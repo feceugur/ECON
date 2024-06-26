@@ -723,7 +723,7 @@ def save_normal_tensor(in_tensor_f, in_tensor_b, idx, png_path, thickness=0.0):
     BNI_dict["normal_B"] = normal_B_arr
     BNI_dict["mask"] = mask_normal_arr > 0.
     BNI_dict["depth_F"] = depth_F_arr - 100. - thickness
-    BNI_dict["depth_B"] = 100. - depth_B_arr + thickness
+    BNI_dict["depth_B"] = 0 - (100. - depth_B_arr + thickness)
     BNI_dict["depth_mask"] = depth_F_arr != -1.0
 
     np.save(png_path + ".npy", BNI_dict, allow_pickle=True)
