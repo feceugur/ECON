@@ -24,7 +24,7 @@ from lib.common.local_affine import register
 from lib.common.imutils import blend_rgb_norm
 from lib.common.config import cfg
 from lib.common.BNI_utils_f import save_normal_tensor
-from lib.common.BNI import BNI
+from lib.common.BNI_f import BNI
 from apps.Normal import Normal
 from apps.IFGeo import IFGeo
 from tqdm.auto import tqdm

@@ -19,6 +19,7 @@ from PIL import Image
 from tqdm.auto import tqdm
 
 from lib.dataset.mesh_util import clean_floats
+from scipy.ndimage import rotate
 
 
 def find_max_list(lst):
@@ -481,7 +482,7 @@ def double_side_bilateral_normal_integration(
 
     nx_back = normal_map_back[normal_mask, 1]
     ny_back = normal_map_back[normal_mask, 0]
-    nz_back = -normal_map_back[normal_mask, 2]
+    nz_back = normal_map_back[normal_mask, 2]
     del normal_map_back
 
     # right, left, top, bottom
@@ -703,7 +704,6 @@ def double_side_bilateral_normal_integration(
     }
 
     return result
-
 
 def save_normal_tensor(in_tensor_f, in_tensor_b, idx, png_path, thickness=0.0):
 
