@@ -657,10 +657,13 @@ def double_side_bilateral_normal_integration(
             back_surf = trimesh.Trimesh(B_verts, faces_back_)
             double_surf = trimesh.Trimesh(F_B_verts, F_B_faces)
 
-            bini_dir = "/home/yxiu/Code/ECON/log/bini/OBJ"
-            front_surf.export(osp.join(bini_dir, f"{i:04d}_F.obj"))
-            back_surf.export(osp.join(bini_dir, f"{i:04d}_B.obj"))
-            double_surf.export(osp.join(bini_dir, f"{i:04d}_FB.obj"))
+            bini_dir = "~/projects/induxr/ECON/result_fls/log/bni/obj/"
+            os.makedirs(bini_dir, exist_ok=True)
+
+            # Export OBJ files
+            front_surf.export(os.path.join(bini_dir, f"{i:04d}_F.obj"))
+            back_surf.export(os.path.join(bini_dir, f"{i:04d}_B.obj"))
+            double_surf.export(os.path.join(bini_dir, f"{i:04d}_FB.obj"))
 
         if relative_energy < tol:
             break
@@ -694,6 +697,13 @@ def double_side_bilateral_normal_integration(
     front_mesh = clean_floats(trimesh.Trimesh(vertices_front, faces_front))
     back_mesh = clean_floats(trimesh.Trimesh(vertices_back, faces_back))
 
+    bini_dir = "./results_fls/log/bni/obj/"
+    os.makedirs(bini_dir, exist_ok=True)
+
+    # Export OBJ files
+    front_mesh.export(os.path.join(bini_dir, f"{i:04d}_F.obj"))
+    back_mesh.export(os.path.join(bini_dir, f"{i:04d}_B.obj"))
+
     result = {
         "F_verts": torch.as_tensor(front_mesh.vertices).float(), "F_faces": torch.as_tensor(
             front_mesh.faces
@@ -723,7 +733,7 @@ def save_normal_tensor(in_tensor_f, in_tensor_b, idx, png_path, thickness=0.0):
     BNI_dict["normal_B"] = normal_B_arr
     BNI_dict["mask"] = mask_normal_arr > 0.
     BNI_dict["depth_F"] = depth_F_arr - 100. - thickness
-    BNI_dict["depth_B"] = 0 - (100. - depth_B_arr + thickness)
+    BNI_dict["depth_B"] = 100. - depth_B_arr + thickness
     BNI_dict["depth_mask"] = depth_F_arr != -1.0
 
     np.save(png_path + ".npy", BNI_dict, allow_pickle=True)
