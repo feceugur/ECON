@@ -66,17 +66,17 @@ class BNI:
         B_verts = verts_inverse_transform(bni_result["B_verts"], self.scale)
 
         self.F_depth = depth_inverse_transform(bni_result["F_depth"], self.scale)
-        self.B_depth = depth_inverse_transform(bni_result["B_depth"], self.scale/2)
+        self.B_depth = depth_inverse_transform(bni_result["B_depth"], self.scale)
 
         # Rotate the back vertices 180 degrees around the y-axis
-        rotation_matrix_y = R.from_euler('y', 180, degrees=True).as_matrix()
+        rotation_matrix_y = R.from_euler('y', 1, degrees=True).as_matrix()
         B_verts_rotated = np.dot(B_verts, rotation_matrix_y.T)
 
         # Rotate the back vertices 180 degrees around the y-axis
-        rotation_matrix_x = R.from_euler('x', -25, degrees=True).as_matrix()
-        B_verts_rotated_x = np.dot(B_verts_rotated, rotation_matrix_x.T)
+        # rotation_matrix_x = R.from_euler('x', -25, degrees=True).as_matrix()
+        # B_verts_rotated_x = np.dot(B_verts_rotated, rotation_matrix_x.T)
 
-        F_B_verts = torch.cat((F_verts, torch.tensor(B_verts_rotated_x)), dim=0)
+        F_B_verts = torch.cat((F_verts, torch.tensor(B_verts_rotated)), dim=0)
         F_B_faces = torch.cat(
             (bni_result["F_faces"], bni_result["B_faces"] + bni_result["F_faces"].max() + 1), dim=0
         )
@@ -90,7 +90,7 @@ class BNI:
         )
 
         self.B_trimesh = trimesh.Trimesh(
-            torch.tensor(B_verts_rotated_x).float(), bni_result["B_faces"].long(), process=False, maintain_order=True
+            torch.tensor(B_verts_rotated).float(), bni_result["B_faces"].long(), process=False, maintain_order=True
         )
 
         # self.F_trimesh = trimesh.Trimesh(

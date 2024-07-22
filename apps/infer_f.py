@@ -38,6 +38,7 @@ import os
 import argparse
 import logging
 import warnings
+import math
 
 warnings.filterwarnings("ignore")
 logging.getLogger("lightning").setLevel(logging.ERROR)
@@ -131,9 +132,6 @@ if __name__ == "__main__":
     for data, data2 in pbar:
 
         losses = init_loss()
-        print(type(data))
-        print(type(data2))
-
         pbar.set_description(f"{data['name']}")
 
         # final results rendered as image (PNG)
@@ -165,17 +163,22 @@ if __name__ == "__main__":
             data2["img_mask"].to(device)
         }
 
+        #import pdb; pdb.set_trace()
+        #print("*****************************************\n",data["body_pose"][0])
+
         # The optimizer and variables
         optimed_pose_f = data["body_pose"].requires_grad_(True)
         optimed_trans_f = data["trans"].requires_grad_(True)
         optimed_betas_f = data["betas"].requires_grad_(True)
         optimed_orient_f = data["global_orient"].requires_grad_(True)
 
+        inverted_global_orient = data["global_orient"].transpose(1, 2).contiguous()
+
         # The optimizer and variables
-        optimed_pose_b = data2["body_pose"].requires_grad_(True)
-        optimed_trans_b = data2["trans"].requires_grad_(True)
-        optimed_betas_b = data2["betas"].requires_grad_(True)
-        optimed_orient_b = data2["global_orient"].requires_grad_(True)
+        optimed_pose_b = data["body_pose"].requires_grad_(True)
+        optimed_trans_b = data["trans"].requires_grad_(True)
+        optimed_betas_b = data["betas"].requires_grad_(True)
+        optimed_orient_b = inverted_global_orient.requires_grad_(True)
 
         optimizer_smpl_f = torch.optim.Adam([
             optimed_pose_f, optimed_trans_f, optimed_betas_f, optimed_orient_f
