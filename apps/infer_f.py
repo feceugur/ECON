@@ -172,13 +172,11 @@ if __name__ == "__main__":
         optimed_betas_f = data["betas"].requires_grad_(True)
         optimed_orient_f = data["global_orient"].requires_grad_(True)
 
-        inverted_global_orient = data["global_orient"].transpose(1, 2).contiguous()
-
         # The optimizer and variables
         optimed_pose_b = data["body_pose"].requires_grad_(True)
         optimed_trans_b = data["trans"].requires_grad_(True)
         optimed_betas_b = data["betas"].requires_grad_(True)
-        optimed_orient_b = inverted_global_orient.requires_grad_(True)
+        optimed_orient_b = data["global_orient"].requires_grad_(True)
 
         optimizer_smpl_f = torch.optim.Adam([
             optimed_pose_f, optimed_trans_f, optimed_betas_f, optimed_orient_f
