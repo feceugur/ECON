@@ -173,10 +173,10 @@ if __name__ == "__main__":
         optimed_orient_f = data["global_orient"].requires_grad_(True)
 
         # The optimizer and variables
-        optimed_pose_b = data["body_pose"].requires_grad_(True)
-        optimed_trans_b = data["trans"].requires_grad_(True)
-        optimed_betas_b = data["betas"].requires_grad_(True)
-        optimed_orient_b = data["global_orient"].requires_grad_(True)
+        optimed_pose_b = data2["body_pose"].requires_grad_(True)
+        optimed_trans_b = data2["trans"].requires_grad_(True)
+        optimed_betas_b = data2["betas"].requires_grad_(True)
+        optimed_orient_b = data2["global_orient"].requires_grad_(True)
 
         optimizer_smpl_f = torch.optim.Adam([
             optimed_pose_f, optimed_trans_f, optimed_betas_f, optimed_orient_f
@@ -509,6 +509,24 @@ if __name__ == "__main__":
                     dim=3), img_crop_path
             )
 
+            # added to save depth maps of the input images
+            img_normal_f_B_path = osp.join(
+                args.out_dir, cfg.name, "png", f"{data['name']}_front_B.png")
+
+            img_normal_b_F_path = osp.join(
+                args.out_dir, cfg.name, "png", f"{data['name']}_back_F.png")
+
+            # Normalize and save in_tensor_f['normal_B'] as an image
+            torchvision.utils.save_image(
+                (in_tensor_f['normal_B'].detach().cpu() + 1.0) * 0.5, img_normal_f_B_path
+            )
+
+            # Normalize and save in_tensor_b['normal_F'] as an image
+            torchvision.utils.save_image(
+                (in_tensor_b['normal_F'].detach().cpu() + 1.0) * 0.5, img_normal_b_F_path
+            )
+            ########
+            
             rgb_norm_F = blend_rgb_norm(in_tensor_f["normal_F"], data)
             rgb_norm_B = blend_rgb_norm(in_tensor_b["normal_F"], data2)
 
