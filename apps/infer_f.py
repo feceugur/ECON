@@ -25,6 +25,7 @@ from lib.common.imutils import blend_rgb_norm
 from lib.common.config import cfg
 from lib.common.BNI_utils_f import save_normal_tensor
 from lib.common.BNI_f import BNI
+from lib.common.affine import AffineRegistration
 from apps.Normal import Normal
 from apps.IFGeo import IFGeo
 from tqdm.auto import tqdm
@@ -509,24 +510,26 @@ if __name__ == "__main__":
                     dim=3), img_crop_path
             )
 
+            # import pdb; pdb.set_trace()
+            affine_reg = AffineRegistration(in_tensor_b['normal_F'], in_tensor_f['normal_B'])
+            in_tensor_b['normal_F'] = affine_reg.fit()
+
             # added to save depth maps of the input images
             img_normal_f_B_path = osp.join(
-                args.out_dir, cfg.name, "png", f"{data['name']}_front_B.png")
+                args.out_dir, cfg.name, "png", f"{data['name']}_depth_front_B.png")
 
             img_normal_b_F_path = osp.join(
-                args.out_dir, cfg.name, "png", f"{data['name']}_back_F.png")
+                args.out_dir, cfg.name, "png", f"{data['name']}_depth_back_F.png")
 
-            # Normalize and save in_tensor_f['normal_B'] as an image
             torchvision.utils.save_image(
                 (in_tensor_f['normal_B'].detach().cpu() + 1.0) * 0.5, img_normal_f_B_path
             )
-
-            # Normalize and save in_tensor_b['normal_F'] as an image
+ 
             torchvision.utils.save_image(
                 (in_tensor_b['normal_F'].detach().cpu() + 1.0) * 0.5, img_normal_b_F_path
             )
             ########
-            
+
             rgb_norm_F = blend_rgb_norm(in_tensor_f["normal_F"], data)
             rgb_norm_B = blend_rgb_norm(in_tensor_b["normal_F"], data2)
 
