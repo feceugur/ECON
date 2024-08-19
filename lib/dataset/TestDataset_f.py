@@ -167,7 +167,12 @@ class TestDataset:
             front_output = front_preds_dict["mesh_out"][-1]
             back_output = back_preds_dict["mesh_out"][-1]
             scale, tranX, tranY = front_output["pred_cam"].split(1, dim=1)
-            
+
+            # Update back parameters with a 180 degree rotation around the y-axis
+            back_global_orient = back_output["rotmat"][:, 0:1]
+            rot_180 = torch.tensor([[[-1, 0, 0], [0, 1, 0], [0, 0, -1]]], device=self.device).repeat(back_global_orient.shape[0], 1, 1)
+            back_global_orient = torch.matmul(rot_180, back_global_orient)
+
             front_arr_dict["betas"] = front_output["pred_shape"]  # 10
             front_arr_dict["body_pose"] = front_output["rotmat"][:, 1:22]
             front_arr_dict["global_orient"] = front_output["rotmat"][:, 0:1]
@@ -178,27 +183,27 @@ class TestDataset:
             front_arr_dict["exp"] = front_output["pred_exp"]
 
             # back_arr_dict["betas"] = back_output["pred_shape"]  # 10
-            back_arr_dict["betas"] = front_output["pred_shape"]  # 10
-            back_arr_dict["body_pose"] = front_output["rotmat"][:, 1:22]
-            back_arr_dict["global_orient"] = front_output["rotmat"][:, 0:1]
-            back_arr_dict["smpl_verts"] = front_output["smplx_verts"]
-            back_arr_dict["left_hand_pose"] = front_output["pred_lhand_rotmat"]
-            back_arr_dict["right_hand_pose"] = front_output["pred_rhand_rotmat"]
-            back_arr_dict['jaw_pose'] = front_output['pred_face_rotmat'][:, 0:1]
-            back_arr_dict["exp"] = front_output["pred_exp"]
+            back_arr_dict["betas"] = back_output["pred_shape"]  # 10
+            back_arr_dict["body_pose"] = back_output["rotmat"][:, 1:22]
+            back_arr_dict["global_orient"] = back_global_orient
+            back_arr_dict["smpl_verts"] = back_output["smplx_verts"]
+            back_arr_dict["left_hand_pose"] = back_output["pred_rhand_rotmat"]
+            back_arr_dict["right_hand_pose"] = back_output["pred_lhand_rotmat"]
+            back_arr_dict['jaw_pose'] = back_output['pred_face_rotmat'][:, 0:1]
+            back_arr_dict["exp"] = back_output["pred_exp"]
 
         elif self.hps_type == "pixie":
             front_arr_dict.update(front_preds_dict)
-            back_arr_dict.update(front_preds_dict)
+            back_arr_dict.update(back_preds_dict)
             front_arr_dict["global_orient"] = front_preds_dict["global_pose"]
             front_arr_dict["betas"] = front_preds_dict["shape"]  # 200
             front_arr_dict["smpl_verts"] = front_preds_dict["vertices"]
             scale, tranX, tranY = front_preds_dict["cam"].split(1, dim=1)
 
-            back_arr_dict["global_orient"] = front_preds_dict["global_pose"]
-            back_arr_dict["betas"] = front_preds_dict["shape"]  # 200
-            back_arr_dict["smpl_verts"] = front_preds_dict["vertices"]
-            back_scale, back_tranX, back_tranY = front_preds_dict["cam"].split(1, dim=1)
+            back_arr_dict["global_orient"] = back_preds_dict["global_pose"]
+            back_arr_dict["betas"] = back_preds_dict["shape"]  # 200
+            back_arr_dict["smpl_verts"] = back_preds_dict["vertices"]
+            back_scale, back_tranX, back_tranY = back_preds_dict["cam"].split(1, dim=1)
 
         front_arr_dict["scale"] = scale.unsqueeze(1)
         front_arr_dict["trans"] = (
@@ -220,11 +225,12 @@ class TestDataset:
         back_arr_dict["body_pose"] = back_arr_dict["body_pose"][:, :, :, :2].reshape(N_body, N_pose, -1)
         back_arr_dict["global_orient"] = back_arr_dict["global_orient"][:, :, :, :2].reshape(N_body, 1, -1)
 
+        back_arr_dict["landmark"] = front_arr_dict["landmark"]
         # Debugging output
-        print(front_arr_dict.keys)
-        print(back_arr_dict.keys)
-        print(f"Type of front_arr_dict: {type(front_arr_dict)}")
-        print(f"Type of back_arr_dict: {type(back_arr_dict)}")
+        # print(front_arr_dict.keys())
+        # print(back_arr_dict.keys())
+        # print(f"Type of front_arr_dict: {type(front_arr_dict)}")
+        # print(f"Type of back_arr_dict: {type(back_arr_dict)}")
 
         return front_arr_dict, back_arr_dict
 

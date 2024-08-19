@@ -1,6 +1,8 @@
 import torch
 import scipy
 import numpy as np
+from PIL import Image
+import torchvision.transforms as transforms
 
 class AffineRegistration:
     def __init__(self, in_tensor_b, in_tensor_f):
@@ -69,3 +71,30 @@ class AffineRegistration:
         self.new_normals[torch.isnan(self.new_normals)] = 0  # Replace NaNs with 0 or any other suitable value
 
         return self.new_normals
+
+    def load_image_as_tensor(image_path, target_size=(512, 512), preserve_alpha=False):
+	    # Open the image using PIL
+	    image = Image.open(image_path)
+    
+	    if preserve_alpha and image.mode == 'RGBA':
+	        # If we want to preserve alpha and the image has an alpha channel
+	        channels = 4
+	    else:
+	        # Otherwise, convert to RGB
+	        image = image.convert('RGB')
+	        channels = 3
+		    
+	    # Define the transformation pipeline
+	    transform = transforms.Compose([
+	        transforms.Resize(target_size),  # Resize the image to 512x512
+	        transforms.ToTensor(),  # Convert the image to a tensor
+	    ])
+	    
+	    # Apply the transformations
+	    tensor = transform(image)
+	    
+	    # Ensure the tensor has 3 channels (RGB)
+	    if tensor.shape[0] == 1:  # If it's a grayscale image
+	        tensor = tensor.repeat(3, 1, 1)
+	    
+	    return tensor

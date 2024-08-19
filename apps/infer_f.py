@@ -510,9 +510,14 @@ if __name__ == "__main__":
                     dim=3), img_crop_path
             )
 
-            # import pdb; pdb.set_trace()
-            affine_reg = AffineRegistration(in_tensor_b['normal_F'], in_tensor_f['normal_B'])
-            in_tensor_b['normal_F'] = affine_reg.fit()
+            import pdb; pdb.set_trace()
+            # affine_reg = AffineRegistration(in_tensor_b['normal_F'], in_tensor_f['normal_B'])
+            # in_tensor_b['normal_F'] = affine_reg.fit()
+
+            image_path = "./result_f/fuldenf.png"
+            in_tensor_b['normal_F'][0] = AffineRegistration.load_image_as_tensor(image_path)
+
+            import pdb; pdb.set_trace()
 
             # added to save depth maps of the input images
             img_normal_f_B_path = osp.join(
