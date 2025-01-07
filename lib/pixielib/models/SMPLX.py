@@ -137,7 +137,8 @@ class SMPLX(nn.Module):
     def __init__(self, config):
         super(SMPLX, self).__init__()
         # print("creating the SMPLX Decoder")
-        ss = np.load(config.smplx_model_path, allow_pickle=True)
+        datafile_path = "/home/ubuntu/Data/Fulden/"
+        ss = np.load(datafile_path + "HPS/pixie_data/SMPLX_NEUTRAL_2020.npz", allow_pickle=True)
         smplx_model = Struct(**ss)
 
         self.dtype = torch.float32
@@ -259,11 +260,11 @@ class SMPLX(nn.Module):
         )
 
         if config.extra_joint_path:
-            self.extra_joint_selector = JointsFromVerticesSelector(fname=config.extra_joint_path)
+            self.extra_joint_selector = JointsFromVerticesSelector(fname=datafile_path+"HPS/pixie_data/smplx_extra_joints.yaml")
         self.use_joint_regressor = True
         self.keypoint_names = SMPLX_names
         if self.use_joint_regressor:
-            with open(config.j14_regressor_path, "rb") as f:
+            with open(datafile_path+"HPS/pixie_data/SMPLX_to_J14.pkl", "rb") as f:
                 j14_regressor = pickle.load(f, encoding="latin1")
             source = []
             target = []

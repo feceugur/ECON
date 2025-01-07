@@ -5,22 +5,34 @@ from PIL import Image
 from torchvision import transforms
 from huggingface_hub import snapshot_download
 
-
+os.environ["HF_HOME"] = "/home/ubuntu/Data/Fulden/sapiens"
 class Config:
     ASSETS_DIR = os.path.join(
-        snapshot_download(repo_id="facebook/sapiens-normal", repo_type="space"), 'assets'
+        snapshot_download(
+            repo_id="facebook/sapiens-normal",
+            repo_type="space",
+            cache_dir="/home/ubuntu/Data/Fulden/sapiens"
+        ),
+        'assets'
     )
-    CHECKPOINTS_DIR = os.path.join(ASSETS_DIR, "checkpoints")
+    CHECKPOINTS_DIR = "/home/ubuntu/Data/Fulden/sapiens/spaces--facebook--sapiens-normal/snapshots/69445cc36a49af657aaa25c86f747c5fc01d3e69/assets/checkpoints/"  # Custom directory for checkpoints
+    
+    # Define checkpoint paths within the custom directory
     CHECKPOINTS = {
-        "0.3b": "sapiens_0.3b_normal_render_people_epoch_66_torchscript.pt2",
-        "0.6b": "sapiens_0.6b_normal_render_people_epoch_200_torchscript.pt2",
-        "1b": "sapiens_1b_normal_render_people_epoch_115_torchscript.pt2",
-        "2b": "sapiens_2b_normal_render_people_epoch_70_torchscript.pt2",
+        "0.3b": os.path.join(CHECKPOINTS_DIR, "sapiens_0.3b_normal_render_people_epoch_66_torchscript.pt2"),
+        "0.6b": os.path.join(CHECKPOINTS_DIR, "sapiens_0.6b_normal_render_people_epoch_200_torchscript.pt2"),
+        "1b": os.path.join(CHECKPOINTS_DIR, "sapiens_1b_normal_render_people_epoch_115_torchscript.pt2"),
+        "2b": os.path.join(CHECKPOINTS_DIR, "sapiens_2b_normal_render_people_epoch_70_torchscript.pt2"),
     }
+    
+    # Custom directory for segmentation checkpoints
+    SEG_CHECKPOINTS_DIR = "/home/ubuntu/Data/Fulden/sapiens/spaces--facebook--sapiens-normal/snapshots/69445cc36a49af657aaa25c86f747c5fc01d3e69/assets/checkpoints/"  # Custom directory for segmentation models
+    
+    # Define segmentation checkpoint paths within the custom directory
     SEG_CHECKPOINTS = {
-        "fg-bg-1b": "sapiens_1b_seg_foreground_epoch_8_torchscript.pt2",
+        "fg-bg-1b": os.path.join(SEG_CHECKPOINTS_DIR, "sapiens_1b_seg_foreground_epoch_8_torchscript.pt2"),
         "no-bg-removal": None,
-        "part-seg-1b": "sapiens_1b_goliath_best_goliath_mIoU_7994_epoch_151_torchscript.pt2",
+        "part-seg-1b": os.path.join(SEG_CHECKPOINTS_DIR, "sapiens_1b_goliath_best_goliath_mIoU_7994_epoch_151_torchscript.pt2"),
     }
 
 

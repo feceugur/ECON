@@ -44,19 +44,20 @@ class SMPLX:
     def __init__(self):
 
         self.current_dir = osp.join(osp.dirname(__file__), "../../data/smpl_related")
+        self.data_dir = osp.join("/home/ubuntu/Data/Fulden")
+        #self.smpl_verts_path = osp.join(self.current_dir, "smpl_data/smpl_verts.npy")
+        self.smpl_verts_path = osp.join(self.data_dir, "smpl_related/smpl_verts.npy")
+        self.smpl_faces_path = osp.join(self.data_dir, "smpl_related/smpl_faces.npy")
+        self.smplx_verts_path = osp.join(self.data_dir, "smpl_related/smplx_verts.npy")
+        self.smplx_faces_path = osp.join(self.data_dir, "smpl_related/smplx_faces.npy")
+        self.cmap_vert_path = osp.join(self.data_dir, "smpl_related/smplx_cmap.npy")
 
-        self.smpl_verts_path = osp.join(self.current_dir, "smpl_data/smpl_verts.npy")
-        self.smpl_faces_path = osp.join(self.current_dir, "smpl_data/smpl_faces.npy")
-        self.smplx_verts_path = osp.join(self.current_dir, "smpl_data/smplx_verts.npy")
-        self.smplx_faces_path = osp.join(self.current_dir, "smpl_data/smplx_faces.npy")
-        self.cmap_vert_path = osp.join(self.current_dir, "smpl_data/smplx_cmap.npy")
+        self.smplx_to_smplx_path = osp.join(self.data_dir, "smpl_related/smplx_to_smpl.pkl")
 
-        self.smplx_to_smplx_path = osp.join(self.current_dir, "smpl_data/smplx_to_smpl.pkl")
-
-        self.smplx_eyeball_fid_path = osp.join(self.current_dir, "smpl_data/eyeball_fid.npy")
-        self.smplx_fill_mouth_fid_path = osp.join(self.current_dir, "smpl_data/fill_mouth_fid.npy")
+        self.smplx_eyeball_fid_path = osp.join(self.data_dir, "smpl_related/eyeball_fid.npy")
+        self.smplx_fill_mouth_fid_path = osp.join(self.data_dir, "smpl_related/fill_mouth_fid.npy")
         self.smplx_flame_vid_path = osp.join(
-            self.current_dir, "smpl_data/FLAME_SMPLX_vertex_ids.npy"
+            self.data_dir, "smpl_related/FLAME_SMPLX_vertex_ids.npy"
         )
         # smpl & smpl-x vertex semantic labels
         self.smpl_vert_seg_path = osp.join(
@@ -66,9 +67,9 @@ class SMPLX:
             osp.dirname(__file__), "../../lib/common/smplx_vert_segmentation.json"
         )
 
-        self.front_flame_path = osp.join(self.current_dir, "smpl_data/FLAME_face_mask_ids.npy")
+        self.front_flame_path = osp.join(self.data_dir, "smpl_related/FLAME_face_mask_ids.npy")
         self.smplx_vertex_lmkid_path = osp.join(
-            self.current_dir, "smpl_data/smplx_vertex_lmkid.npy"
+            self.data_dir, "smpl_related/smplx_vertex_lmkid.npy"
         )
 
         self.smplx_faces = np.load(self.smplx_faces_path)

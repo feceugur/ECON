@@ -705,6 +705,31 @@ def double_side_bilateral_normal_integration(
     return result
 
 
+def save_normal_tensor_upt(in_tensor_f, in_tensor_b, idx, png_path, thickness=0.0):
+
+    os.makedirs(os.path.dirname(png_path), exist_ok=True)
+
+    normal_F_arr = tensor2arr(in_tensor_f["normal_F"][idx:idx + 1])
+    normal_B_arr = tensor2arr(in_tensor_b["normal_F"][idx:idx + 1])
+    mask_normal_arr = tensor2arr(in_tensor_f["image"][idx:idx + 1], True)
+
+    depth_F_arr = depth2arr(in_tensor_f["depth_F"][idx])
+    depth_B_arr = depth2arr(in_tensor_b["depth_F"][idx])
+
+    BNI_dict = {}
+
+    # clothed human
+    BNI_dict["normal_F"] = normal_F_arr
+    BNI_dict["normal_B"] = normal_B_arr
+    BNI_dict["mask"] = mask_normal_arr > 0.
+    BNI_dict["depth_F"] = depth_F_arr - 100. - thickness
+    BNI_dict["depth_B"] = 100. - depth_B_arr + thickness
+    BNI_dict["depth_mask"] = depth_F_arr != -1.0
+
+    np.save(png_path + ".npy", BNI_dict, allow_pickle=True)
+
+    return BNI_dict
+
 def save_normal_tensor(in_tensor, idx, png_path, thickness=0.0):
 
     os.makedirs(os.path.dirname(png_path), exist_ok=True)

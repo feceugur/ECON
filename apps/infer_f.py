@@ -17,8 +17,6 @@
 import logging
 import warnings
 
-from apps.clean_mesh import MeshWatertightifier
-
 warnings.filterwarnings("ignore")
 logging.getLogger("lightning").setLevel(logging.ERROR)
 logging.getLogger("trimesh").setLevel(logging.ERROR)
@@ -35,8 +33,9 @@ from termcolor import colored
 from tqdm.auto import tqdm
 
 from apps.IFGeo import IFGeo
-from apps.Normal import Normal
+from apps.Normal_f import Normal
 from apps.sapiens import ImageProcessor
+from apps.clean_mesh import MeshWatertightifier
 
 from lib.common.BNI import BNI
 from lib.common.BNI_utils import save_normal_tensor
@@ -47,7 +46,7 @@ from lib.common.render import query_color
 from lib.common.train_util import Format, init_loss
 from lib.common.voxelize import VoxelGrid
 from lib.dataset.mesh_util import *
-from lib.dataset.TestDataset import TestDataset
+from lib.dataset.TestDataset_f import TestDataset
 from lib.net.geometry import rot6d_to_rotmat, rotation_matrix_to_angle_axis
 
 torch.backends.cudnn.benchmark = True
@@ -63,6 +62,7 @@ if __name__ == "__main__":
     parser.add_argument("-loop_smpl", "--loop_smpl", type=int, default=50)
     parser.add_argument("-patience", "--patience", type=int, default=5)
     parser.add_argument("-in_dir", "--in_dir", type=str, default="./examples")
+    parser.add_argument("-in_b_dir", "--in_b_dir", type=str, default="./examples")
     parser.add_argument("-out_dir", "--out_dir", type=str, default="./results")
     parser.add_argument("-seg_dir", "--seg_dir", type=str, default=None)
     parser.add_argument("-cfg", "--config", type=str, default="./configs/econ.yaml")
@@ -105,6 +105,7 @@ if __name__ == "__main__":
 
     dataset_param = {
         "image_dir": args.in_dir,
+        "image_b_dir": args.in_b_dir,
         "seg_dir": args.seg_dir,
         "use_seg": True,    # w/ or w/o segmentation
         "hps_type": cfg.bni.hps_type,    # pymafx/pixie
@@ -126,13 +127,13 @@ if __name__ == "__main__":
         print(colored(f"Complete with {Format.start} SMPL-X (Explicit) {Format.end}", "green"))
 
     dataset = TestDataset(dataset_param, device)
+    front_arr_dict, back_arr_dict = dataset[0]
 
     print(colored(f"Dataset Size: {len(dataset)}", "green"))
 
     pbar = tqdm(dataset)
 
-    for data in pbar:
-
+    for data, data_b in pbar:
 
         losses = init_loss()
 
@@ -160,7 +161,9 @@ if __name__ == "__main__":
         in_tensor = {
             "smpl_faces": data["smpl_faces"], 
             "image": data["img_icon"].to(device), 
-            "mask": data["img_mask"].to(device)
+            "image_back": data_b["img_icon"].to(device),
+            "mask": data["img_mask"].to(device),
+            "mask_back": data_b["img_mask"].to(device)
         }
 
         # The optimizer and variables
@@ -293,15 +296,14 @@ if __name__ == "__main__":
                 img_norm_path_f = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_front_normal.png")
                 torchvision.utils.save_image((in_tensor['normal_F'].detach().cpu()),img_norm_path_f)
                 img_norm_path_b = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_back_normal.png")
-                torchvision.utils.save_image((in_tensor['normal_B'].detach().cpu()),img_norm_path_b)
-                """
+                torchvision.utils.save_image((in_tensor['normal_B'].detach().cpu()),img_norm_path_b)"""
 
-                img_crop_path = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_normal_and_mask_default.png")
-                row1 = torch.cat([data["img_crop"][:, :3], data["img_crop"][:, :3]], dim=3)  # Concatenate front and back images
+                img_crop_path = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_normal_and_mask.png")
+                row1 = torch.cat([data["img_crop"][:, :3], data_b["img_crop"][:, :3]], dim=3)  # Concatenate front and back images
                 row2 = torch.cat([(in_tensor['normal_F'].detach().cpu() + 1.0) * 0.5, 
                                 (in_tensor['normal_B'].detach().cpu() + 1.0) * 0.5], dim=3)  # Concatenate normal front and back
                 row3 = torch.cat([in_tensor["mask"].unsqueeze(1).repeat(1, 3, 1, 1).detach().cpu(),
-                                in_tensor["mask"].unsqueeze(1).repeat(1, 3, 1, 1).detach().cpu()], dim=3)  # Concatenate mask and mask_back
+                                in_tensor["mask_back"].unsqueeze(1).repeat(1, 3, 1, 1).detach().cpu()], dim=3)  # Concatenate mask and mask_back
 
                 # Now stack the rows vertically (along dim=2)
                 final_tensor = torch.cat([row1, row2, row3], dim=2)
@@ -313,7 +315,6 @@ if __name__ == "__main__":
                 # as the back cloth normals are conditioned on the body cloth normals
 
                 if cfg.sapiens.use:
-
                     in_tensor["normal_F"] = sapiens_normal_square
 
                 diff_F_smpl = torch.abs(in_tensor["T_normal_F"] - in_tensor["normal_F"])
@@ -730,7 +731,7 @@ if __name__ == "__main__":
             torch.save(
                 in_tensor, osp.join(args.out_dir, cfg.name, f"vid/{data['name']}_in_tensor.pt")
             )
-            
+
         final_watertight_path = f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_full_wt.obj"
         watertightifier = MeshWatertightifier(final_path, final_watertight_path)
         result = watertightifier.process(reconstruction_method='poisson', depth=10)

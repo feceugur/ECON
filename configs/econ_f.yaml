@@ -5,7 +5,7 @@ ifnet_path: "/home/ubuntu/Data/Fulden/ckpt/ifnet.ckpt"
 results_path: "./results"
 
 net:
-  in_nml: (('image', 3), ('T_normal_F', 3), ('T_normal_B', 3))
+  in_nml: (('image', 3), ('image_back', 3), ('T_normal_F', 3), ('T_normal_B', 3))
   in_geo: (('normal_F',3), ('normal_B',3))
 
 test_mode: True
