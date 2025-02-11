@@ -52,6 +52,7 @@ econ_obj.vertices -= smplx_param["transl"].cpu().numpy()
 for key in smplx_param.keys():
     smplx_param[key] = smplx_param[key].cpu().view(1, -1)
 
+print(smplx_container.model_dir)
 smpl_model = smplx.create(
     smplx_container.model_dir,
     model_type="smplx",
