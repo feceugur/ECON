@@ -1,7 +1,6 @@
 import os.path as osp
 
-# pymafx_data_dir = osp.join(osp.dirname(__file__), "/home/ubuntu/Data/Fulden/HPS/pymafx_data/smpl")
-pymafx_data_dir = "/home/ubuntu/Data/Fulden/HPS/pymafx_data/"
+pymafx_data_dir = osp.join(osp.dirname(__file__), "../../../data/HPS/pymafx_data")
 
 JOINT_REGRESSOR_TRAIN_EXTRA = osp.join(pymafx_data_dir, 'J_regressor_extra.npy')
 JOINT_REGRESSOR_H36M = osp.join(pymafx_data_dir, 'J_regressor_h36m.npy')

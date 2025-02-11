@@ -719,13 +719,13 @@ if __name__ == "__main__":
                 final_mesh = sum(full_lst)
                 final_mesh.export(final_path)
 
-        if not args.novis:
-            # Load rendered images from multiple views.
-            dataset.render.load_meshes(final_mesh.vertices, final_mesh.faces)
-            rotate_recon_lst = dataset.render.get_image(cam_type="four")
-            # Create two separate lists for the cloth images: one for front and one for back.
-            per_loop_lst_front = [in_tensor['image'][idx:idx + 1]] + rotate_recon_lst
-            per_loop_lst_back  = [in_tensor['image_back'][idx:idx + 1]] + rotate_recon_lst
+            if not args.novis:
+                # Load rendered images from multiple views.
+                dataset.render.load_meshes(final_mesh.vertices, final_mesh.faces)
+                rotate_recon_lst = dataset.render.get_image(cam_type="four")
+                # Create two separate lists for the cloth images: one for front and one for back.
+                per_loop_lst_front = [in_tensor['image'][idx:idx + 1]] + rotate_recon_lst
+                per_loop_lst_back  = [in_tensor['image_back'][idx:idx + 1]] + rotate_recon_lst
 
         # @SSH
         # --- Color the final mesh ---
@@ -733,22 +733,19 @@ if __name__ == "__main__":
 
                 # coloring the final mesh (front: RGB pixels, back: normal colors)
                 final_colors = query_color(
-                    torch.tensor(final_mesh.vertices).float(),
-                    torch.tensor(final_mesh.faces).long(),
+                torch.tensor(final_mesh.vertices).float(),
+                torch.tensor(final_mesh.faces).long(),
                 torch.tensor(side_mesh.vertices).float(),
                 in_tensor["image"][idx:idx + 1],
                 in_tensor["image_back"][idx:idx + 1],
                 device=device,
-            )
-            final_mesh.visual.vertex_colors = final_colors
-            final_mesh.export(final_path)
-            elif cfg.bni.texture_src == 'SD':
+                )
+                final_mesh.visual.vertex_colors = final_colors
+                final_mesh.export(final_path)
             elif cfg.bni.texture_src == 'SD':
 
-        elif cfg.bni.texture_src == 'SD':
-
-            # !TODO: add texture from Stable Diffusion
-            pass
+                # !TODO: add texture from Stable Diffusion
+                pass
 
         if not args.novis and len(per_loop_lst_front) > 0 and len(per_loop_lst_back) > 0:
             # Save the front cloth image.
