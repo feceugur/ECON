@@ -65,12 +65,12 @@ if __name__ == "__main__":
     parser.add_argument("-in_b_dir", "--in_b_dir", type=str, default="./examples")
     parser.add_argument("-out_dir", "--out_dir", type=str, default="./results")
     parser.add_argument("-seg_dir", "--seg_dir", type=str, default=None)
-    parser.add_argument("-cfg", "--config", type=str, default="./configs/econ.yaml")
+    parser.add_argument("-cfg", "--config", type=str, default="./configs/econ_f.yaml")
     parser.add_argument("-multi", action="store_false")
     parser.add_argument("-novis", action="store_true")
 
     args = parser.parse_args()
-
+    
     # cfg read and merge
     cfg.merge_from_file(args.config)
     cfg.merge_from_file("./lib/pymafx/configs/pymafx_config.yaml")
@@ -133,6 +133,15 @@ if __name__ == "__main__":
 
     pbar = tqdm(dataset)
 
+    # @SSH
+    people=['Fulden', 'Rafael', 'Roger', 'Albert', 'Stefan']
+    if cfg.bni.use_ifnet:
+        args.out_dir = f'{args.out_dir}/{people[0]}/IFN+_face_thresh_{cfg.bni.face_thres:.2f}'
+        os.makedirs(args.out_dir, exist_ok=True)
+    else:
+        args.out_dir = f'{args.out_dir}/{people[0]}/face_thresh_{cfg.bni.face_thres:.2f}'
+        os.makedirs(args.out_dir, exist_ok=True)
+       
     for data, data_b in pbar:
 
         losses = init_loss()
@@ -190,7 +199,7 @@ if __name__ == "__main__":
         per_data_lst = []
 
         N_body, N_pose = optimed_pose.shape[:2]
-
+   
         smpl_path = f"{args.out_dir}/{cfg.name}/obj/{data['name']}_smpl_00.obj"
 
         # sapiens inference for current batch data
@@ -225,7 +234,6 @@ if __name__ == "__main__":
 
             batch_smpl_verts = torch.stack(smpl_verts_lst)
             batch_smpl_faces = torch.stack(smpl_faces_lst)
-
             # render optimized mesh as normal [-1,1]
             in_tensor["T_normal_F"], in_tensor["T_normal_B"] = dataset.render_normal(
                 batch_smpl_verts, batch_smpl_faces
@@ -233,6 +241,15 @@ if __name__ == "__main__":
 
             with torch.no_grad():
                 in_tensor["normal_F"], in_tensor["normal_B"] = normal_net.netG(in_tensor)
+            
+
+            # Flip the x-component and invert the entire back normal map
+            # in_tensor["normal_B"][:, 0, :, :] = -in_tensor["normal_B"][:, 0, :, :]  # Flip x component
+            # in_tensor["normal_B"] = -in_tensor["normal_B"]  # Invert entire normal map
+
+            # # Normalize to maintain unit length
+            # in_tensor["normal_B"] = in_tensor["normal_B"] / torch.norm(in_tensor["normal_B"], dim=1, keepdim=True)
+            # normal_net.netG.save_nml_image(in_tensor["normal_F"], in_tensor["normal_B"], out_dir=args.out_dir)
 
             in_tensor["smpl_verts"] = batch_smpl_verts * torch.tensor([1., -1., 1.]).to(device)
             in_tensor["smpl_faces"] = batch_smpl_faces[:, :, [0, 2, 1]]
@@ -291,7 +308,17 @@ if __name__ == "__main__":
 
                 with torch.no_grad():
                     # [1, 3, 512, 512], (-1.0, 1.0)
-                    in_tensor["normal_F"], in_tensor["normal_B"] = normal_net.netG(in_tensor)
+                    in_tensor["normal_F"], in_tensor["normal_B"] = normal_net.netG(in_tensor, args.out_dir)
+                    
+                # Flip the x-component and invert the entire back normal map
+                # in_tensor["normal_B"][:, 0, :, :] = -in_tensor["normal_B"][:, 0, :, :]  # Flip x component
+                # in_tensor["normal_B"] = -in_tensor["normal_B"]  # Invert entire normal map
+
+                # # Normalize to maintain unit length
+                # in_tensor["normal_B"] = in_tensor["normal_B"] / torch.norm(in_tensor["normal_B"], dim=1, keepdim=True)
+                # normal_net.netG.save_nml_image(in_tensor["normal_F"], in_tensor["normal_B"], out_dir=args.out_dir)
+
+
                 """
                 img_norm_path_f = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_front_normal.png")
                 torchvision.utils.save_image((in_tensor['normal_F'].detach().cpu()),img_norm_path_f)
@@ -387,7 +414,10 @@ if __name__ == "__main__":
                         diff_S[:, :, :512].unsqueeze(1).repeat(1, 3, 1, 1),
                     ])
                     per_loop_lst.extend([
-                        in_tensor["image"],
+                        # @SSH
+                        # in_tensor["image"],
+                        in_tensor["image_back"],
+                        # @SSH END
                         in_tensor["T_normal_B"],
                         in_tensor["normal_B"],
                         diff_S[:, :, 512:].unsqueeze(1).repeat(1, 3, 1, 1),
@@ -508,6 +538,7 @@ if __name__ == "__main__":
             hand_mesh = smpl_obj_lst[idx].copy()
             smplx_mesh = smpl_obj_lst[idx].copy()
 
+
             # save normals, depths and masks
             BNI_dict = save_normal_tensor(
                 in_tensor,
@@ -534,19 +565,15 @@ if __name__ == "__main__":
             # replace SMPL by completed mesh as side_mesh
 
             if cfg.bni.use_ifnet:
-
                 side_mesh_path = f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_IF.obj"
-
                 side_mesh = apply_face_mask(side_mesh, ~SMPLX_object.smplx_eyeball_fid_mask)
-
                 # mesh completion via IF-net
                 in_tensor.update(
                     dataset.depth_to_voxel({
-                        "depth_F": BNI_object.F_depth.unsqueeze(0), "depth_B":
-                        BNI_object.B_depth.unsqueeze(0)
+                        "depth_F": BNI_object.F_depth.unsqueeze(0), 
+                        "depth_B": BNI_object.B_depth.unsqueeze(0)
                     })
                 )
-
                 occupancies = VoxelGrid.from_mesh(side_mesh, cfg.vol_res, loc=[
                     0,
                 ] * 3, scale=2.0).data.transpose(2, 1, 0)
@@ -558,10 +585,8 @@ if __name__ == "__main__":
                 with torch.no_grad():
                     sdf = ifnet.reconEngine(netG=ifnet.netG, batch=in_tensor)
                     verts_IF, faces_IF = ifnet.reconEngine.export_mesh(sdf)
-
                 if ifnet.clean_mesh_flag:
                     verts_IF, faces_IF = clean_mesh(verts_IF, faces_IF)
-
                 side_mesh = trimesh.Trimesh(verts_IF, faces_IF)
                 side_mesh = remesh_laplacian(side_mesh, side_mesh_path)
 
@@ -597,7 +622,7 @@ if __name__ == "__main__":
             full_lst = []
 
             if "face" in cfg.bni.use_smpl:
-
+                
                 # only face
                 face_mesh = apply_vertex_mask(face_mesh, SMPLX_object.front_flame_vertex_mask)
 
@@ -694,33 +719,48 @@ if __name__ == "__main__":
                 final_mesh = sum(full_lst)
                 final_mesh.export(final_path)
 
-            if not args.novis:
-                dataset.render.load_meshes(final_mesh.vertices, final_mesh.faces)
-                rotate_recon_lst = dataset.render.get_image(cam_type="four")
-                per_loop_lst.extend([in_tensor['image'][idx:idx + 1]] + rotate_recon_lst)
+        if not args.novis:
+            # Load rendered images from multiple views.
+            dataset.render.load_meshes(final_mesh.vertices, final_mesh.faces)
+            rotate_recon_lst = dataset.render.get_image(cam_type="four")
+            # Create two separate lists for the cloth images: one for front and one for back.
+            per_loop_lst_front = [in_tensor['image'][idx:idx + 1]] + rotate_recon_lst
+            per_loop_lst_back  = [in_tensor['image_back'][idx:idx + 1]] + rotate_recon_lst
 
+        # @SSH
+        # --- Color the final mesh ---
             if cfg.bni.texture_src == 'image':
 
                 # coloring the final mesh (front: RGB pixels, back: normal colors)
                 final_colors = query_color(
                     torch.tensor(final_mesh.vertices).float(),
                     torch.tensor(final_mesh.faces).long(),
-                    in_tensor["image"][idx:idx + 1],
-                    device=device,
-                )
-                final_mesh.visual.vertex_colors = final_colors
-                final_mesh.export(final_path)
-
+                torch.tensor(side_mesh.vertices).float(),
+                in_tensor["image"][idx:idx + 1],
+                in_tensor["image_back"][idx:idx + 1],
+                device=device,
+            )
+            final_mesh.visual.vertex_colors = final_colors
+            final_mesh.export(final_path)
+            elif cfg.bni.texture_src == 'SD':
             elif cfg.bni.texture_src == 'SD':
 
-                # !TODO: add texture from Stable Diffusion
-                pass
+        elif cfg.bni.texture_src == 'SD':
 
-        if len(per_loop_lst) > 0 and (not args.novis):
+            # !TODO: add texture from Stable Diffusion
+            pass
 
-            per_data_lst.append(get_optim_grid_image(per_loop_lst, None, nrow=5, type="cloth"))
-            per_data_lst[-1].save(osp.join(args.out_dir, cfg.name, f"png/{data['name']}_cloth.png"))
+        if not args.novis and len(per_loop_lst_front) > 0 and len(per_loop_lst_back) > 0:
+            # Save the front cloth image.
+            cloth_front = get_optim_grid_image(per_loop_lst_front, None, nrow=5, type="cloth_front")
+            cloth_front_path = osp.join(args.out_dir, cfg.name, f"png/{data['name']}_cloth_front.png")
+            cloth_front.save(cloth_front_path)
 
+            # Save the back cloth image.
+            cloth_back = get_optim_grid_image(per_loop_lst_back, None, nrow=5, type="cloth_back")
+            cloth_back_path = osp.join(args.out_dir, cfg.name, f"png/{data['name']}_cloth_back.png")
+            cloth_back.save(cloth_back_path)
+        # @SSH END
             # for video rendering
             in_tensor["BNI_verts"].append(torch.tensor(final_mesh.vertices).float())
             in_tensor["BNI_faces"].append(torch.tensor(final_mesh.faces).long())

@@ -70,7 +70,7 @@ class NormalNet_f(BasePIFuNet):
 
         init_net(self)
 
-    def forward(self, in_tensor):
+    def forward(self, in_tensor, out_dir):
         # Prepare input lists for forward (front) and backward (back) normal estimation
         inF_list = []
         inB_list = []
@@ -88,18 +88,25 @@ class NormalNet_f(BasePIFuNet):
 
         # Concatenate inputs along the channel dimension
         nmlF = self.netF(torch.cat(inF_list, dim=1))  # Forward network
+        # @SSH
         nmlB = self.netB(torch.cat(inB_list, dim=1))  # Backward network
+        # nmlB = self.netF(torch.cat(inB_list, dim=1))
+        # @SSH END
 
         # Normalize normals to ensure ||normal|| == 1
         nmlF_normalized = nmlF / torch.norm(nmlF, dim=1, keepdim=True)
         nmlB_normalized = nmlB / torch.norm(nmlB, dim=1, keepdim=True)
 
+        # @SSH
+        # nmlB_normalized = -nmlB_normalized
+        # nmlB_normalized[:, 0, :, :] = -nmlB_normalized[:, 0, :, :]  # Flip x-component (mirror)
+        # @SSH END
+
         # Create a mask for valid pixels (non-zero regions)
         mask = ((in_tensor["image"].abs().sum(dim=1, keepdim=True) != 0.0).detach().float())
         back_mask = ((in_tensor["image_back"].abs().sum(dim=1, keepdim=True) != 0.0).detach().float())
-
-        self.save_mask_image(mask, back_mask)
-        self.save_nml_image(nmlF_normalized, nmlB_normalized)
+        self.save_mask_image(mask, back_mask, out_dir)
+        self.save_nml_image(nmlF_normalized, nmlB_normalized, out_dir)
         # Return masked and normalized normals
         return nmlF_normalized * mask, nmlB_normalized * back_mask
 
@@ -186,8 +193,9 @@ class NormalNet_f(BasePIFuNet):
 
         return total_loss
 
-    def save_mask_image(self, mask, back_mask):
+    def save_mask_image(self, mask, back_mask, out_dir):
         # Normalize the tensors to range 0-255 (optional if they're already 0 or 1)
+        self.out_dir = out_dir
         mask = (mask * 255).byte()
         back_mask = (back_mask * 255).byte()
 
@@ -200,11 +208,12 @@ class NormalNet_f(BasePIFuNet):
         back_mask_img = Image.fromarray(back_mask_np, mode='L')
 
         # Save images
-        mask_img.save("./results_rafa/mask_image.png")
-        back_mask_img.save("./results_rafa/back_mask_image.png")
+        mask_img.save(f"{self.out_dir}/econ/png/mask_image.png")
+        back_mask_img.save(f"{out_dir}/econ/png/back_mask_image.png")
 
-    def save_nml_image(self, nmlF_normalized, nmlB_normalized):
+    def save_nml_image(self, nmlF_normalized, nmlB_normalized, out_dir):
         # Normalize to [0, 1] range for image representation
+        self.out_dir = out_dir
         nmlF_normalized = (nmlF_normalized + 1) / 2  # Map from [-1, 1] to [0, 1]
         nmlB_normalized = (nmlB_normalized + 1) / 2  # Map from [-1, 1] to [0, 1]
 
@@ -217,9 +226,9 @@ class NormalNet_f(BasePIFuNet):
         nmlB_np = nmlB_normalized.squeeze().permute(1, 2, 0).cpu().numpy()  # (H, W, 3)
 
         # Convert to PIL Image and save
-        nmlF_img = Image.fromarray(nmlF_np, mode='RGB')  # Save as RGB image
+        nmlF_img = Image.fromarray(nmlF_np, mode='RGB')
         nmlB_img = Image.fromarray(nmlB_np, mode='RGB')
 
         # Save images
-        nmlF_img.save("./results_rafa/nmlF_image.png")
-        nmlB_img.save("./results_rafa/nmlB_image.png")
+        nmlF_img.save(f"{self.out_dir}/econ/png/nmlF_image.png")
+        nmlB_img.save(f"{self.out_dir}/econ/png/nmlB_image.png")

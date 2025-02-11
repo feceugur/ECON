@@ -1018,6 +1018,7 @@ class SMPLX(SMPLH):
         if osp.isdir(model_path):
             model_fn = "SMPLX_{}.{ext}".format(gender.upper(), ext=ext)
             smplx_path = os.path.join(model_path, model_fn)
+            # smplx_path = '/home/ubuntu/Data/Fulden/HPS/pymafx_data/smpl/SMPLX_NEUTRAL.npz'
         else:
             smplx_path = model_path
         assert osp.exists(smplx_path), "Path {} does not exist!".format(smplx_path)

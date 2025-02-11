@@ -32,7 +32,9 @@ smplx_container = SMPLX()
 device = torch.device(f"cuda:{args.gpu}")
 
 # loading SMPL-X and econ objs inferred with ECON
-prefix = f"./results/econ/obj/{args.name}"
+# prefix = f"./results_fulden/econ/obj/{args.name}"
+prefix = f"./results/Fulden/IFN+_face_thresh_0.31/econ/obj/{args.name}"
+
 smpl_path = f"{prefix}_smpl_00.npy"
 smplx_param = np.load(smpl_path, allow_pickle=True).item()
 
@@ -137,7 +139,7 @@ if not osp.exists(f"{prefix}/econ_da.obj") or not osp.exists(f"{prefix}/smpl_da.
     econ_da_body = keep_largest(econ_da_body)
 
     # remove ignore parts from SMPL-X
-    register_mask = ~np.isin(np.arange(smpl_da.vertices.shape[0]), ignore_vid)
+    register_mask = np.ones(smpl_da.vertices.shape[0], dtype=bool)  # All True
     smpl_da_body = smpl_da.copy()
     smpl_da_body.update_faces(register_mask[smpl_da.faces].all(axis=1))
     smpl_da_body.remove_unreferenced_vertices()
@@ -251,29 +253,65 @@ print("Start Color mapping...")
 from PIL import Image
 from torchvision import transforms
 
-from lib.common.render import query_color, query_normal_color
+from lib.common.render import query_color, query_normal_color, query_avatar_color
 from lib.common.render_utils import Pytorch3dRasterizer
 
 # choice 1: pixels to visible regions, normals to invisible regions
 
-if not osp.exists(f"{prefix}/econ_icp_rgb.ply"):
-    masked_image = f"./results/econ/png/{args.name}_cloth.png"
-    tensor_image = transforms.ToTensor()(Image.open(masked_image))[:, :, :512]
+# @SSH
+# if not osp.exists(f"{prefix}/econ_icp_rgb.ply"):
+#     masked_image = f"./results/Fulden/face_thresh_0.30/econ/png/{args.name}_cloth.png"
+#     # masked_image = f"./results/econ/png/{args.name}_cloth.png"
 
-    final_rgb = query_color(
+#     tensor_image = transforms.ToTensor()(Image.open(masked_image))[:, :, :512]
+#     final_rgb = query_color(
+#         torch.tensor(econ_pose.vertices).float(),
+#         torch.tensor(econ_pose.faces).long(),
+#         ((tensor_image - 0.5) * 2.0).unsqueeze(0).to(device),
+#         ((tensor_image - 0.5) * 2.0).unsqueeze(0).to(device),   # back image
+#         device=device,
+#         paint_normal=False,
+#     ).numpy()
+#     final_rgb[final_rgb == tensor_image[:, 0, 0] * 255.0] = 0.5 * 255.0
+
+#     econ_pose.visual.vertex_colors = final_rgb
+#     econ_pose.export(f"{prefix}/econ_icp_rgb.ply")
+# else:
+#     mesh = trimesh.load(f"{prefix}/econ_icp_rgb.ply")
+#     final_rgb = mesh.visual.vertex_colors[:, :3]
+if not osp.exists(f"{prefix}/econ_icp_rgb.ply"):
+    # Load the separate cloth images saved from infer_f.py.
+    cloth_front_path = f"./results/Fulden/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_front.png"
+    cloth_back_path  = f"./results/Fulden/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_back.png"
+
+    # Load the images as tensors.
+    tensor_front = transforms.ToTensor()(Image.open(cloth_front_path))[:, :, :512]
+    tensor_back  = transforms.ToTensor()(Image.open(cloth_back_path))[:, :, :512]
+
+    # Normalize the textures from [0,1] to [-1,1] and add a batch dimension.
+    front_image = ((tensor_front - 0.5) * 2.0).unsqueeze(0).to(device)
+    back_image  = ((tensor_back  - 0.5) * 2.0).unsqueeze(0).to(device)
+
+    # Call the updated query_color that now accepts two images.
+    final_rgb = query_avatar_color(
         torch.tensor(econ_pose.vertices).float(),
         torch.tensor(econ_pose.faces).long(),
-        ((tensor_image - 0.5) * 2.0).unsqueeze(0).to(device),
+        front_image,
+        back_image,
         device=device,
-        paint_normal=False,
     ).numpy()
-    final_rgb[final_rgb == tensor_image[:, 0, 0] * 255.0] = 0.5 * 255.0
+
+    # Optionally: adjust any pixels that still match a default color if needed.
+    # For example:
+    final_rgb[final_rgb == tensor_front[:, 0, 0] * 255.0] = 0.5 * 255.0
 
     econ_pose.visual.vertex_colors = final_rgb
     econ_pose.export(f"{prefix}/econ_icp_rgb.ply")
 else:
     mesh = trimesh.load(f"{prefix}/econ_icp_rgb.ply")
     final_rgb = mesh.visual.vertex_colors[:, :3]
+
+# @SSH END 
 
 # choice 2: normals to all the regions
 

@@ -135,8 +135,10 @@ class SMPLX:
 
         self.smplx_to_smpl = cPickle.load(open(self.smplx_to_smplx_path, "rb"))
 
-        self.model_dir = osp.join(self.current_dir, "models")
+        # self.model_dir = osp.join(self.current_dir, "models")
 
+        self.model_dir = osp.join(self.data_dir, "HPS/pymafx_data")
+        
         # self.ghum_smpl_pairs = torch.tensor([(0, 24), (2, 26), (5, 25), (7, 28), (8, 27), (11, 16),
         #                                      (12, 17), (13, 18), (14, 19), (15, 20), (16, 21),
         #                                      (17, 39), (18, 44), (19, 36), (20, 41), (21, 35),

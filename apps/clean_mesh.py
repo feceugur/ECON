@@ -27,6 +27,7 @@ class MeshWatertightifier:
         self.ms.meshing_repair_non_manifold_vertices()
         self.ms.meshing_remove_unreferenced_vertices()
 
+
     def fill_holes(self):
         """
         Fills holes in the mesh.
