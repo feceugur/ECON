@@ -58,234 +58,39 @@ def image2vid(images, vid_path):
         video.write(cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR))
     video.release()
 
-# def query_color(verts, faces, image, device, paint_normal=True):
-#     """query colors from points and image
 
-#     Args:
-#         verts ([B, 3]): [query verts]
-#         faces ([M, 3]): [query faces]
-#         image ([B, 3, H, W]): [full image]
+def query_color(verts, faces, image, device, paint_normal=True):
+    """query colors from points and image
 
-#     Returns:
-#         [np.float]: [return colors]
-#     """
-
-#     verts = verts.float().to(device)
-#     faces = faces.long().to(device)
-
-#     (xy, z) = verts.split([2, 1], dim=1)
-#     visibility = get_visibility(xy, z, faces[:, [0, 2, 1]]).flatten()
-#     uv = xy.unsqueeze(0).unsqueeze(2)    # [B, N, 2]
-#     uv = uv * torch.tensor([1.0, -1.0]).type_as(uv)
-#     colors = ((
-#         torch.nn.functional.grid_sample(image, uv, align_corners=True)[0, :, :, 0].permute(1, 0) +
-#         1.0
-#     ) * 0.5 * 255.0)
-#     if paint_normal:
-#         colors[visibility == 0.0] = ((
-#             Meshes(verts.unsqueeze(0), faces.unsqueeze(0)).verts_normals_padded().squeeze(0) + 1.0
-#         ) * 0.5 * 255.0)[visibility == 0.0]
-#     else:
-#         colors[visibility == 0.0] = (torch.tensor([0.5, 0.5, 0.5]) * 255.0).to(device)
-
-#     return colors.detach().cpu()
-
-# @SSH - works well
-def query_avatar_color(verts, faces, front_image, back_image, device):
-    """
-    Query colors from two images (front_image and back_image) based on vertex visibility.
-    
-    For vertices that are visible from the front, we sample colors from front_image.
-    For vertices that are not visible (i.e. on the back side), we sample from back_image.
-    
     Args:
-        verts (Tensor): [N, 3] vertex coordinates.
-        faces (Tensor): [M, 3] face indices.
-        front_image (Tensor): [1, C, H, W] tensor representing the front image (values in [-1, 1]).
-        back_image (Tensor): [1, C, H, W] tensor representing the back image (values in [-1, 1]).
-        device (torch.device): The device on which tensors should reside.
-    
+        verts ([B, 3]): [query verts]
+        faces ([M, 3]): [query faces]
+        image ([B, 3, H, W]): [full image]
+
     Returns:
-        Tensor: [N, 3] colors in the range [0, 255] for each vertex.
+        [np.float]: [return colors]
     """
+
     verts = verts.float().to(device)
     faces = faces.long().to(device)
-    
-    # Split vertex coordinates: xy for UV computation and z for depth
+
     (xy, z) = verts.split([2, 1], dim=1)
-    
-    # Compute the visibility mask using your existing function.
-    # Here, visibility > 0.5 indicates the vertex is seen from the front.
-    visibility = get_visibility(xy, z, faces[:, [0, 2, 1]]).flatten().to(device)  # shape: [N]
-    
-    # Compute UV coordinates based on xy.
-    # We assume that the front and back images share the same UV mapping.
-    # The grid_sample function expects a grid of shape [N, H, W, 2].
-    uv = xy.unsqueeze(0).unsqueeze(2)  # shape: [1, N, 1, 2]
-    # Adjust the y-axis if necessary (flip y) so that the UV mapping aligns with image coordinates.
-    uv = uv * torch.tensor([1.0, -1.0], device=device).view(1, 1, 1, 2)
-    
-    # Sample from the front image.
-    front_sample = torch.nn.functional.grid_sample(
-        front_image, uv, align_corners=True, padding_mode='border'
-    )
-    # front_sample: [1, C, N, 1] --> reshape to [N, C]
-    front_colors = front_sample.squeeze(3).permute(2, 1, 0).squeeze(2)
-    front_colors = (front_colors + 1.0) * 0.5 * 255.0  # Map from [-1, 1] to [0, 255]
-    
-    # Sample from the back image.
-    back_sample = torch.nn.functional.grid_sample(
-        back_image, uv, align_corners=True, padding_mode='border'
-    )
-    # back_sample: [1, C, N, 1] --> reshape to [N, C]
-    back_colors = back_sample.squeeze(3).permute(2, 1, 0).squeeze(2)
-    back_colors = (back_colors + 1.0) * 0.5 * 255.0
-    
-    # Create a boolean mask: True for vertices visible from the front.
-    visibility_mask = (visibility > 0.6).unsqueeze(1).expand(-1, 3)
-    
-    # Use torch.where to choose front_colors if visible, otherwise use back_colors.
-    colors = torch.where(visibility_mask, front_colors, back_colors)
-    
+    visibility = get_visibility(xy, z, faces[:, [0, 2, 1]]).flatten()
+    uv = xy.unsqueeze(0).unsqueeze(2)    # [B, N, 2]
+    uv = uv * torch.tensor([1.0, -1.0]).type_as(uv)
+    colors = ((
+        torch.nn.functional.grid_sample(image, uv, align_corners=True)[0, :, :, 0].permute(1, 0) +
+        1.0
+    ) * 0.5 * 255.0)
+    if paint_normal:
+        colors[visibility == 0.0] = ((
+            Meshes(verts.unsqueeze(0), faces.unsqueeze(0)).verts_normals_padded().squeeze(0) + 1.0
+        ) * 0.5 * 255.0)[visibility == 0.0]
+    else:
+        colors[visibility == 0.0] = (torch.tensor([0.5, 0.5, 0.5]) * 255.0).to(device)
+
     return colors.detach().cpu()
 
-# IDK IF THIS WORKS WELL
-import torch
-import torch.nn.functional as F
-from pytorch3d.ops import knn_points
-
-def query_color(verts, faces, side_verts,
-                front_image, back_image, device,
-                threshold=0.8):
-    """
-    1) Classify main mesh (verts) as front/back using single visibility.
-    2) Paint front/back from images.
-    3) Inpaint side_verts by averaging colors from the nearest front & back verts.
-    4) Return ONE color buffer for all vertices: [N_main + N_side, 3].
-
-    Args:
-        verts (FloatTensor): [N_main, 3] main mesh vertices
-        faces (LongTensor):  [M_main, 3] main mesh faces (used in get_visibility)
-        side_verts (FloatTensor): [N_side, 3] side mesh vertices
-        front_image (FloatTensor): [1, C, H, W], in [-1,1]
-        back_image  (FloatTensor): [1, C, H, W], in [-1,1]
-        device (torch.device)
-        threshold (float): e.g. 0.8 for front/back classification
-
-    Returns:
-        colors: [N_main + N_side, 3], each in [0,255], on CPU
-    """
-
-    # ---------------------------------------------------------
-    # PART A: MAIN MESH -- VISIBILITY AND FRONT/BACK PAINTING
-    # ---------------------------------------------------------
-
-    # 1) Move main mesh to device
-    verts  = verts.float().to(device)   # [N_main, 3]
-    faces  = faces.long().to(device)    # [M_main, 3]
-    N_main = verts.shape[0]
-
-    # 2) Compute visibility in [0,1] or {0,1}.  
-    #    We'll assume your get_visibility() returns shape [N_main], 0/1.
-    #    If it's only 0/1, then 'in-between' region will remain empty.
-    xy, z = verts.split([2, 1], dim=1)
-    visibility = get_visibility(xy, z, faces[:, [0,2,1]])  # -> [N_main]
-    visibility = visibility.flatten().to(device)
-
-    # 3) Sample front/back textures with grid_sample
-    uv = xy.unsqueeze(0).unsqueeze(2)  # -> [1, N_main, 1, 2]
-    # flip Y for PyTorch coords:
-    uv = uv * torch.tensor([1.0, -1.0], device=device).view(1,1,1,2)
-
-    front_sample = F.grid_sample(front_image, uv, align_corners=True, padding_mode='border')
-    back_sample  = F.grid_sample(back_image,  uv, align_corners=True, padding_mode='border')
-
-    # Reshape to [N_main, C], map [-1,1] -> [0,255]
-    front_colors = (front_sample.squeeze(3).permute(2,1,0).squeeze(2) + 1.0) * 0.5 * 255.0
-    back_colors  = (back_sample.squeeze(3).permute(2,1,0).squeeze(2) + 1.0) * 0.5 * 255.0
-
-    # 4) Masks
-    front_mask = (visibility > threshold)               # e.g. (==1 if threshold=0.8)
-    back_mask  = (visibility < (1.0 - threshold))       # e.g. (==0 if threshold=0.8)
-    inpaint_mask = ~(front_mask | back_mask)            # only non-empty if visibility is fractional
-
-    # 5) Initialize colors for main mesh
-    colors_main = torch.zeros((N_main, 3), device=device)
-
-    # 6) Assign front/back
-    colors_main[front_mask] = front_colors[front_mask]
-    colors_main[back_mask]  = back_colors[back_mask]
-
-    # 7) Optionally fill "in-between" with nearest front/back average
-    inpaint_inds = inpaint_mask.nonzero().flatten()
-    if len(inpaint_inds) > 0:
-        # only relevant if you have fractional visibility
-        front_inds = front_mask.nonzero().flatten()
-        back_inds  = back_mask.nonzero().flatten()
-        if len(front_inds) > 0 and len(back_inds) > 0:
-            inpaint_positions = verts[inpaint_inds].unsqueeze(0)   # [1, N_inpaint, 3]
-            front_positions   = verts[front_inds].unsqueeze(0)     # [1, N_front, 3]
-            back_positions    = verts[back_inds].unsqueeze(0)      # [1, N_back, 3]
-
-            nn_front = knn_points(inpaint_positions, front_positions, K=1)
-            nn_back  = knn_points(inpaint_positions, back_positions,  K=1)
-
-            idx_front = nn_front.idx[0, :, 0]
-            idx_back  = nn_back.idx[0, :, 0]
-            c_front = colors_main[front_inds[idx_front]]  # [N_inpaint, 3]
-            c_back  = colors_main[back_inds[idx_back]]
-
-            c_inpaint = 0.5 * (c_front + c_back)
-            colors_main[inpaint_inds] = c_inpaint
-
-    # ---------------------------------------------------------
-    # PART B: SIDE MESH -- INPAINT BY NEAREST FRONT & BACK
-    # ---------------------------------------------------------
-
-    side_verts = side_verts.float().to(device)  # [N_side, 3]
-    N_side = side_verts.shape[0]
-
-    # We'll fill a separate side-color buffer, then merge it with the main.
-    colors_side = torch.zeros((N_side, 3), device=device)
-
-    # Indices of main-mesh front/back (for nearest-neighbor search)
-    front_inds = front_mask.nonzero().flatten()
-    back_inds  = back_mask.nonzero().flatten()
-
-    if N_side > 0 and len(front_inds) > 0 and len(back_inds) > 0:
-        # 1) side positions => [1, N_side, 3]
-        side_positions  = side_verts.unsqueeze(0)
-        # 2) main front/back positions
-        front_positions = verts[front_inds].unsqueeze(0)  # [1, N_front, 3]
-        back_positions  = verts[back_inds].unsqueeze(0)   # [1, N_back, 3]
-
-        # 3) Nearest front
-        nn_front = knn_points(side_positions, front_positions, K=1)
-        idx_front = nn_front.idx[0, :, 0]
-        c_front = colors_main[front_inds[idx_front]]  # shape [N_side, 3]
-
-        # 4) Nearest back
-        nn_back  = knn_points(side_positions, back_positions, K=1)
-        idx_back  = nn_back.idx[0, :, 0]
-        c_back  = colors_main[back_inds[idx_back]]
-
-        # 5) Average => side color
-        c_side = 0.5 * (c_front + c_back)
-        colors_side = c_side
-
-    # If there's no front or no back, side_verts remain zeros or you can copy whichever is available.
-
-    # ---------------------------------------------------------
-    # PART C: COMBINE BOTH INTO ONE COLOR BUFFER
-    # ---------------------------------------------------------
-
-    # We'll concatenate main mesh colors + side mesh colors into a single [N_main + N_side, 3].
-    colors = torch.cat([colors_main, colors_side], dim=0)  # shape: [N_main + N_side, 3]
-
-    # Return them on CPU
-    return colors.detach().cpu()
-
-# @SSH END
 
 def query_normal_color(verts, faces, device):
     """query normal colors
