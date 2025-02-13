@@ -394,15 +394,47 @@ if args.uv:
         torch.tensor(final_rgb).unsqueeze(0).float() / 255.0,
     )
 
-    gray_texture = texture_npy.copy()
-    gray_texture[texture_npy.sum(axis=2) == 0.0] = 0.5
+    # @SSH
+
+    import torch
+    import torch.nn.functional as F
+
+    # Assume texture_npy is your rendered texture as a (H, W, 3) numpy array in [0, 1].
+    # Convert to a PyTorch tensor and rearrange to (B, C, H, W)
+    texture_tensor = torch.from_numpy(texture_npy.copy()).float().permute(2, 0, 1).unsqueeze(0).to(device)
+
+    # --- Quantization ---
+    # For example, reduce each channel to 16 discrete levels to force hard boundaries.
+    levels = 16
+    # Multiply by 255, quantize, then scale back to [0,1].
+    texture_quantized = torch.floor(texture_tensor * 255 / (256 / levels)) * (256 / levels) / 255
+
+    # --- Morphological Dilation ---
+    # Use max_pool2d as a dilation operator on each channel independently.
+    # The kernel_size and padding determine the effect.
+    dilated = F.max_pool2d(texture_quantized, kernel_size=3, stride=1, padding=1)
+    eroded = -F.max_pool2d(-dilated, kernel_size=3, stride=1, padding=1)
+
+    # (Optionally, you can follow with an erosion step via negative pooling if desired:
+    # cleaned = -F.max_pool2d(-dilated, kernel_size=3, stride=1, padding=1)
+    # For now, we'll use the dilated result directly.)
+    cleaned_texture = eroded
+
+    # Convert back to (H, W, 3) numpy array for further processing or saving.
+    texture_cleaned = cleaned_texture.squeeze(0).permute(1, 2, 0).cpu().numpy()
+
+    # @SSH END
+
+    gray_texture = texture_cleaned.copy()
+    gray_texture[texture_cleaned.sum(axis=2) == 0.0] = 0.5
     Image.fromarray((gray_texture * 255.0).astype(np.uint8)).save(f"{cache_path}/texture.png")
 
-    # UV mask for TEXTure (https://readpaper.com/paper/4720151447010820097)
-    white_texture = texture_npy.copy()
-    white_texture[texture_npy.sum(axis=2) == 0.0] = 1.0
-    Image.fromarray((white_texture * 255.0).astype(np.uint8)).save(f"{cache_path}/mask.png")
 
+    # UV mask for TEXTure (https://readpaper.com/paper/4720151447010820097)
+    white_texture = texture_cleaned.copy()
+    white_texture[texture_cleaned.sum(axis=2) == 0.0] = 1.0
+    Image.fromarray((white_texture * 255.0).astype(np.uint8)).save(f"{cache_path}/mask.png")
+    
     # generate a-pose vertices
     new_pose = smpl_out_lst[0].full_pose
     new_pose[:, :3] = 0.0
