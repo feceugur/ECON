@@ -28,6 +28,7 @@ import numpy as np
 import torch
 import torchvision
 import trimesh
+import pymeshlab
 from pytorch3d.ops import SubdivideMeshes
 from termcolor import colored
 from tqdm.auto import tqdm
@@ -35,7 +36,7 @@ from tqdm.auto import tqdm
 from apps.IFGeo import IFGeo
 from apps.Normal_f import Normal
 from apps.sapiens import ImageProcessor
-from apps.clean_mesh import MeshWatertightifier
+from apps.clean_mesh import MeshCleanProcess, MeshWatertightifier
 
 from lib.common.BNI import BNI
 from lib.common.BNI_utils import save_normal_tensor
@@ -694,6 +695,37 @@ if __name__ == "__main__":
                 final_mesh = sum(full_lst)
                 final_mesh.export(final_path)
 
+            # Load the final mesh
+            final_trimesh = trimesh.load(final_path)
+
+            # Convert face vertex indices to NumPy array
+            face_vids = np.array(SMPLX_object.front_flame_vertex_mask, dtype=np.int32)
+
+            # Get all vertices and faces
+            vertices = final_trimesh.vertices
+            faces = final_trimesh.faces
+
+            # Find faces that contain at least one face vertex (to exclude from simplification)
+            face_mask = np.isin(faces, face_vids).any(axis=1)
+
+            # Separate face and body meshes
+            face_mesh = trimesh.Trimesh(vertices=vertices, faces=faces[face_mask])  # Face remains unchanged
+            body_mesh = trimesh.Trimesh(vertices=vertices, faces=faces[~face_mask])  # Body will be simplified
+
+            # Compute the target reduction ratio (must be between 0 and 1)
+            target_faces = 25000  # Adjust polygon count
+            current_body_faces = len(body_mesh.faces)
+            target_reduction = max(0.0, min(1.0, 1 - (target_faces / current_body_faces)))
+
+            # Apply decimation **only to the body**
+            simplified_body = body_mesh.simplify_quadric_decimation(target_reduction)
+
+            # Merge the unchanged face with the simplified body
+            final_mesh = trimesh.util.concatenate([face_mesh, simplified_body])
+
+            # Export the final mesh
+            final_mesh.export(final_path)
+            final_mesh.export(f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_test.obj")
             if not args.novis:
                 dataset.render.load_meshes(final_mesh.vertices, final_mesh.faces)
                 rotate_recon_lst = dataset.render.get_image(cam_type="four")
@@ -733,10 +765,17 @@ if __name__ == "__main__":
             )
 
         final_watertight_path = f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_full_wt.obj"
-        watertightifier = MeshWatertightifier(final_path, final_watertight_path)
+        watertightifier = MeshCleanProcess(final_path, final_watertight_path)
         result = watertightifier.process(reconstruction_method='poisson', depth=10)
 
         if result:
             print("The mesh is watertight and has been saved successfully!")
         else:
             print("The mesh is not watertight. Further inspection may be needed.")
+        
+        final_mesh = MeshCleanProcess.process_watertight_mesh(
+            final_watertight_path=f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_full_wt.obj",
+            output_path=f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_final.obj",
+            face_vertex_mask=SMPLX_object.front_flame_vertex_mask,
+            target_faces=25000
+        )

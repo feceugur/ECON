@@ -17,8 +17,6 @@
 import logging
 import warnings
 
-from apps.clean_mesh import MeshWatertightifier
-
 warnings.filterwarnings("ignore")
 logging.getLogger("lightning").setLevel(logging.ERROR)
 logging.getLogger("trimesh").setLevel(logging.ERROR)
@@ -37,6 +35,7 @@ from tqdm.auto import tqdm
 from apps.IFGeo import IFGeo
 from apps.Normal import Normal
 from apps.sapiens import ImageProcessor
+from apps.clean_mesh import MeshCleanProcess
 
 from lib.common.BNI import BNI
 from lib.common.BNI_utils import save_normal_tensor
@@ -693,6 +692,7 @@ if __name__ == "__main__":
                 final_mesh = sum(full_lst)
                 final_mesh.export(final_path)
 
+            
             if not args.novis:
                 dataset.render.load_meshes(final_mesh.vertices, final_mesh.faces)
                 rotate_recon_lst = dataset.render.get_image(cam_type="four")
@@ -732,10 +732,17 @@ if __name__ == "__main__":
             )
             
         final_watertight_path = f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_full_wt.obj"
-        watertightifier = MeshWatertightifier(final_path, final_watertight_path)
+        watertightifier = MeshCleanProcess(final_path, final_watertight_path)
         result = watertightifier.process(reconstruction_method='poisson', depth=10)
 
         if result:
             print("The mesh is watertight and has been saved successfully!")
         else:
             print("The mesh is not watertight. Further inspection may be needed.")
+
+        final_mesh = MeshCleanProcess.process_watertight_mesh(
+            final_watertight_path=f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_full_wt.obj",
+            output_path=f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_final.obj",
+            face_vertex_mask=SMPLX_object.front_flame_vertex_mask,
+            target_faces=25000
+)
