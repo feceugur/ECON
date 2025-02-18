@@ -42,7 +42,7 @@ from lib.common.BNI_utils import save_normal_tensor
 from lib.common.config import cfg
 from lib.common.imutils import blend_rgb_norm, load_img, transform_to_tensor, wrap
 from lib.common.local_affine import register
-from lib.common.render import query_color
+from lib.common.render import query_color, query_side_color, query_back_color, query_normal_color
 from lib.common.train_util import Format, init_loss
 from lib.common.voxelize import VoxelGrid
 from lib.dataset.mesh_util import *
@@ -90,7 +90,7 @@ if __name__ == "__main__":
     parser.add_argument("-multi", action="store_false")
     parser.add_argument("-novis", action="store_true")
     
-    parser.add_argument("-n", "--name", type=str, default="fulden_tpose_f1")
+    parser.add_argument("-n", "--name", type=str, default="rafa_tpose_f_3")
     parser.add_argument("-g", "--gpu", type=int, default=0)
     parser.add_argument("-uv", action="store_true")
     parser.add_argument("-dress", action="store_true")
@@ -159,12 +159,12 @@ if __name__ == "__main__":
     pbar = tqdm(dataset)
 
     # @SSH
-    people=['Fulden', 'Rafael', 'Roger', 'Albert', 'Stefan']
+    people=['Fulden', 'Rafa', 'Roger', 'Albert', 'Stefan']
     if cfg.bni.use_ifnet:
-        args.out_dir = f'{args.out_dir}/{people[0]}/IFN+_face_thresh_{cfg.bni.face_thres:.2f}'
+        args.out_dir = f'{args.out_dir}/{people[1]}/IFN+_face_thresh_{cfg.bni.face_thres:.2f}'
         os.makedirs(args.out_dir, exist_ok=True)
     else:
-        args.out_dir = f'{args.out_dir}/{people[0]}/face_thresh_{cfg.bni.face_thres:.2f}'
+        args.out_dir = f'{args.out_dir}/{people[1]}/face_thresh_{cfg.bni.face_thres:.2f}'
         os.makedirs(args.out_dir, exist_ok=True)
        
     for data, data_b in pbar:
@@ -755,20 +755,45 @@ if __name__ == "__main__":
         # @SSH
         # --- Color the final mesh ---
             if cfg.bni.texture_src == 'image':
+                # Use final mesh vertices for all texture queries.
+                verts_tensor = torch.tensor(final_mesh.vertices).float().to(device)
+                faces_tensor = torch.tensor(final_mesh.faces).long().to(device)
 
-                # coloring the final mesh (front: RGB pixels, back: normal colors)
-                final_colors = query_color(
-                    torch.tensor(final_mesh.vertices).float(),
-                    torch.tensor(final_mesh.faces).long(),
-                torch.tensor(side_mesh.vertices).float(),
-                torch.tensor(side_mesh.faces).long(),
-                in_tensor["image"][idx:idx + 1],
-                in_tensor["image_back"][idx:idx + 1],
-                device=device,
-            )
+                # Query colors from front and back images using final mesh vertices.
+                front_colors = query_color(
+                    verts_tensor,
+                    faces_tensor,
+                    in_tensor["image"][idx:idx + 1],
+                    device=device,
+                )
+                back_colors = query_back_color(
+                    verts_tensor,
+                    faces_tensor,
+                    in_tensor["image_back"][idx:idx + 1],
+                    device=device,
+                )
+                # Query side colors (constant green) using final mesh vertices.
+                side_colors = query_side_color(
+                    verts_tensor,
+                    faces_tensor,
+                    device=device,
+                )
+
+                # Compute visibility masks.
+                # Front mask uses modified face ordering.
+                xy, z = verts_tensor.split([2, 1], dim=1)
+                front_vis = get_visibility(xy, z, faces_tensor[:, [0, 2, 1]]).flatten()
+                # Back mask uses the original face ordering.
+                back_vis = get_visibility(xy, z, faces_tensor).flatten()
+
+                # Layering order: start with side as base, then overlay back, then front.
+                final_colors = side_colors.clone()
+                mask_back = (front_vis == 0) & (back_vis == 1)
+                final_colors[mask_back] = back_colors[mask_back]
+                final_colors[front_vis == 1] = front_colors[front_vis == 1]
+
                 final_mesh.visual.vertex_colors = final_colors
                 final_mesh.export(final_path)
-            
 
             elif cfg.bni.texture_src == 'SD':
 
@@ -807,14 +832,13 @@ if __name__ == "__main__":
             print("The mesh is not watertight. Further inspection may be needed.")
 
 
-print("avatarizer")
 
 smplx_container = SMPLX()
 device = torch.device(f"cuda:{args.gpu}")
 
 # loading SMPL-X and econ objs inferred with ECON
 # prefix = f"./results_fulden/econ/obj/{args.name}"
-prefix = f"./results/Fulden/IFN+_face_thresh_0.31/econ/obj/{args.name}"
+prefix = f"./results/Rafa/IFN+_face_thresh_0.32/econ/obj/{args.name}"
 
 smpl_path = f"{prefix}_smpl_00.npy"
 smplx_param = np.load(smpl_path, allow_pickle=True).item()
@@ -833,7 +857,6 @@ econ_obj.vertices -= smplx_param["transl"].cpu().numpy()
 for key in smplx_param.keys():
     smplx_param[key] = smplx_param[key].cpu().view(1, -1)
 
-print(smplx_container.model_dir)
 smpl_model = smplx.create(
     smplx_container.model_dir,
     model_type="smplx",
@@ -1035,7 +1058,6 @@ print("Start Color mapping...")
 from PIL import Image
 from torchvision import transforms
 
-from lib.common.render import query_color, query_normal_color, query_avatar_color
 from lib.common.render_utils import Pytorch3dRasterizer
 
 # choice 1: pixels to visible regions, normals to invisible regions
@@ -1061,10 +1083,11 @@ from lib.common.render_utils import Pytorch3dRasterizer
 # else:
 #     mesh = trimesh.load(f"{prefix}/econ_icp_rgb.ply")
 #     final_rgb = mesh.visual.vertex_colors[:, :3]
+
 if not osp.exists(f"{prefix}/econ_icp_rgb.ply"):
     # Load the separate cloth images saved from infer_f.py.
-    cloth_front_path = f"./results/Fulden/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_front.png"
-    cloth_back_path  = f"./results/Fulden/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_back.png"
+    cloth_front_path = f"./results/Rafa/IFN+_face_thresh_0.32/econ/png/{args.name}_cloth_front.png"
+    cloth_back_path  = f"./results/Rafa/IFN+_face_thresh_0.32/econ/png/{args.name}_cloth_back.png"
 
     # Load the images as tensors.
     tensor_front = transforms.ToTensor()(Image.open(cloth_front_path))[:, :, :512]
@@ -1074,23 +1097,50 @@ if not osp.exists(f"{prefix}/econ_icp_rgb.ply"):
     front_image = ((tensor_front - 0.5) * 2.0).unsqueeze(0).to(device)
     back_image  = ((tensor_back  - 0.5) * 2.0).unsqueeze(0).to(device)
 
-    # Call the updated query_color that now accepts two images.
-    final_rgb = query_color(
-        torch.tensor(econ_pose.vertices).float(),
-        torch.tensor(econ_pose.faces).long(),
-        torch.tensor(side_mesh.vertices).float(),
-        torch.tensor(side_mesh.faces).long(),
-    # in_tensor["image"][idx:idx + 1],
-    # in_tensor["image_back"][idx:idx + 1],
-    front_image,
-    back_image,
-    device=device,
-    ).numpy()
+    # Convert econ_pose mesh to tensors.
+    verts_tensor = torch.tensor(econ_pose.vertices).float().to(device)
+    faces_tensor = torch.tensor(econ_pose.faces).long().to(device)
 
-    # Optionally: adjust any pixels that still match a default color if needed.
-    # For example:
-    final_rgb[final_rgb == tensor_front[:, 0, 0] * 255.0] = 0.5 * 255.0
+    # Query front and back colors on econ_pose vertices.
+    front_colors = query_color(verts_tensor, faces_tensor, front_image, device=device)
+    back_colors  = query_back_color(verts_tensor, faces_tensor, back_image, device=device)
 
+    # Query side colors using econ_pose vertices (for consistent indexing).
+    side_colors = query_side_color(verts_tensor, faces_tensor, device=device)
+    
+    front_colors = front_colors.cpu()
+    back_colors  = back_colors.cpu()
+    side_colors  = side_colors.cpu()
+
+    # final_rgb = front_colors.clone()  # front is the base
+    # mask_back = back_colors.abs().sum(dim=1) != 0  # if back color is nonzero
+    # final_rgb[mask_back] = back_colors[mask_back]
+    # mask_side = side_colors.abs().sum(dim=1) != 0  # if side color is nonzero
+    # final_rgb[mask_side] = side_colors[mask_side]
+
+    default_color = torch.tensor([0.5, 0.5, 0.5], device=front_colors.device) * 255.0
+
+    # Compute masks that indicate whether the queried color is "valid"
+    # (i.e. different from the default color)
+    mask_front = (front_colors - default_color).abs().sum(dim=1) > 1e-3
+    mask_side  = (side_colors  - default_color).abs().sum(dim=1) > 1e-3
+    mask_back = (back_colors - default_color).abs().sum(dim=1) > 1e-3
+    
+    # Layering order: front > side > back.
+    # For each vertex:
+    #   if front is valid, use front.
+    #   else if side is valid, use side.
+    #   otherwise, use back.
+    final_rgb = torch.where(mask_side.unsqueeze(1), 
+                        side_colors, 
+                        back_colors)
+    final_rgb = torch.where(mask_back.unsqueeze(1), 
+                        back_colors, 
+                        side_colors)
+    final_rgb = torch.where(mask_front.unsqueeze(1), 
+                        front_colors, 
+                        side_colors)
+   
     econ_pose.visual.vertex_colors = final_rgb
     econ_pose.export(f"{prefix}/econ_icp_rgb.ply")
 else:
