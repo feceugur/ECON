@@ -806,9 +806,6 @@ if __name__ == "__main__":
         else:
             print("The mesh is not watertight. Further inspection may be needed.")
 
-
-print("avatarizer")
-
 smplx_container = SMPLX()
 device = torch.device(f"cuda:{args.gpu}")
 
@@ -833,7 +830,6 @@ econ_obj.vertices -= smplx_param["transl"].cpu().numpy()
 for key in smplx_param.keys():
     smplx_param[key] = smplx_param[key].cpu().view(1, -1)
 
-print(smplx_container.model_dir)
 smpl_model = smplx.create(
     smplx_container.model_dir,
     model_type="smplx",
@@ -877,6 +873,7 @@ smpl_verts = smpl_out_lst[3].vertices.detach()[0]
 smpl_tree = cKDTree(smpl_verts.cpu().numpy())
 dist, idx = smpl_tree.query(econ_obj.vertices, k=3)
 
+print(not osp.exists(f"{prefix}/econ_da.obj"), not osp.exists(f"{prefix}/smpl_da.obj"))
 if not osp.exists(f"{prefix}/econ_da.obj") or not osp.exists(f"{prefix}/smpl_da.obj"):
 
     # t-pose for ECON
@@ -1116,6 +1113,63 @@ else:
     file_normal = mesh.visual.vertex_colors[:, :3]
 
 # econ data used for animation and rendering
+# Get background color from the top-left pixel
+bg_color = (tensor_front[:, 0, 0].cpu().numpy() * 255.0)
+
+# Instead of using an elementwise equality (which might not work as expected for multi-channel data),
+# compute a mask for vertices that match the background color.
+tol = 1e-1  # tolerance for matching
+mask = np.all(np.abs(final_rgb - bg_color) < tol, axis=1)
+
+# Define purple (you can adjust the values as needed)
+purple_color = np.array([128, 0, 128], dtype=final_rgb.dtype)
+
+# Replace the colors at the masked vertices with purple
+final_rgb[mask] = purple_color
+
+def build_vertex_neighbors(faces, num_vertices):
+    """Build a list of neighboring vertices for each vertex."""
+    neighbors = {i: set() for i in range(num_vertices)}
+    for face in faces:
+        for i in range(3):
+            v_i = face[i]
+            v_j = face[(i+1)%3]
+            v_k = face[(i+2)%3]
+            neighbors[v_i].update([v_j, v_k])
+    return neighbors
+
+def inpaint_colors(vertices, faces, colors, mask, iterations=10):
+    """
+    For vertices where mask==True, update their color by averaging
+    the colors of neighboring vertices (that are not masked).
+    """
+    num_vertices = vertices.shape[0]
+    neighbors = build_vertex_neighbors(faces, num_vertices)
+    colors_inpainted = colors.copy()
+    for it in range(iterations):
+        new_colors = colors_inpainted.copy()
+        for i in range(num_vertices):
+            if mask[i]:
+                neighbor_idxs = list(neighbors[i])
+                valid_neighbors = [j for j in neighbor_idxs if not mask[j]]
+                if valid_neighbors:
+                    new_colors[i] = np.mean(colors_inpainted[valid_neighbors], axis=0)
+        colors_inpainted = new_colors
+    return colors_inpainted
+
+# Build a mask for vertices that are still purple (i.e. in need of inpainting)
+mask_purple = np.all(np.abs(final_rgb - purple_color) < tol, axis=1)
+
+# Inpaint the purple regions by averaging neighbor colors over several iterations.
+final_rgb_inpainted = inpaint_colors(econ_pose.vertices, econ_pose.faces, final_rgb, mask_purple, iterations=10)
+
+##########################################
+# Optional: Adjust any remaining background pixels if needed
+##########################################
+
+# (This step is optional; you might not need it if inpainting worked well.)
+final_rgb = final_rgb_inpainted
+
 
 econ_dict = {
     "v_template": econ_cano_verts.unsqueeze(0),

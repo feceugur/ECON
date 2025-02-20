@@ -251,7 +251,6 @@ def query_color(verts, faces, side_verts, side_faces,
     # If side_faces is provided (and nonempty), use it to assign red to the vertices
     # that participate in side faces. (Here, we simply set all side vertices to red.)
     if side_faces is not None and side_faces.numel() > 0:
-        print("yesss, we do enter here because")
         print(side_faces is not None, side_faces.numel()>0)
         side_faces = side_faces.long().to(device)
         # Optionally, determine the vertices used by side_faces:
