@@ -159,12 +159,12 @@ if __name__ == "__main__":
     pbar = tqdm(dataset)
 
     # @SSH
-    people=['Fulden', 'Rafael', 'Roger', 'Albert', 'Stefan']
+    people=['Fulden', 'Rafa', 'Jon', 'Jon2','Roger', 'Albert', 'Stefan']
     if cfg.bni.use_ifnet:
-        args.out_dir = f'{args.out_dir}/{people[0]}/IFN+_face_thresh_{cfg.bni.face_thres:.2f}'
+        args.out_dir = f'{args.out_dir}/{people[2]}/IFN+_face_thresh_{cfg.bni.face_thres:.2f}'
         os.makedirs(args.out_dir, exist_ok=True)
     else:
-        args.out_dir = f'{args.out_dir}/{people[0]}/face_thresh_{cfg.bni.face_thres:.2f}'
+        args.out_dir = f'{args.out_dir}/{people[2]}/face_thresh_{cfg.bni.face_thres:.2f}'
         os.makedirs(args.out_dir, exist_ok=True)
        
     for data, data_b in pbar:
@@ -757,16 +757,16 @@ if __name__ == "__main__":
             if cfg.bni.texture_src == 'image':
 
                 # coloring the final mesh (front: RGB pixels, back: normal colors)
-                final_colors = query_color(
-                    torch.tensor(final_mesh.vertices).float(),
-                    torch.tensor(final_mesh.faces).long(),
-                torch.tensor(side_mesh.vertices).float(),
-                torch.tensor(side_mesh.faces).long(),
-                in_tensor["image"][idx:idx + 1],
-                in_tensor["image_back"][idx:idx + 1],
-                device=device,
-            )
-                final_mesh.visual.vertex_colors = final_colors
+            #     final_colors = query_color(
+            #         torch.tensor(final_mesh.vertices).float(),
+            #         torch.tensor(final_mesh.faces).long(),
+            #     torch.tensor(side_mesh.vertices).float(),
+            #     torch.tensor(side_mesh.faces).long(),
+            #     in_tensor["image"][idx:idx + 1],
+            #     in_tensor["image_back"][idx:idx + 1],
+            #     device=device,
+            # )
+                # final_mesh.visual.vertex_colors = final_colors
                 final_mesh.export(final_path)
             
 
@@ -811,7 +811,7 @@ device = torch.device(f"cuda:{args.gpu}")
 
 # loading SMPL-X and econ objs inferred with ECON
 # prefix = f"./results_fulden/econ/obj/{args.name}"
-prefix = f"./results/Fulden/IFN+_face_thresh_0.31/econ/obj/{args.name}"
+prefix = f"./results/Jon/IFN+_face_thresh_0.31/econ/obj/{args.name}"
 
 smpl_path = f"{prefix}_smpl_00.npy"
 smplx_param = np.load(smpl_path, allow_pickle=True).item()
@@ -1032,7 +1032,7 @@ print("Start Color mapping...")
 from PIL import Image
 from torchvision import transforms
 
-from lib.common.render import query_color, query_normal_color, query_avatar_color
+from lib.common.render import query_color, query_normal_color
 from lib.common.render_utils import Pytorch3dRasterizer
 
 # choice 1: pixels to visible regions, normals to invisible regions
@@ -1058,10 +1058,18 @@ from lib.common.render_utils import Pytorch3dRasterizer
 # else:
 #     mesh = trimesh.load(f"{prefix}/econ_icp_rgb.ply")
 #     final_rgb = mesh.visual.vertex_colors[:, :3]
+
+num_vertices = len(econ_pose.vertices)
+# Create an array of shape (num_vertices, 3) filled with red (RGB: [255, 0, 0])
+red_colors = np.tile(np.array([255, 0, 0], dtype=np.uint8), (num_vertices, 1))
+
+# Assign red to every vertex
+econ_pose.visual.vertex_colors = red_colors
+
 if not osp.exists(f"{prefix}/econ_icp_rgb.ply"):
     # Load the separate cloth images saved from infer_f.py.
-    cloth_front_path = f"./results/Fulden/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_front.png"
-    cloth_back_path  = f"./results/Fulden/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_back.png"
+    cloth_front_path = f"./results/Jon/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_front.png"
+    cloth_back_path  = f"./results/Jon/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_back.png"
 
     # Load the images as tensors.
     tensor_front = transforms.ToTensor()(Image.open(cloth_front_path))[:, :, :512]
@@ -1071,22 +1079,16 @@ if not osp.exists(f"{prefix}/econ_icp_rgb.ply"):
     front_image = ((tensor_front - 0.5) * 2.0).unsqueeze(0).to(device)
     back_image  = ((tensor_back  - 0.5) * 2.0).unsqueeze(0).to(device)
 
+    final_rgb = np.tile(np.array([255, 0, 0], dtype=np.uint8), (num_vertices, 1))
+
     # Call the updated query_color that now accepts two images.
     final_rgb = query_color(
         torch.tensor(econ_pose.vertices).float(),
         torch.tensor(econ_pose.faces).long(),
-        torch.tensor(side_mesh.vertices).float(),
-        torch.tensor(side_mesh.faces).long(),
-    # in_tensor["image"][idx:idx + 1],
-    # in_tensor["image_back"][idx:idx + 1],
-    front_image,
-    back_image,
-    device=device,
+        front_image,
+        back_image,
+        device=device,
     ).numpy()
-
-    # Optionally: adjust any pixels that still match a default color if needed.
-    # For example:
-    final_rgb[final_rgb == tensor_front[:, 0, 0] * 255.0] = 0.5 * 255.0
 
     econ_pose.visual.vertex_colors = final_rgb
     econ_pose.export(f"{prefix}/econ_icp_rgb.ply")
@@ -1113,62 +1115,55 @@ else:
     file_normal = mesh.visual.vertex_colors[:, :3]
 
 # econ data used for animation and rendering
-# Get background color from the top-left pixel
-bg_color = (tensor_front[:, 0, 0].cpu().numpy() * 255.0)
+# ----------THIS TAKES THE BACKGOUND COLOR AND IF THERE ARE PLACES IN THE MESH WHICH CORRESPOND TO IT, IT ASSIGNS PURPLE THERE (FOR BETTER VISIBILITY)----------
+# bg_color = (tensor_front[:, 0, 0].cpu().numpy() * 255.0)
 
-# Instead of using an elementwise equality (which might not work as expected for multi-channel data),
-# compute a mask for vertices that match the background color.
-tol = 1e-1  # tolerance for matching
-mask = np.all(np.abs(final_rgb - bg_color) < tol, axis=1)
+# computes a mask for vertices that match the background color.
+# tol = 1e-1  # tolerance for matching
+# mask = np.all(np.abs(final_rgb - bg_color) < tol, axis=1)
 
-# Define purple (you can adjust the values as needed)
-purple_color = np.array([128, 0, 128], dtype=final_rgb.dtype)
+# purple_color = np.array([128, 0, 128], dtype=final_rgb.dtype)
 
-# Replace the colors at the masked vertices with purple
-final_rgb[mask] = purple_color
+# replaces the colors at the masked vertices with purple
+# final_rgb[mask] = purple_color
 
-def build_vertex_neighbors(faces, num_vertices):
-    """Build a list of neighboring vertices for each vertex."""
-    neighbors = {i: set() for i in range(num_vertices)}
-    for face in faces:
-        for i in range(3):
-            v_i = face[i]
-            v_j = face[(i+1)%3]
-            v_k = face[(i+2)%3]
-            neighbors[v_i].update([v_j, v_k])
-    return neighbors
+# def build_vertex_neighbors(faces, num_vertices):
+#     """Build a list of neighboring vertices for each vertex."""
+#     neighbors = {i: set() for i in range(num_vertices)}
+#     for face in faces:
+#         for i in range(3):
+#             v_i = face[i]
+#             v_j = face[(i+1)%3]
+#             v_k = face[(i+2)%3]
+#             neighbors[v_i].update([v_j, v_k])
+#     return neighbors
 
-def inpaint_colors(vertices, faces, colors, mask, iterations=10):
-    """
-    For vertices where mask==True, update their color by averaging
-    the colors of neighboring vertices (that are not masked).
-    """
-    num_vertices = vertices.shape[0]
-    neighbors = build_vertex_neighbors(faces, num_vertices)
-    colors_inpainted = colors.copy()
-    for it in range(iterations):
-        new_colors = colors_inpainted.copy()
-        for i in range(num_vertices):
-            if mask[i]:
-                neighbor_idxs = list(neighbors[i])
-                valid_neighbors = [j for j in neighbor_idxs if not mask[j]]
-                if valid_neighbors:
-                    new_colors[i] = np.mean(colors_inpainted[valid_neighbors], axis=0)
-        colors_inpainted = new_colors
-    return colors_inpainted
+# def inpaint_colors(vertices, faces, colors, mask, iterations=20):
+#     """
+#     For vertices where mask==True, update their color by averaging
+#     the colors of neighboring vertices (that are not masked).
+#     """
+#     num_vertices = vertices.shape[0]
+#     neighbors = build_vertex_neighbors(faces, num_vertices)
+#     colors_inpainted = colors.copy()
+#     for i in range(iterations):
+#         new_colors = colors_inpainted.copy()
+#         for i in range(num_vertices):
+#             if mask[i]:
+#                 neighbor_idxs = list(neighbors[i])
+#                 valid_neighbors = [j for j in neighbor_idxs if not mask[j]]
+#                 if valid_neighbors:
+#                     new_colors[i] = np.mean(colors_inpainted[valid_neighbors], axis=0)
+#         colors_inpainted = new_colors
+#     return colors_inpainted
 
 # Build a mask for vertices that are still purple (i.e. in need of inpainting)
-mask_purple = np.all(np.abs(final_rgb - purple_color) < tol, axis=1)
+# mask_purple = np.all(np.abs(final_rgb - purple_color) < tol, axis=1)
 
 # Inpaint the purple regions by averaging neighbor colors over several iterations.
-final_rgb_inpainted = inpaint_colors(econ_pose.vertices, econ_pose.faces, final_rgb, mask_purple, iterations=10)
+# final_rgb_inpainted = inpaint_colors(econ_pose.vertices, econ_pose.faces, final_rgb, mask_purple, iterations=20)
 
-##########################################
-# Optional: Adjust any remaining background pixels if needed
-##########################################
-
-# (This step is optional; you might not need it if inpainting worked well.)
-final_rgb = final_rgb_inpainted
+# final_rgb = final_rgb_inpainted
 
 
 econ_dict = {

@@ -91,70 +91,9 @@ def image2vid(images, vid_path):
 #     return colors.detach().cpu()
 
 # @SSH - works well
-def query_avatar_color(verts, faces, front_image, back_image, device):
-    """
-    Query colors from two images (front_image and back_image) based on vertex visibility.
-    
-    For vertices that are visible from the front, we sample colors from front_image.
-    For vertices that are not visible (i.e. on the back side), we sample from back_image.
-    
-    Args:
-        verts (Tensor): [N, 3] vertex coordinates.
-        faces (Tensor): [M, 3] face indices.
-        front_image (Tensor): [1, C, H, W] tensor representing the front image (values in [-1, 1]).
-        back_image (Tensor): [1, C, H, W] tensor representing the back image (values in [-1, 1]).
-        device (torch.device): The device on which tensors should reside.
-    
-    Returns:
-        Tensor: [N, 3] colors in the range [0, 255] for each vertex.
-    """
-    verts = verts.float().to(device)
-    faces = faces.long().to(device)
-    
-    # Split vertex coordinates: xy for UV computation and z for depth
-    (xy, z) = verts.split([2, 1], dim=1)
-    
-    # Compute the visibility mask using your existing function.
-    # Here, visibility > 0.5 indicates the vertex is seen from the front.
-    visibility = get_visibility(xy, z, faces[:, [0, 2, 1]]).flatten().to(device)  # shape: [N]
-    
-    # Compute UV coordinates based on xy.
-    # We assume that the front and back images share the same UV mapping.
-    # The grid_sample function expects a grid of shape [N, H, W, 2].
-    uv = xy.unsqueeze(0).unsqueeze(2)  # shape: [1, N, 1, 2]
-    # Adjust the y-axis if necessary (flip y) so that the UV mapping aligns with image coordinates.
-    uv = uv * torch.tensor([1.0, -1.0], device=device).view(1, 1, 1, 2)
-    
-    # Sample from the front image.
-    front_sample = torch.nn.functional.grid_sample(
-        front_image, uv, align_corners=True, padding_mode='border', mode='nearest',
-    )
-    # front_sample: [1, C, N, 1] --> reshape to [N, C]
-    front_colors = front_sample.squeeze(3).permute(2, 1, 0).squeeze(2)
-    front_colors = (front_colors + 1.0) * 0.5 * 255.0  # Map from [-1, 1] to [0, 255]
-    
-    # Sample from the back image.
-    back_sample = torch.nn.functional.grid_sample(
-        back_image, uv, align_corners=True, padding_mode='border', mode='nearest',
-    )
-    # back_sample: [1, C, N, 1] --> reshape to [N, C]
-    back_colors = back_sample.squeeze(3).permute(2, 1, 0).squeeze(2)
-    back_colors = (back_colors + 1.0) * 0.5 * 255.0
-    
-    # Create a boolean mask: True for vertices visible from the front.
-    visibility_mask = (visibility > 0.6).unsqueeze(1).expand(-1, 3)
-    
-    # Use torch.where to choose front_colors if visible, otherwise use back_colors.
-    colors = torch.where(visibility_mask, front_colors, back_colors)
-    
-    return colors.detach().cpu()
-
-# IDK IF THIS WORKS WELL
 import torch
-import torch.nn.functional as F
-from pytorch3d.ops import knn_points
 
-def query_color(verts, faces, side_verts, side_faces,
+def query_color(verts, faces,
                 front_image, back_image, device,
                 threshold=0.8):
     """
@@ -210,61 +149,14 @@ def query_color(verts, faces, side_verts, side_faces,
     # 4) Create front/back masks based on visibility.
     front_mask   = (visibility > threshold)
     back_mask    = (visibility < (1.0 - threshold))
-    inpaint_mask = ~(front_mask | back_mask)
 
     # 5) Initialize color buffer for the main mesh.
-    colors_main = torch.zeros((N_main, 3), device=device)
+    colors = torch.zeros((N_main, 3), device=device)
 
     # 6) Assign front and back colors.
-    colors_main[front_mask] = front_colors[front_mask]
-    colors_main[back_mask]  = back_colors[back_mask]
+    colors[front_mask] = front_colors[front_mask]
+    colors[back_mask]  = back_colors[back_mask]
 
-    # 7) Optionally fill "in-between" vertices (fractional visibility)
-    inpaint_inds = inpaint_mask.nonzero().flatten()
-    if len(inpaint_inds) > 0:
-        front_inds = front_mask.nonzero().flatten()
-        back_inds  = back_mask.nonzero().flatten()
-        if len(front_inds) > 0 and len(back_inds) > 0:
-            inpaint_positions = verts[inpaint_inds].unsqueeze(0)  # [1, N_inpaint, 3]
-            front_positions   = verts[front_inds].unsqueeze(0)    # [1, N_front, 3]
-            back_positions    = verts[back_inds].unsqueeze(0)     # [1, N_back, 3]
-
-            nn_front = knn_points(inpaint_positions, front_positions, K=1)
-            nn_back  = knn_points(inpaint_positions, back_positions,  K=1)
-
-            idx_front = nn_front.idx[0, :, 0]
-            idx_back  = nn_back.idx[0, :, 0]
-            c_front = colors_main[front_inds[idx_front]]
-            c_back  = colors_main[back_inds[idx_back]]
-
-            c_inpaint = 0.5 * (c_front + c_back)
-            colors_main[inpaint_inds] = c_inpaint
-
-    # ---------------------------------------------------------
-    # PART B: SIDE MESH -- PAINT SIDE FACES RED
-    # ---------------------------------------------------------
-    # Process side mesh vertices.
-    side_verts = side_verts.float().to(device)  # [N_side, 3]
-    N_side = side_verts.shape[0]
-    colors_side = torch.zeros((N_side, 3), device=device)
-
-    # If side_faces is provided (and nonempty), use it to assign red to the vertices
-    # that participate in side faces. (Here, we simply set all side vertices to red.)
-    if side_faces is not None and side_faces.numel() > 0:
-        print(side_faces is not None, side_faces.numel()>0)
-        side_faces = side_faces.long().to(device)
-        # Optionally, determine the vertices used by side_faces:
-        side_vertex_indices = torch.unique(side_faces.view(-1))
-        colors_side[side_vertex_indices] = torch.tensor([1.0, 0.0, 0.0], device=device)
-        # For simplicity, we assign red to all side vertices:
-        colors_side[:] = torch.tensor([1.0, 0.0, 0.0], device=device)
-    else:
-        colors_side[:] = torch.tensor([1.0, 0.0, 0.0], device=device)
-
-    # ---------------------------------------------------------
-    # PART C: COMBINE MAIN AND SIDE MESH COLORS
-    # ---------------------------------------------------------
-    colors = torch.cat([colors_main, colors_side], dim=0)  # [N_main + N_side, 3]
     return colors.detach().cpu()
 
 # @SSH END
@@ -378,7 +270,7 @@ class Render:
 
         return cameras
 
-    def init_renderer(self, camera, type="mesh", bg="gray"):
+    def init_renderer(self, camera, type="mesh", bg="orange"):
 
         blendparam = BlendParams(1e-4, 1e-8, np.array(ImageColor.getrgb(bg)) / 255.0)
 
