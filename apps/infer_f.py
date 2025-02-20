@@ -74,6 +74,19 @@ torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
+def compute_side_mask(final_verts, side_verts, threshold=1e-2):
+    """
+    Given final mesh vertices and side mesh vertices (both as torch tensors),
+    compute a boolean mask for final_verts that are "close" (within threshold)
+    to some vertex from the side mesh.
+    """
+    final_np = final_verts.detach().cpu().numpy()
+    side_np = side_verts.detach().cpu().numpy()
+    tree = cKDTree(side_np)
+    dists, _ = tree.query(final_np, k=1)
+    mask = torch.tensor(dists < threshold, device=final_verts.device)
+    return mask
+
 if __name__ == "__main__":
 
     # loading cfg file
@@ -754,45 +767,54 @@ if __name__ == "__main__":
 
         # @SSH
         # --- Color the final mesh ---
+
             if cfg.bni.texture_src == 'image':
-                # Use final mesh vertices for all texture queries.
+                # Convert final mesh vertices/faces to torch tensors.
                 verts_tensor = torch.tensor(final_mesh.vertices).float().to(device)
                 faces_tensor = torch.tensor(final_mesh.faces).long().to(device)
-
-                # Query colors from front and back images using final mesh vertices.
-                front_colors = query_color(
-                    verts_tensor,
-                    faces_tensor,
-                    in_tensor["image"][idx:idx + 1],
-                    device=device,
-                )
-                back_colors = query_back_color(
-                    verts_tensor,
-                    faces_tensor,
-                    in_tensor["image_back"][idx:idx + 1],
-                    device=device,
-                )
-                # Query side colors (constant green) using final mesh vertices.
-                side_colors = query_side_color(
-                    verts_tensor,
-                    faces_tensor,
-                    device=device,
-                )
-
-                # Compute visibility masks.
-                # Front mask uses modified face ordering.
-                xy, z = verts_tensor.split([2, 1], dim=1)
-                front_vis = get_visibility(xy, z, faces_tensor[:, [0, 2, 1]]).flatten()
-                # Back mask uses the original face ordering.
-                back_vis = get_visibility(xy, z, faces_tensor).flatten()
-
-                # Layering order: start with side as base, then overlay back, then front.
-                final_colors = side_colors.clone()
-                mask_back = (front_vis == 0) & (back_vis == 1)
-                final_colors[mask_back] = back_colors[mask_back]
-                final_colors[front_vis == 1] = front_colors[front_vis == 1]
-
-                final_mesh.visual.vertex_colors = final_colors
+                
+                # # Query front and back colors (each function returns a CPU tensor).
+                # front_colors = query_color(
+                #     verts_tensor,
+                #     faces_tensor,
+                #     in_tensor["image"][idx:idx + 1],
+                #     device=device,
+                #     paint_normal=False
+                # )
+                # back_colors = query_back_color(
+                #     verts_tensor,
+                #     faces_tensor,
+                #     in_tensor["image_back"][idx:idx + 1],
+                #     device=device,
+                #     paint_normal=False
+                # )
+                
+                # # Compute a mask for final mesh vertices that are part of the side region.
+                # # Move the mask to CPU so that it can index the CPU tensors.
+                # side_mask = compute_side_mask(verts_tensor, side_verts, threshold=1e-2).cpu()
+                
+                # # Get side (green) colors for side vertices.
+                # # query_side_color returns green for all vertices in its input.
+                # # Here we just need one green triplet.
+                # side_green = query_side_color(side_verts, side_faces, device=device)[0]  # a single green color
+                # # Create a full side color tensor for final_mesh vertices: green only where side_mask is True.
+                # side_colors = torch.zeros_like(front_colors)
+                # side_colors[side_mask] = side_green.unsqueeze(0).repeat(side_mask.sum(), 1)
+                
+                # # Define default gray (on CPU) to match what the query functions return.
+                # default_color = (torch.tensor([0.0, 0.0, 1.0]) * 255.0)
+                # final_colors = default_color.unsqueeze(0).repeat(verts_tensor.shape[0], 1)
+                
+                # # Layering order (priority: front > back > side/default):
+                # # 1. Set side color for vertices that belong to the side region.
+                # final_colors[side_mask] = side_colors[side_mask]
+                # # 2. Override with back colors where they differ from default gray.
+                
+                # front_mask = ~torch.all(front_colors.eq(default_color), dim=1)
+                # final_colors[front_mask] = front_colors[front_mask]
+                # back_mask = ~torch.all(back_colors.eq(default_color), dim=1)
+                # final_colors[back_mask] = back_colors[back_mask]                
+                # final_mesh.visual.vertex_colors = final_colors.detach().cpu()
                 final_mesh.export(final_path)
 
             elif cfg.bni.texture_src == 'SD':
@@ -830,8 +852,6 @@ if __name__ == "__main__":
             print("The mesh is watertight and has been saved successfully!")
         else:
             print("The mesh is not watertight. Further inspection may be needed.")
-
-
 
 smplx_container = SMPLX()
 device = torch.device(f"cuda:{args.gpu}")
@@ -1084,88 +1104,212 @@ from lib.common.render_utils import Pytorch3dRasterizer
 #     mesh = trimesh.load(f"{prefix}/econ_icp_rgb.ply")
 #     final_rgb = mesh.visual.vertex_colors[:, :3]
 
-if not osp.exists(f"{prefix}/econ_icp_rgb.ply"):
-    # Load the separate cloth images saved from infer_f.py.
-    cloth_front_path = f"./results/Rafa/IFN+_face_thresh_0.32/econ/png/{args.name}_cloth_front.png"
-    cloth_back_path  = f"./results/Rafa/IFN+_face_thresh_0.32/econ/png/{args.name}_cloth_back.png"
 
-    # Load the images as tensors.
-    tensor_front = transforms.ToTensor()(Image.open(cloth_front_path))[:, :, :512]
-    tensor_back  = transforms.ToTensor()(Image.open(cloth_back_path))[:, :, :512]
+# --- New: Load both front and back images ---
+front_image_path = f"./results/Rafa/IFN+_face_thresh_0.32/econ/png/{args.name}_cloth_front.png"
+back_image_path = f"./results/Rafa/IFN+_face_thresh_0.32/econ/png/{args.name}_cloth_back.png"  # new back image
 
-    # Normalize the textures from [0,1] to [-1,1] and add a batch dimension.
-    front_image = ((tensor_front - 0.5) * 2.0).unsqueeze(0).to(device)
-    back_image  = ((tensor_back  - 0.5) * 2.0).unsqueeze(0).to(device)
+import os.path as osp
+import numpy as np
+import torch
+import trimesh
+from PIL import Image
+from torchvision import transforms
+from lib.common.render import query_color, query_normal_color
+from lib.common.render_utils import Pytorch3dRasterizer
 
-    # Convert econ_pose mesh to tensors.
-    verts_tensor = torch.tensor(econ_pose.vertices).float().to(device)
-    faces_tensor = torch.tensor(econ_pose.faces).long().to(device)
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Query front and back colors on econ_pose vertices.
-    front_colors = query_color(verts_tensor, faces_tensor, front_image, device=device)
-    back_colors  = query_back_color(verts_tensor, faces_tensor, back_image, device=device)
+##########################################
+# Option 1: Use default camera parameters
+##########################################
 
-    # Query side colors using econ_pose vertices (for consistent indexing).
-    side_colors = query_side_color(verts_tensor, faces_tensor, device=device)
-    
-    front_colors = front_colors.cpu()
-    back_colors  = back_colors.cpu()
-    side_colors  = side_colors.cpu()
+# Default front camera parameters (identity intrinsics & extrinsics)
+front_cam_intrinsics = torch.eye(3).float().to(device)
+front_cam_extrinsics = torch.eye(4).float().to(device)
 
-    # final_rgb = front_colors.clone()  # front is the base
-    # mask_back = back_colors.abs().sum(dim=1) != 0  # if back color is nonzero
-    # final_rgb[mask_back] = back_colors[mask_back]
-    # mask_side = side_colors.abs().sum(dim=1) != 0  # if side color is nonzero
-    # final_rgb[mask_side] = side_colors[mask_side]
+# For the back view, use the same intrinsics and simulate a 180° rotation about Y.
+back_cam_intrinsics = torch.eye(3).float().to(device)
+back_cam_extrinsics = torch.eye(4).float().to(device)
+R_180 = torch.tensor([[-1, 0,  0],
+                      [ 0, 1,  0],
+                      [ 0, 0, -1]], dtype=torch.float32).to(device)
+back_cam_extrinsics[:3, :3] = R_180
 
-    default_color = torch.tensor([0.5, 0.5, 0.5], device=front_colors.device) * 255.0
+# In Option 1 we assume vertices are already in normalized coordinates for grid sampling.
+# For the back view, we simply rotate the vertices.
 
-    # Compute masks that indicate whether the queried color is "valid"
-    # (i.e. different from the default color)
-    mask_front = (front_colors - default_color).abs().sum(dim=1) > 1e-3
-    mask_side  = (side_colors  - default_color).abs().sum(dim=1) > 1e-3
-    mask_back = (back_colors - default_color).abs().sum(dim=1) > 1e-3
-    
-    # Layering order: front > side > back.
-    # For each vertex:
-    #   if front is valid, use front.
-    #   else if side is valid, use side.
-    #   otherwise, use back.
-    final_rgb = torch.where(mask_side.unsqueeze(1), 
-                        side_colors, 
-                        back_colors)
-    final_rgb = torch.where(mask_back.unsqueeze(1), 
-                        back_colors, 
-                        side_colors)
-    final_rgb = torch.where(mask_front.unsqueeze(1), 
-                        front_colors, 
-                        side_colors)
-   
-    econ_pose.visual.vertex_colors = final_rgb
-    econ_pose.export(f"{prefix}/econ_icp_rgb.ply")
-else:
-    mesh = trimesh.load(f"{prefix}/econ_icp_rgb.ply")
-    final_rgb = mesh.visual.vertex_colors[:, :3]
+def rotate_vertices_180(verts):
+    """Rotate vertices 180° about the Y axis."""
+    rotated = verts.clone()
+    rotated[:, 0] = -verts[:, 0]
+    rotated[:, 2] = -verts[:, 2]
+    return rotated
 
-# @SSH END 
+##########################################
+# Load front and back images
+##########################################
 
-# choice 2: normals to all the regions
+
+# Load images, crop if needed, and convert to tensor.
+tensor_front = transforms.ToTensor()(Image.open(front_image_path))[:, :, :512]
+tensor_back  = transforms.ToTensor()(Image.open(back_image_path))[:, :, :512]
+
+# Normalize to [-1, 1] for grid_sample
+front_tensor_norm = ((tensor_front - 0.5) * 2.0).unsqueeze(0).to(device)
+back_tensor_norm  = ((tensor_back - 0.5) * 2.0).unsqueeze(0).to(device)
+
+##########################################
+# Get mesh vertices and faces
+##########################################
+
+# econ_pose is assumed to be your mesh object (e.g., a trimesh object)
+verts_tensor = torch.tensor(econ_pose.vertices).float().to(device)
+faces_tensor = torch.tensor(econ_pose.faces).long().to(device)
+
+##########################################
+# Query colors for front and back views
+##########################################
+
+# Front view: sample using original vertices.
+final_rgb_front = query_color(
+    verts_tensor,
+    faces_tensor,
+    front_tensor_norm,
+    device=device,
+    paint_normal=False,
+).numpy()
+
+# Back view: rotate vertices by 180° and sample using the back image.
+verts_rotated = rotate_vertices_180(verts_tensor)
+final_rgb_back = query_color(
+    verts_rotated,
+    faces_tensor,
+    back_tensor_norm,
+    device=device,
+    paint_normal=False,
+).numpy()
+
+##########################################
+# Blend front and back colors
+##########################################
+
+# Compute vertex normals using trimesh.
+mesh_temp = trimesh.Trimesh(vertices=econ_pose.vertices,
+                            faces=econ_pose.faces, process=False)
+vertex_normals = mesh_temp.vertex_normals  # shape: (N, 3)
+
+# Define assumed view directions:
+# Front view direction: +Z; Back view direction: -Z.
+front_view_dir = np.array([0, 0, 1], dtype=np.float32)
+back_view_dir  = np.array([0, 0, -1], dtype=np.float32)
+
+# Compute dot products to measure alignment.
+dots_front = (vertex_normals * front_view_dir).sum(axis=1)
+dots_back  = (vertex_normals * back_view_dir).sum(axis=1)
+
+# Map dot values from [-1,1] to [0,1].
+weight_front = np.clip((dots_front + 1.0) / 2.0, 0.0, 1.0)
+weight_back  = np.clip((dots_back + 1.0) / 2.0, 0.0, 1.0)
+
+# Compute a blend weight that favors the front where applicable.
+blend_weight = weight_front / (weight_front + weight_back + 1e-8)
+
+# Blend the colors per vertex.
+final_rgb = blend_weight[:, None] * final_rgb_front + (1.0 - blend_weight[:, None]) * final_rgb_back
+
+##########################################
+# Fill gaps in occluded regions
+##########################################
+
+# Here, we assume that if a vertex color is exactly the fallback value,
+# (i.e. 0.5*255 for each channel), then that vertex was not seen in either image.
+# You may want to add a tolerance if needed.
+# fallback_color = (np.array([0.5, 0.5, 0.5]) * 255.0)
+
+# Compute a mask where all channels are (approximately) equal to fallback_color.
+# (Adjust the tolerance if necessary.)
+# tol = 1e-2
+# mask = np.all(np.abs(final_rgb - fallback_color) < tol, axis=1)
+
+# Query a fallback color using vertex normals for the occluded regions.
+# normal_rgb = query_normal_color(
+#     verts_tensor,
+#     faces_tensor,
+#     device=device,
+# ).numpy()
+
+# Replace fallback regions with normal-based colors.
+# final_rgb[mask] = normal_rgb[mask]
+
+##########################################
+# Optional: Adjust specific background pixels
+##########################################
+
+# at the top-left corner of the front image.
+# Get background color from the top-left pixel
+# Assume tensor_front is the front image tensor (shape: [C, H, W])
+# and final_rgb is the per-vertex color array (shape: [N, 3]).
+
+# Get corner pixel colors (scaled to 0-255)
+top_left     = (tensor_front[:, 0, 0].cpu().numpy() * 255.0)
+top_right    = (tensor_front[:, 0, -1].cpu().numpy() * 255.0)
+bottom_left  = (tensor_front[:, -1, 0].cpu().numpy() * 255.0)
+bottom_right = (tensor_front[:, -1, -1].cpu().numpy() * 255.0)
+
+# Define bright inspection colors for each corner:
+inspection_colors = {
+    "top_left": np.array([255, 0, 255], dtype=final_rgb.dtype),      # Magenta
+    "top_right": np.array([0, 255, 255], dtype=final_rgb.dtype),       # Cyan
+    "bottom_left": np.array([255, 255, 0], dtype=final_rgb.dtype),       # Yellow
+    "bottom_right": np.array([0, 255, 0], dtype=final_rgb.dtype),        # Green
+}
+
+# Tolerance for matching (adjust as needed)
+tol = 1e-2
+
+def assign_inspection_color(corner_color, inspection_color, rgb_array):
+    """
+    Find vertices with colors close to `corner_color` and assign them `inspection_color`.
+    """
+    # Create a mask where the color in all channels is within tolerance
+    mask = np.all(np.abs(rgb_array - corner_color) < tol, axis=1)
+    rgb_array[mask] = inspection_color
+    return rgb_array
+
+# For each corner, replace matching vertex colors with the inspection color.
+final_rgb = assign_inspection_color(top_left, inspection_colors["top_left"], final_rgb)
+final_rgb = assign_inspection_color(top_right, inspection_colors["top_right"], final_rgb)
+final_rgb = assign_inspection_color(bottom_left, inspection_colors["bottom_left"], final_rgb)
+final_rgb = assign_inspection_color(bottom_right, inspection_colors["bottom_right"], final_rgb)
+
+##########################################
+# Assign colors and export mesh
+##########################################
+
+econ_pose.visual.vertex_colors = final_rgb
+econ_pose.export(f"{prefix}/econ_icp_rgb.ply")
+
+##########################################
+# Normal-based color mapping (unchanged)
+##########################################
 
 if not osp.exists(f"{prefix}/econ_icp_normal.ply"):
-
     file_normal = query_normal_color(
-        torch.tensor(econ_pose.vertices).float(),
-        torch.tensor(econ_pose.faces).long(),
+        verts_tensor,
+        faces_tensor,
         device=device,
     ).numpy()
-
     econ_pose.visual.vertex_colors = file_normal
     econ_pose.export(f"{prefix}/econ_icp_normal.ply")
 else:
     mesh = trimesh.load(f"{prefix}/econ_icp_normal.ply")
     file_normal = mesh.visual.vertex_colors[:, :3]
 
-# econ data used for animation and rendering
+##########################################
+# Save econ data for further processing
+##########################################
 
 econ_dict = {
     "v_template": econ_cano_verts.unsqueeze(0),
@@ -1180,21 +1324,18 @@ econ_dict = {
 
 torch.save(econ_dict, f"{cache_path}/econ.pt")
 
-print(
-    colored(
-        "If the dress/skirt is torn in `<file_name>/econ_da.obj`, please delete ./file_name and regenerate them with `-dress` \n \
-    python -m apps.avatarizer -n <file_name> -dress", "yellow"
-    )
-)
+print("Finished saving econ data.")
 
-args.uv = True
+##########################################
+# UV Texture Generation (if enabled)
+##########################################
+
+args.uv =True
 args.dress = False
-
 if args.uv:
-
     print("Start UV texture generation...")
-
-    # Generate UV coords
+    
+    # Generate UV coordinates.
     v_np = econ_pose.vertices
     f_np = econ_pose.faces
 
@@ -1223,9 +1364,7 @@ if args.uv:
         torch.save(ft.cpu(), ft_cache)
 
     # UV texture rendering
-
     uv_rasterizer = Pytorch3dRasterizer(image_size=8192, device=device)
-
     texture_npy = uv_rasterizer.get_texture(
         torch.cat([(vt - 0.5) * 2.0, torch.ones_like(vt[:, :1])], dim=1),
         ft,
@@ -1238,16 +1377,14 @@ if args.uv:
     gray_texture[texture_npy.sum(axis=2) == 0.0] = 0.5
     Image.fromarray((gray_texture * 255.0).astype(np.uint8)).save(f"{cache_path}/texture.png")
 
-
-    # UV mask for TEXTure (https://readpaper.com/paper/4720151447010820097)
+    # UV mask for texture.
     white_texture = texture_npy.copy()
     white_texture[texture_npy.sum(axis=2) == 0.0] = 1.0
     Image.fromarray((white_texture * 255.0).astype(np.uint8)).save(f"{cache_path}/mask.png")
-    
-    # generate a-pose vertices
+
+    # Generate a-pose vertices.
     new_pose = smpl_out_lst[0].full_pose
     new_pose[:, :3] = 0.0
-
     posed_econ_verts, _ = general_lbs(
         pose=new_pose,
         v_template=econ_cano_verts.unsqueeze(0),
@@ -1257,15 +1394,15 @@ if args.uv:
         lbs_weights=econ_lbs_weights,
     )
 
-    # export mtl file
+    # Export material file.
     with open(f"{cache_path}/material.mtl", "w") as fp:
-        fp.write(f"newmtl mat0 \n")
-        fp.write(f"Ka 1.000000 1.000000 1.000000 \n")
-        fp.write(f"Kd 1.000000 1.000000 1.000000 \n")
-        fp.write(f"Ks 0.000000 0.000000 0.000000 \n")
-        fp.write(f"Tr 1.000000 \n")
-        fp.write(f"illum 1 \n")
-        fp.write(f"Ns 0.000000 \n")
-        fp.write(f"map_Kd texture.png \n")
+        fp.write("newmtl mat0 \n")
+        fp.write("Ka 1.000000 1.000000 1.000000 \n")
+        fp.write("Kd 1.000000 1.000000 1.000000 \n")
+        fp.write("Ks 0.000000 0.000000 0.000000 \n")
+        fp.write("Tr 1.000000 \n")
+        fp.write("illum 1 \n")
+        fp.write("Ns 0.000000 \n")
+        fp.write("map_Kd texture.png \n")
 
     export_obj(posed_econ_verts[0].detach().cpu().numpy(), f_np, vt, ft, f"{cache_path}/mesh.obj")

@@ -64,43 +64,36 @@ import torch
 import torch.nn.functional as F
 from pytorch3d.structures import Meshes
 
-def query_color(verts, faces, image, device, paint_normal=False):
-    """
-    Query front-face colors from a provided image.
-    
+def query_color(verts, faces, image, device, paint_normal=True):
+    """query colors from points and image
+
     Args:
-        verts (torch.Tensor): [N, 3] vertices.
-        faces (torch.Tensor): [M, 3] faces.
-        image (torch.Tensor): [B, 3, H, W] front image.
-        device (torch.device): Device to perform computations on.
-        paint_normal (bool): If True, use vertex normals to fill in invisible areas.
-        
+        verts ([B, 3]): [query verts]
+        faces ([M, 3]): [query faces]
+        image ([B, 3, H, W]): [full image]
+
     Returns:
-        torch.Tensor: [N, 3] colors in the [0, 255] range.
+        [np.float]: [return colors]
     """
+
     verts = verts.float().to(device)
     faces = faces.long().to(device)
-    
-    # Split into 2D xy coordinates and depth z.
-    xy, z = verts.split([2, 1], dim=1)
-    
-    # Determine which vertices are visible.
+
+    (xy, z) = verts.split([2, 1], dim=1)
     visibility = get_visibility(xy, z, faces[:, [0, 2, 1]]).flatten()
-    
-    # Prepare UV coordinates.
-    uv = xy.unsqueeze(0).unsqueeze(2)  # Shape: [B, N, 2]
+    uv = xy.unsqueeze(0).unsqueeze(2)    # [B, N, 2]
     uv = uv * torch.tensor([1.0, -1.0]).type_as(uv)
-    
-    # Sample colors from the front image.
-    colors = ((F.grid_sample(image, uv, align_corners=True)[0, :, :, 0].permute(1, 0) + 1.0) * 0.5 * 255.0)
-    
-    # For areas that are not visible, either paint with vertex normals or use a default gray.
+    colors = ((
+        torch.nn.functional.grid_sample(image, uv, align_corners=True)[0, :, :, 0].permute(1, 0) +
+        1.0
+    ) * 0.5 * 255.0)
     if paint_normal:
-        normals = Meshes(verts.unsqueeze(0), faces.unsqueeze(0)).verts_normals_padded().squeeze(0)
-        colors[visibility == 0.0] = ((normals + 1.0) * 0.5 * 255.0)[visibility == 0.0]
+        colors[visibility == 0.0] = ((
+            Meshes(verts.unsqueeze(0), faces.unsqueeze(0)).verts_normals_padded().squeeze(0) + 1.0
+        ) * 0.5 * 255.0)[visibility == 0.0]
     else:
         colors[visibility == 0.0] = (torch.tensor([0.5, 0.5, 0.5]) * 255.0).to(device)
-    
+
     return colors.detach().cpu()
 
 
