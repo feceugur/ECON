@@ -521,6 +521,27 @@ def get_visibility(xy, z, faces, img_res=2**12, blur_radius=0.0, faces_per_pixel
             faces[idx][torch.unique(pix_to_face[idx][pix_to_face[idx] != -1]) - Num_faces * idx, :]
         )
         vis_mask[idx, vis_vertices_id] = 1.0
+    
+    # Initialize a tensor to accumulate soft scores for each vertex.
+    # soft_vis = torch.zeros_like(vis_mask, device=bary_coords.device)
+    # for idx in range(N_body):
+    #     valid = pix_to_face[idx] != -1  # shape: [H, W, faces_per_pixel]
+        
+    #     # Flatten bary_coords and valid to apply the boolean mask
+    #     bary_coords_flat = bary_coords[idx].reshape(-1, bary_coords[idx].shape[-1])  # [H*W*faces_per_pixel, 3]
+    #     valid_flat = valid.view(-1)  # [H*W*faces_per_pixel]
+    #     valid_bary = bary_coords_flat[valid_flat]   # shape: [num_valid_pixels, 3]
+        
+    #     # Get valid face indices similarly:
+    #     pix_to_face_flat = pix_to_face[idx].view(-1)
+    #     valid_faces = pix_to_face_flat[valid_flat]   # shape: [num_valid_pixels]
+        
+    #     for i in range(valid_faces.shape[0]):
+    #         face_idx = valid_faces[i].item()
+    #         local_face_idx = face_idx - idx * faces.shape[1]  # if batching applies
+    #         vertex_ids = faces[idx][local_face_idx, :]  # shape: [3]
+    #         for j in range(3):
+    #             soft_vis[idx, vertex_ids[j]] += valid_bary[i, j]
 
     # print("------------------------\n")
     # print(f"keep points : {vis_mask.sum()/len(vis_mask)}")

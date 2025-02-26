@@ -47,7 +47,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 class TestDataset:
-    def __init__(self, cfg, device):
+    def __init__(self, cfg, device, bg_color):
         self.image_dir = cfg["image_dir"]
         self.image_b_dir = cfg["image_b_dir"]
         self.seg_dir = cfg["seg_dir"]
@@ -59,7 +59,7 @@ class TestDataset:
         self.single = cfg["single"]
 
         self.device = device
-
+        self.bg_color = bg_color
         # Define valid image formats
         img_fmts = ["jpg", "png", "jpeg", "JPG", "bmp", "exr"]
 
@@ -95,7 +95,9 @@ class TestDataset:
         )
         self.detector.eval()
 
-        self.render = Render(size=512, device=self.device)
+        self.render = []
+        self.render = Render(size=512, device=self.device, bg_color=self.bg_color)
+
 
     def __len__(self):
         return len(self.subject_list)
@@ -146,19 +148,18 @@ class TestDataset:
         }
 
     def __getitem__(self, index):
-        # Get paths for the front and back images
         img_paths = self.subject_list[index]
         front_img_path = img_paths["front"]
         back_img_path = img_paths["back"]
 
         # Process the front image
         front_img_name = front_img_path.split("/")[-1].rsplit(".", 1)[0]
-        front_arr_dict = process_image(front_img_path, self.hps_type, self.single, 512, self.detector)
+        front_arr_dict = process_image(front_img_path, self.hps_type, self.single, 512, self.detector, self.bg_color)
         front_arr_dict.update({"name": front_img_name})
 
         # Process the back image
         back_img_name = back_img_path.split("/")[-1].rsplit(".", 1)[0]
-        back_arr_dict = process_image(back_img_path, self.hps_type, self.single, 512, self.detector)
+        back_arr_dict = process_image(back_img_path, self.hps_type, self.single, 512, self.detector, self.bg_color)
         back_arr_dict.update({"name": back_img_name})
 
         # Perform HPS inference for both front and back images

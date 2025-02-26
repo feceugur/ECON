@@ -94,8 +94,7 @@ def image2vid(images, vid_path):
 import torch
 
 def query_color(verts, faces,
-                front_image, back_image, device,
-                threshold=0.8):
+                front_image, back_image, device):
     """
     1) Classify main mesh (verts) as front/back using single visibility.
     2) Paint front/back from images.
@@ -105,36 +104,25 @@ def query_color(verts, faces,
     Args:
         verts (FloatTensor): [N_main, 3] main mesh vertices
         faces (LongTensor):  [M_main, 3] main mesh faces (used in get_visibility)
-        side_verts (FloatTensor): [N_side, 3] side mesh vertices
-        side_faces (LongTensor): [M_side, 3] side mesh faces (indices into side_verts)
         front_image (FloatTensor): [1, C, H, W], in [-1,1]
         back_image  (FloatTensor): [1, C, H, W], in [-1,1]
         device (torch.device)
-        threshold (float): e.g. 0.8 for front/back classification
 
     Returns:
         colors: [N_main + N_side, 3], each in [0,255], on CPU
     """
     import torch.nn.functional as F
 
-    # ---------------------------------------------------------
-    # PART A: MAIN MESH -- VISIBILITY AND FRONT/BACK PAINTING
-    # ---------------------------------------------------------
-    # 1) Move main mesh to device
-    verts  = verts.float().to(device)   # [N_main, 3]
-    faces  = faces.long().to(device)    # [M_main, 3]
+    verts  = verts.float().to(device)   
+    faces  = faces.long().to(device)    
     N_main = verts.shape[0]
 
-    # 2) Compute visibility in [0,1] or {0,1}.
-    #    (Assuming get_visibility returns a [N_main]-shaped tensor.)
     xy, z = verts.split([2, 1], dim=1)
-    visibility = get_visibility(xy, z, faces[:, [0, 2, 1]])  # -> [N_main]
+    visibility = get_visibility(xy, z, faces[:, [0, 2, 1]]) 
     visibility = visibility.flatten().to(device)
 
     # 3) Sample front/back textures with grid_sample.
-    #    Create UV coordinates from the xy positions.
-    uv = xy.unsqueeze(0).unsqueeze(2)  # -> [1, N_main, 1, 2]
-    # Flip Y for PyTorch grid_sample (if needed):
+    uv = xy.unsqueeze(0).unsqueeze(2)  
     uv = uv * torch.tensor([1.0, -1.0], device=device).view(1, 1, 1, 2)
 
     front_sample = F.grid_sample(front_image, uv, align_corners=True,
@@ -142,18 +130,15 @@ def query_color(verts, faces,
     back_sample  = F.grid_sample(back_image,  uv, align_corners=True,
                                  padding_mode='border', mode='nearest')
 
-    # Reshape to [N_main, C] and map from [-1, 1] to [0, 255]
+
     front_colors = (front_sample.squeeze(3).permute(2, 1, 0).squeeze(2) + 1.0) * 0.5 * 255.0
     back_colors  = (back_sample.squeeze(3).permute(2, 1, 0).squeeze(2) + 1.0) * 0.5 * 255.0
 
-    # 4) Create front/back masks based on visibility.
-    front_mask   = (visibility > threshold)
-    back_mask    = (visibility < (1.0 - threshold))
-
-    # 5) Initialize color buffer for the main mesh.
+    front_mask   = (visibility > 0.5)
+    back_mask    = (visibility < (1.0 - 0.5))
+   
     colors = torch.zeros((N_main, 3), device=device)
 
-    # 6) Assign front and back colors.
     colors[front_mask] = front_colors[front_mask]
     colors[back_mask]  = back_colors[back_mask]
 
@@ -199,10 +184,10 @@ class cleanShader(torch.nn.Module):
 
 
 class Render:
-    def __init__(self, size=512, device=torch.device("cuda:0")):
+    def __init__(self, bg_color, size=512, device=torch.device("cuda:0")):
         self.device = device
         self.size = size
-
+        self.bg_color = bg_color
         # camera setting
         self.dis = 100.0
         self.scale = 100.0
@@ -270,7 +255,7 @@ class Render:
 
         return cameras
 
-    def init_renderer(self, camera, type="mesh", bg="orange"):
+    def init_renderer(self, camera, type="mesh", bg="gray"):
 
         blendparam = BlendParams(1e-4, 1e-8, np.array(ImageColor.getrgb(bg)) / 255.0)
 

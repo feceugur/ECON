@@ -1,4 +1,5 @@
 import os
+from termcolor import colored
 
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 import cv2
@@ -173,7 +174,7 @@ def remove_floats(mask):
     return new_mask
 
 
-def process_image(img_file, hps_type, single, input_res, detector):
+def process_image(img_file, hps_type, single, input_res, detector, bg_color):
 
     img_raw, (in_height, in_width) = load_img(img_file)
     tgt_res = input_res * 2
@@ -237,7 +238,8 @@ def process_image(img_file, hps_type, single, input_res, detector):
         ).squeeze(0).permute(1, 2, 0).numpy().astype(np.uint8)
 
         # get accurate person segmentation mask
-        img_rembg = remove(img_crop, post_process_mask=True, session=new_session("u2net"))
+        img_rembg = remove(img_crop, post_process_mask=True, session=new_session("u2net"), bgcolor=bg_color)
+        print(colored(f"removed bg of img: {img_file} and substituted with color {bg_color}", "yellow"))
         img_mask = remove_floats(img_rembg[:, :, [3]])
 
         mean_icon = std_icon = (0.5, 0.5, 0.5)
