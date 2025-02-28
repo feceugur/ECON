@@ -259,9 +259,6 @@ import os.path as osp
 from lib.common.render import query_color, query_normal_color
 from lib.common.render_utils import Pytorch3dRasterizer
 
-# Assumptions: econ_pose, econ_cano_verts, econ_posedirs, econ_J_regressor,
-# smpl_model, econ_lbs_weights, args, prefix, cache_path, device, etc. are already defined.
-
 ##########################################
 # First Pass: Using _cloth_front and _cloth_back images
 ##########################################
@@ -303,7 +300,7 @@ if not ('vt' in globals() and 'ft' in globals() and 'vmapping' in globals()):
     pack_options.resolution = 8192
     pack_options.bruteForce = True
     atlas.generate(chart_options=chart_options)
-    vmapping, ft_np, vt_np = atlas[0]  # vmapping: mapping from original vertices to UV indices.
+    vmapping, ft_np, vt_np = atlas[0]  # mapping from original vertices to UV indices.
     vt = torch.from_numpy(vt_np.astype(np.float32)).float().to(device)
     ft = torch.from_numpy(ft_np.astype(np.int64)).int().to(device)
 
@@ -318,7 +315,6 @@ texture_map1 = uv_rasterizer.get_texture(
 )
 # Save first-pass texture map.
 texture_map1_8bit = (texture_map1 * 255.0).astype(np.uint8)
-from PIL import Image
 Image.fromarray(texture_map1_8bit).save(f"{cache_path}/texture_map1.png")
 print("First-pass texture map saved as texture_map1.png.")
 
@@ -368,91 +364,11 @@ Image.fromarray((mask_diff.astype(np.uint8) * 255)).save(f"{cache_path}/diff_mas
 print("Difference mask saved as diff_mask.png.")
 
 ##########################################
-# Map Difference Mask to Vertices Using UV Coordinates
-##########################################
-
-# Compute per-vertex UV coordinates from xatlas mapping.
-# vmapping maps each original vertex index to an index in vt_np.
-vertex_uv = vt_np[vmapping]  # shape: (num_vertices, 2) with values in [0,1]
-# Convert UV coordinates to pixel indices.
-vertex_pixel = np.zeros_like(vertex_uv)
-vertex_pixel[:, 0] = vertex_uv[:, 0] * (W - 1)
-# Note: V coordinate is often flipped; here we assume 0 is at the top.
-vertex_pixel[:, 1] = (1 - vertex_uv[:, 1]) * (H - 1)
-
-# For each vertex, sample the diff_mask.
-num_vertices = len(econ_pose.vertices)
-vertex_mask = np.zeros(num_vertices, dtype=bool)
-for i in range(num_vertices):
-    x = int(np.clip(vertex_pixel[i, 0], 0, W - 1))
-    y = int(np.clip(vertex_pixel[i, 1], 0, H - 1))
-    vertex_mask[i] = mask_diff[y, x]
-
-print("Percentage of vertices marked for inpainting (from diff mask):",
-    100.0 * np.sum(vertex_mask) / num_vertices, "%")
-
-##########################################
-# Inpaint Regions Marked by Vertex Mask
-##########################################
-
-def build_vertex_neighbors(faces, num_vertices):
-    """Build a list of neighboring vertices for each vertex."""
-    neighbors = {i: set() for i in range(num_vertices)}
-    for face in faces:
-        for i in range(3):
-            v_i = face[i]
-            v_j = face[(i + 1) % 3]
-            v_k = face[(i + 2) % 3]
-            neighbors[v_i].update([v_j, v_k])
-    return neighbors
-
-def inpaint_colors(vertices, colors, mask, k=2):
-    """
-    Inpaint each vertex marked as unpainted (mask True) by averaging the colors
-    of the k closest painted vertices (mask False) based on Euclidean distance.
-    
-    Args:
-        vertices (np.ndarray): Array of shape (N, 3) for vertex positions.
-        colors (np.ndarray): Array of shape (N, 3) for vertex colors.
-        mask (np.ndarray): Boolean array of shape (N,) where True indicates that 
-                        the vertex is unpainted and needs inpainting.
-        k (int): Number of closest painted vertices to average.
-        
-    Returns:
-        np.ndarray: Updated colors after inpainting.
-    """
-    inpainted_colors = colors.copy()
-    painted_indices = np.where(~mask)[0]  # indices that are already painted
-    
-    # Precompute for efficiency:
-    painted_vertices = vertices[painted_indices]
-    
-    for i, needs_inpaint in enumerate(mask):
-        if needs_inpaint:
-            # Compute distances from vertex i to all painted vertices.
-            dists = np.linalg.norm(vertices[i] - painted_vertices, axis=1)
-            # Get indices of the k closest painted vertices.
-            if len(dists) < k:
-                k = len(dists)
-            closest_indices = painted_indices[np.argsort(dists)[:k]]
-            # Average their colors.
-            inpainted_colors[i] = np.mean(colors[closest_indices], axis=0)
-
-    return inpainted_colors
-
-# Use the second pass colors as our base.
-mask_fallback = vertex_mask  # if vertex_mask marks unpainted vertices
-final_rgb = final_rgb_pass2.copy()
-fallback_color = np.array([128, 0, 128], dtype=final_rgb.dtype)
-final_rgb[vertex_mask] = fallback_color
-
-# Inpaint the vertices marked (vertex_mask).
-final_rgb_inpainted = inpaint_colors(np.array(econ_pose.vertices), final_rgb, mask_fallback, k=2)
-final_rgb = final_rgb_inpainted
-
-##########################################
 # Assign Final Vertex Colors and Export Mesh
 ##########################################
+
+# Use the second pass colors directly.
+final_rgb = final_rgb_pass2
 
 econ_pose.visual.vertex_colors = final_rgb
 econ_pose.export(f"{prefix}/econ_icp_rgb.ply")
@@ -537,16 +453,49 @@ if args.uv:
         torch.tensor(f_np).unsqueeze(0).long(),
         torch.tensor(final_rgb).unsqueeze(0).float() / 255.0,
     )
-    gray_texture = texture_npy.copy()
-    gray_texture[texture_npy.sum(axis=2) == 0.0] = 0.5
+    
+    import cv2
+    # Create a mask for missing (zero-sum) pixels in the texture.
+    missing_mask = (texture_npy.sum(axis=2) == 0).astype(np.uint8) * 255
+
+    # Resize the diff mask (from 512x512) to texture resolution.
+    diff_mask_resized = cv2.resize((mask_diff.astype(np.uint8) * 255),
+                                   (texture_npy.shape[1], texture_npy.shape[0]),
+                                   interpolation=cv2.INTER_NEAREST)
+
+    # Combine the missing areas with the diff mask.
+    combined_mask = cv2.bitwise_or(missing_mask, diff_mask_resized)
+    
+    # Erode the combined mask using a 5x5 kernel to slightly shrink the inpainting region.
+    kernel = np.ones((5, 5), np.uint8)
+    eroded_mask = cv2.erode(combined_mask, kernel, iterations=1)
+
+    # Convert texture_npy (in [0,1]) to an 8-bit image.
+    texture_8bit = (texture_npy * 255).astype(np.uint8)
+
+    # Inpaint the combined regions using the Navier–Stokes (NS) algorithm.
+    inpainted_texture_ns = cv2.inpaint(texture_8bit, eroded_mask, inpaintRadius=3, flags=cv2.INPAINT_NS)
+
+    # Create a smooth weight mask by blurring the eroded mask.
+    smooth_mask = cv2.GaussianBlur(eroded_mask, (15, 15), sigmaX=0)
+    alpha = smooth_mask.astype(np.float32) / 255.0
+    alpha = alpha[..., np.newaxis]  # Expand dims to match (H,W,3)
+
+    # Blend the original texture with the NS inpainted result using the smooth mask.
+    moderate_texture_ns = (texture_8bit.astype(np.float32) * (1 - alpha) +
+                           inpainted_texture_ns.astype(np.float32) * alpha).astype(np.uint8)
+    moderate_texture_ns = moderate_texture_ns.astype(np.float32) / 255.0
+
     print("Starting texture generation...")
 
     try:
         if not osp.exists(cache_path):
             os.makedirs(cache_path)
 
-        Image.fromarray((gray_texture * 255.0).astype(np.uint8)).save(f"{cache_path}/texture.png")
+        # Save the moderately inpainted texture (NS only).
+        Image.fromarray((moderate_texture_ns * 255.0).astype(np.uint8)).save(f"{cache_path}/texture_ns.png")
         
+        # Also, save a white mask (for areas that were originally missing) for reference.
         white_texture = texture_npy.copy()
         white_texture[texture_npy.sum(axis=2) == 0.0] = 1.0
         Image.fromarray((white_texture * 255.0).astype(np.uint8)).save(f"{cache_path}/mask.png")
@@ -562,9 +511,9 @@ if args.uv:
             lbs_weights=econ_lbs_weights,
         )
 
-        print("texture.png saved successfully.")
+        print("Texture generation successful: texture_ns.png saved.")
     except Exception as e:
-        print("Error saving texture.png:", e)
+        print("Error saving texture:", e)
 
     with open(f"{cache_path}/material.mtl", "w") as fp:
         fp.write("newmtl mat0 \n")
@@ -574,5 +523,5 @@ if args.uv:
         fp.write("Tr 1.000000 \n")
         fp.write("illum 1 \n")
         fp.write("Ns 0.000000 \n")
-        fp.write("map_Kd texture.png \n")
+        fp.write("map_Kd texture_ns.png \n")
     export_obj(posed_econ_verts[0].detach().cpu().numpy(), f_np, vt, ft, f"{cache_path}/mesh.obj")
