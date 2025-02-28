@@ -52,6 +52,7 @@ econ_obj.vertices -= smplx_param["transl"].cpu().numpy()
 for key in smplx_param.keys():
     smplx_param[key] = smplx_param[key].cpu().view(1, -1)
 
+print(smplx_container.model_dir)
 smpl_model = smplx.create(
     smplx_container.model_dir,
     model_type="smplx",
@@ -102,7 +103,7 @@ if not osp.exists(f"{prefix}/econ_da.obj") or not osp.exists(f"{prefix}/smpl_da.
     rot_mat_t = smpl_out_lst[3].vertex_transformation.detach()[0][idx[:, 0]]
     homo_coord = torch.ones_like(econ_verts)[..., :1]
     econ_cano_verts = torch.inverse(rot_mat_t) @ torch.cat([econ_verts, homo_coord],
-                                                        dim=1).unsqueeze(-1)
+                                                           dim=1).unsqueeze(-1)
     econ_cano_verts = econ_cano_verts[:, :3, 0].cpu()
     econ_cano = trimesh.Trimesh(econ_cano_verts, econ_obj.faces)
 
@@ -157,11 +158,11 @@ if not osp.exists(f"{prefix}/econ_da.obj") or not osp.exists(f"{prefix}/smpl_da.
     econ_da_body = econ_da.copy()
     edge_before = np.sqrt(
         ((econ_obj.vertices[econ_cano.edges[:, 0]] -
-        econ_obj.vertices[econ_cano.edges[:, 1]])**2).sum(axis=1)
+          econ_obj.vertices[econ_cano.edges[:, 1]])**2).sum(axis=1)
     )
     edge_after = np.sqrt(
         ((econ_da.vertices[econ_cano.edges[:, 0]] -
-        econ_da.vertices[econ_cano.edges[:, 1]])**2).sum(axis=1)
+          econ_da.vertices[econ_cano.edges[:, 1]])**2).sum(axis=1)
     )
     edge_diff = edge_after / edge_before.clip(1e-2)
 
@@ -248,234 +249,88 @@ os.makedirs(cache_path, exist_ok=True)
 # -----------------------------------------------------------------
 # create UV texture (.obj .mtl .png) from posed ECON reconstruction
 # -----------------------------------------------------------------
-print("Start Color mapping...")
 
+print("Start Color mapping...")
 from PIL import Image
 from torchvision import transforms
-import numpy as np
-import torch
-import trimesh
-import os.path as osp
-from lib.common.render import query_color, query_normal_color
+
+from lib.common.render import query_color, query_normal_color, query_avatar_color
 from lib.common.render_utils import Pytorch3dRasterizer
 
-# Assumptions: econ_pose, econ_cano_verts, econ_posedirs, econ_J_regressor,
-# smpl_model, econ_lbs_weights, args, prefix, cache_path, device, etc. are already defined.
+# choice 1: pixels to visible regions, normals to invisible regions
 
-##########################################
-# First Pass: Using _cloth_front and _cloth_back images
-##########################################
+# @SSH
+# if not osp.exists(f"{prefix}/econ_icp_rgb.ply"):
+#     masked_image = f"./results/Fulden/face_thresh_0.30/econ/png/{args.name}_cloth.png"
+#     # masked_image = f"./results/econ/png/{args.name}_cloth.png"
 
-# Load first-pass images.
-cloth_front_path = f"./results/Fulden/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_front.png"
-cloth_back_path  = f"./results/Fulden/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_back.png"
+#     tensor_image = transforms.ToTensor()(Image.open(masked_image))[:, :, :512]
+#     final_rgb = query_color(
+#         torch.tensor(econ_pose.vertices).float(),
+#         torch.tensor(econ_pose.faces).long(),
+#         ((tensor_image - 0.5) * 2.0).unsqueeze(0).to(device),
+#         ((tensor_image - 0.5) * 2.0).unsqueeze(0).to(device),   # back image
+#         device=device,
+#         paint_normal=False,
+#     ).numpy()
+#     final_rgb[final_rgb == tensor_image[:, 0, 0] * 255.0] = 0.5 * 255.0
 
-tensor_front_1 = transforms.ToTensor()(Image.open(cloth_front_path))[:, :, :512]
-tensor_back_1  = transforms.ToTensor()(Image.open(cloth_back_path))[:, :, :512]
-H, W = tensor_front_1.shape[1], tensor_front_1.shape[2]
+#     econ_pose.visual.vertex_colors = final_rgb
+#     econ_pose.export(f"{prefix}/econ_icp_rgb.ply")
+# else:
+#     mesh = trimesh.load(f"{prefix}/econ_icp_rgb.ply")
+#     final_rgb = mesh.visual.vertex_colors[:, :3]
+if not osp.exists(f"{prefix}/econ_icp_rgb.ply"):
+    # Load the separate cloth images saved from infer_f.py.
+    cloth_front_path = f"./results/Fulden/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_front.png"
+    cloth_back_path  = f"./results/Fulden/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_back.png"
 
-# Normalize to [-1,1] and add batch dimension.
-front_image_1 = ((tensor_front_1 - 0.5) * 2.0).unsqueeze(0).to(device)
-back_image_1  = ((tensor_back_1  - 0.5) * 2.0).unsqueeze(0).to(device)
+    # Load the images as tensors.
+    tensor_front = transforms.ToTensor()(Image.open(cloth_front_path))[:, :, :512]
+    tensor_back  = transforms.ToTensor()(Image.open(cloth_back_path))[:, :, :512]
 
-# Query colors for pass 1.
-verts_tensor = torch.tensor(econ_pose.vertices).float().to(device)
-faces_tensor = torch.tensor(econ_pose.faces).long().to(device)
+    # Normalize the textures from [0,1] to [-1,1] and add a batch dimension.
+    front_image = ((tensor_front - 0.5) * 2.0).unsqueeze(0).to(device)
+    back_image  = ((tensor_back  - 0.5) * 2.0).unsqueeze(0).to(device)
 
-final_rgb_pass1 = query_color(
-    verts_tensor,
-    faces_tensor,
-    front_image_1,
-    back_image_1,
-    device=device,
-).numpy()
-
-# Generate UV texture map for pass 1.
-uv_rasterizer = Pytorch3dRasterizer(image_size=8192, device=device)
-# Generate UV coordinates using xatlas (if not already generated)
-if not ('vt' in globals() and 'ft' in globals() and 'vmapping' in globals()):
-    import xatlas
-    atlas = xatlas.Atlas()
-    atlas.add_mesh(econ_pose.vertices, econ_pose.faces)
-    chart_options = xatlas.ChartOptions()
-    pack_options = xatlas.PackOptions()
-    chart_options.max_iterations = 4
-    pack_options.resolution = 8192
-    pack_options.bruteForce = True
-    atlas.generate(chart_options=chart_options)
-    vmapping, ft_np, vt_np = atlas[0]  # vmapping: mapping from original vertices to UV indices.
-    vt = torch.from_numpy(vt_np.astype(np.float32)).float().to(device)
-    ft = torch.from_numpy(ft_np.astype(np.int64)).int().to(device)
-
-v_np = econ_pose.vertices
-f_np = econ_pose.faces
-texture_map1 = uv_rasterizer.get_texture(
-    torch.cat([(vt - 0.5) * 2.0, torch.ones_like(vt[:, :1])], dim=1),
-    ft,
-    torch.tensor(v_np).unsqueeze(0).float(),
-    torch.tensor(f_np).unsqueeze(0).long(),
-    torch.tensor(final_rgb_pass1).unsqueeze(0).float() / 255.0,
-)
-# Save first-pass texture map.
-texture_map1_8bit = (texture_map1 * 255.0).astype(np.uint8)
-from PIL import Image
-Image.fromarray(texture_map1_8bit).save(f"{cache_path}/texture_map1.png")
-print("First-pass texture map saved as texture_map1.png.")
-
-##########################################
-# Second Pass: Using _cloth_front_II and _cloth_back_II images
-##########################################
-
-cloth_front_path_II = f"./results/Fulden/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_front_II.png"
-cloth_back_path_II  = f"./results/Fulden/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_back_II.png"
-
-tensor_front_2 = transforms.ToTensor()(Image.open(cloth_front_path_II))[:, :, :512]
-tensor_back_2  = transforms.ToTensor()(Image.open(cloth_back_path_II))[:, :, :512]
-
-front_image_2 = ((tensor_front_2 - 0.5) * 2.0).unsqueeze(0).to(device)
-back_image_2  = ((tensor_back_2  - 0.5) * 2.0).unsqueeze(0).to(device)
-
-final_rgb_pass2 = query_color(
-    verts_tensor,
-    faces_tensor,
-    front_image_2,
-    back_image_2,
-    device=device,
-).numpy()
-
-# Generate second UV texture map.
-texture_map2 = uv_rasterizer.get_texture(
-    torch.cat([(vt - 0.5) * 2.0, torch.ones_like(vt[:, :1])], dim=1),
-    ft,
-    torch.tensor(v_np).unsqueeze(0).float(),
-    torch.tensor(f_np).unsqueeze(0).long(),
-    torch.tensor(final_rgb_pass2).unsqueeze(0).float() / 255.0,
-)
-
-texture_map2_8bit = (texture_map2 * 255.0).astype(np.uint8)
-Image.fromarray(texture_map2_8bit).save(f"{cache_path}/texture_map2.png")
-print("Second-pass texture map saved as texture_map2.png.")
-
-##########################################
-# Compare Texture Maps and Create Difference Mask
-##########################################
-
-# Compute per-pixel absolute difference.
-diff_map = np.abs(texture_map1_8bit.astype(np.float32) - texture_map2_8bit.astype(np.float32)) / 255.0
-threshold = 0.1  # threshold in normalized space
-mask_diff = np.any(diff_map > threshold, axis=2)  # Boolean mask of shape (H, W)
-Image.fromarray((mask_diff.astype(np.uint8) * 255)).save(f"{cache_path}/diff_mask.png")
-print("Difference mask saved as diff_mask.png.")
-
-##########################################
-# Map Difference Mask to Vertices Using UV Coordinates
-##########################################
-
-# Compute per-vertex UV coordinates from xatlas mapping.
-# vmapping maps each original vertex index to an index in vt_np.
-vertex_uv = vt_np[vmapping]  # shape: (num_vertices, 2) with values in [0,1]
-# Convert UV coordinates to pixel indices.
-vertex_pixel = np.zeros_like(vertex_uv)
-vertex_pixel[:, 0] = vertex_uv[:, 0] * (W - 1)
-# Note: V coordinate is often flipped; here we assume 0 is at the top.
-vertex_pixel[:, 1] = (1 - vertex_uv[:, 1]) * (H - 1)
-
-# For each vertex, sample the diff_mask.
-num_vertices = len(econ_pose.vertices)
-vertex_mask = np.zeros(num_vertices, dtype=bool)
-for i in range(num_vertices):
-    x = int(np.clip(vertex_pixel[i, 0], 0, W - 1))
-    y = int(np.clip(vertex_pixel[i, 1], 0, H - 1))
-    vertex_mask[i] = mask_diff[y, x]
-
-print("Percentage of vertices marked for inpainting (from diff mask):",
-    100.0 * np.sum(vertex_mask) / num_vertices, "%")
-
-##########################################
-# Inpaint Regions Marked by Vertex Mask
-##########################################
-
-def build_vertex_neighbors(faces, num_vertices):
-    """Build a list of neighboring vertices for each vertex."""
-    neighbors = {i: set() for i in range(num_vertices)}
-    for face in faces:
-        for i in range(3):
-            v_i = face[i]
-            v_j = face[(i + 1) % 3]
-            v_k = face[(i + 2) % 3]
-            neighbors[v_i].update([v_j, v_k])
-    return neighbors
-
-def inpaint_colors(vertices, colors, mask, k=2):
-    """
-    Inpaint each vertex marked as unpainted (mask True) by averaging the colors
-    of the k closest painted vertices (mask False) based on Euclidean distance.
-    
-    Args:
-        vertices (np.ndarray): Array of shape (N, 3) for vertex positions.
-        colors (np.ndarray): Array of shape (N, 3) for vertex colors.
-        mask (np.ndarray): Boolean array of shape (N,) where True indicates that 
-                        the vertex is unpainted and needs inpainting.
-        k (int): Number of closest painted vertices to average.
-        
-    Returns:
-        np.ndarray: Updated colors after inpainting.
-    """
-    inpainted_colors = colors.copy()
-    painted_indices = np.where(~mask)[0]  # indices that are already painted
-    
-    # Precompute for efficiency:
-    painted_vertices = vertices[painted_indices]
-    
-    for i, needs_inpaint in enumerate(mask):
-        if needs_inpaint:
-            # Compute distances from vertex i to all painted vertices.
-            dists = np.linalg.norm(vertices[i] - painted_vertices, axis=1)
-            # Get indices of the k closest painted vertices.
-            if len(dists) < k:
-                k = len(dists)
-            closest_indices = painted_indices[np.argsort(dists)[:k]]
-            # Average their colors.
-            inpainted_colors[i] = np.mean(colors[closest_indices], axis=0)
-
-    return inpainted_colors
-
-# Use the second pass colors as our base.
-mask_fallback = vertex_mask  # if vertex_mask marks unpainted vertices
-final_rgb = final_rgb_pass2.copy()
-fallback_color = np.array([128, 0, 128], dtype=final_rgb.dtype)
-final_rgb[vertex_mask] = fallback_color
-
-# Inpaint the vertices marked (vertex_mask).
-final_rgb_inpainted = inpaint_colors(np.array(econ_pose.vertices), final_rgb, mask_fallback, k=2)
-final_rgb = final_rgb_inpainted
-
-##########################################
-# Assign Final Vertex Colors and Export Mesh
-##########################################
-
-econ_pose.visual.vertex_colors = final_rgb
-econ_pose.export(f"{prefix}/econ_icp_rgb.ply")
-
-##########################################
-# Normal-based Color Mapping (Choice 2, unchanged)
-##########################################
-
-if not osp.exists(f"{prefix}/econ_icp_normal.ply"):
-    file_normal = query_normal_color(
-        verts_tensor,
-        faces_tensor,
+    # Call the updated query_color that now accepts two images.
+    final_rgb = query_avatar_color(
+        torch.tensor(econ_pose.vertices).float(),
+        torch.tensor(econ_pose.faces).long(),
+        front_image,
+        back_image,
         device=device,
     ).numpy()
+
+    # Optionally: adjust any pixels that still match a default color if needed.
+    # For example:
+    final_rgb[final_rgb == tensor_front[:, 0, 0] * 255.0] = 0.5 * 255.0
+
+    econ_pose.visual.vertex_colors = final_rgb
+    econ_pose.export(f"{prefix}/econ_icp_rgb.ply")
+else:
+    mesh = trimesh.load(f"{prefix}/econ_icp_rgb.ply")
+    final_rgb = mesh.visual.vertex_colors[:, :3]
+
+# @SSH END 
+
+# choice 2: normals to all the regions
+
+if not osp.exists(f"{prefix}/econ_icp_normal.ply"):
+
+    file_normal = query_normal_color(
+        torch.tensor(econ_pose.vertices).float(),
+        torch.tensor(econ_pose.faces).long(),
+        device=device,
+    ).numpy()
+
     econ_pose.visual.vertex_colors = file_normal
     econ_pose.export(f"{prefix}/econ_icp_normal.ply")
 else:
     mesh = trimesh.load(f"{prefix}/econ_icp_normal.ply")
     file_normal = mesh.visual.vertex_colors[:, :3]
 
-##########################################
-# Save econ Data for Further Processing
-##########################################
+# econ data used for animation and rendering
 
 econ_dict = {
     "v_template": econ_cano_verts.unsqueeze(0),
@@ -491,19 +346,17 @@ econ_dict = {
 torch.save(econ_dict, f"{cache_path}/econ.pt")
 
 print(
-    "If the dress/skirt is torn in `<file_name>/econ_da.obj`, please delete ./file_name and regenerate them with `-dress`\n"
-    "python -m apps.avatarizer -n <file_name> -dress"
+    colored(
+        "If the dress/skirt is torn in `<file_name>/econ_da.obj`, please delete ./file_name and regenerate them with `-dress` \n \
+    python -m apps.avatarizer -n <file_name> -dress", "yellow"
+    )
 )
 
-##########################################
-# UV Texture Generation (if enabled)
-##########################################
-
-args.uv = True
-args.dress = False
-
 if args.uv:
+
     print("Start UV texture generation...")
+
+    # Generate UV coords
     v_np = econ_pose.vertices
     f_np = econ_pose.faces
 
@@ -515,6 +368,7 @@ if args.uv:
         ft = torch.load(ft_cache).to(device)
     else:
         import xatlas
+
         atlas = xatlas.Atlas()
         atlas.add_mesh(v_np, f_np)
         chart_options = xatlas.ChartOptions()
@@ -524,11 +378,13 @@ if args.uv:
         pack_options.bruteForce = True
         atlas.generate(chart_options=chart_options)
         vmapping, ft_np, vt_np = atlas[0]
+
         vt = torch.from_numpy(vt_np.astype(np.float32)).float().to(device)
         ft = torch.from_numpy(ft_np.astype(np.int64)).int().to(device)
         torch.save(vt.cpu(), vt_cache)
         torch.save(ft.cpu(), ft_cache)
 
+    # UV texture rendering
     uv_rasterizer = Pytorch3dRasterizer(image_size=8192, device=device)
     texture_npy = uv_rasterizer.get_texture(
         torch.cat([(vt - 0.5) * 2.0, torch.ones_like(vt[:, :1])], dim=1),
@@ -537,42 +393,70 @@ if args.uv:
         torch.tensor(f_np).unsqueeze(0).long(),
         torch.tensor(final_rgb).unsqueeze(0).float() / 255.0,
     )
-    gray_texture = texture_npy.copy()
-    gray_texture[texture_npy.sum(axis=2) == 0.0] = 0.5
-    print("Starting texture generation...")
 
-    try:
-        if not osp.exists(cache_path):
-            os.makedirs(cache_path)
+    # @SSH
 
-        Image.fromarray((gray_texture * 255.0).astype(np.uint8)).save(f"{cache_path}/texture.png")
-        
-        white_texture = texture_npy.copy()
-        white_texture[texture_npy.sum(axis=2) == 0.0] = 1.0
-        Image.fromarray((white_texture * 255.0).astype(np.uint8)).save(f"{cache_path}/mask.png")
-        
-        new_pose = smpl_out_lst[0].full_pose
-        new_pose[:, :3] = 0.0
-        posed_econ_verts, _ = general_lbs(
-            pose=new_pose,
-            v_template=econ_cano_verts.unsqueeze(0),
-            posedirs=econ_posedirs,
-            J_regressor=econ_J_regressor,
-            parents=smpl_model.parents,
-            lbs_weights=econ_lbs_weights,
-        )
+    import torch
+    import torch.nn.functional as F
 
-        print("texture.png saved successfully.")
-    except Exception as e:
-        print("Error saving texture.png:", e)
+    # Assume texture_npy is your rendered texture as a (H, W, 3) numpy array in [0, 1].
+    # Convert to a PyTorch tensor and rearrange to (B, C, H, W)
+    texture_tensor = torch.from_numpy(texture_npy.copy()).float().permute(2, 0, 1).unsqueeze(0).to(device)
 
+    # --- Quantization ---
+    # For example, reduce each channel to 16 discrete levels to force hard boundaries.
+    levels = 16
+    # Multiply by 255, quantize, then scale back to [0,1].
+    texture_quantized = torch.floor(texture_tensor * 255 / (256 / levels)) * (256 / levels) / 255
+
+    # --- Morphological Dilation ---
+    # Use max_pool2d as a dilation operator on each channel independently.
+    # The kernel_size and padding determine the effect.
+    dilated = F.max_pool2d(texture_quantized, kernel_size=3, stride=1, padding=1)
+    eroded = -F.max_pool2d(-dilated, kernel_size=3, stride=1, padding=1)
+
+    # (Optionally, you can follow with an erosion step via negative pooling if desired:
+    # cleaned = -F.max_pool2d(-dilated, kernel_size=3, stride=1, padding=1)
+    # For now, we'll use the dilated result directly.)
+    cleaned_texture = eroded
+
+    # Convert back to (H, W, 3) numpy array for further processing or saving.
+    texture_cleaned = cleaned_texture.squeeze(0).permute(1, 2, 0).cpu().numpy()
+
+    # @SSH END
+
+    gray_texture = texture_cleaned.copy()
+    gray_texture[texture_cleaned.sum(axis=2) == 0.0] = 0.5
+    Image.fromarray((gray_texture * 255.0).astype(np.uint8)).save(f"{cache_path}/texture.png")
+
+
+    # UV mask for TEXTure (https://readpaper.com/paper/4720151447010820097)
+    white_texture = texture_cleaned.copy()
+    white_texture[texture_cleaned.sum(axis=2) == 0.0] = 1.0
+    Image.fromarray((white_texture * 255.0).astype(np.uint8)).save(f"{cache_path}/mask.png")
+    
+    # generate a-pose vertices
+    new_pose = smpl_out_lst[0].full_pose
+    new_pose[:, :3] = 0.0
+
+    posed_econ_verts, _ = general_lbs(
+        pose=new_pose,
+        v_template=econ_cano_verts.unsqueeze(0),
+        posedirs=econ_posedirs,
+        J_regressor=econ_J_regressor,
+        parents=smpl_model.parents,
+        lbs_weights=econ_lbs_weights,
+    )
+
+    # export mtl file
     with open(f"{cache_path}/material.mtl", "w") as fp:
-        fp.write("newmtl mat0 \n")
-        fp.write("Ka 1.000000 1.000000 1.000000 \n")
-        fp.write("Kd 1.000000 1.000000 1.000000 \n")
-        fp.write("Ks 0.000000 0.000000 0.000000 \n")
-        fp.write("Tr 1.000000 \n")
-        fp.write("illum 1 \n")
-        fp.write("Ns 0.000000 \n")
-        fp.write("map_Kd texture.png \n")
+        fp.write(f"newmtl mat0 \n")
+        fp.write(f"Ka 1.000000 1.000000 1.000000 \n")
+        fp.write(f"Kd 1.000000 1.000000 1.000000 \n")
+        fp.write(f"Ks 0.000000 0.000000 0.000000 \n")
+        fp.write(f"Tr 1.000000 \n")
+        fp.write(f"illum 1 \n")
+        fp.write(f"Ns 0.000000 \n")
+        fp.write(f"map_Kd texture.png \n")
+
     export_obj(posed_econ_verts[0].detach().cpu().numpy(), f_np, vt, ft, f"{cache_path}/mesh.obj")
