@@ -105,6 +105,7 @@ class NormalNet_f(BasePIFuNet):
         # Create a mask for valid pixels (non-zero regions)
         mask = ((in_tensor["image"].abs().sum(dim=1, keepdim=True) != 0.0).detach().float())
         back_mask = ((in_tensor["image_back"].abs().sum(dim=1, keepdim=True) != 0.0).detach().float())
+        
         self.save_mask_image(mask, back_mask, out_dir)
         self.save_nml_image(nmlF_normalized, nmlB_normalized, out_dir)
         # Return masked and normalized normals

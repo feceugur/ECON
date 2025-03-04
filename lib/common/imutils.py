@@ -239,7 +239,6 @@ def process_image(img_file, hps_type, single, input_res, detector, bg_color):
 
         # get accurate person segmentation mask
         img_rembg = remove(img_crop, post_process_mask=True, session=new_session("u2net"), bgcolor=bg_color)
-        print(colored(f"removed bg of img: {img_file} and substituted with color {bg_color}", "yellow"))
         img_mask = remove_floats(img_rembg[:, :, [3]])
 
         mean_icon = std_icon = (0.5, 0.5, 0.5)

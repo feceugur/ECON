@@ -258,24 +258,22 @@ import trimesh
 import os.path as osp
 from lib.common.render import query_color, query_normal_color
 from lib.common.render_utils import Pytorch3dRasterizer
+from lib.dataset.mesh_util import export_obj
 
 ##########################################
-# First Pass: Using _cloth_front and _cloth_back images
+# First Pass: Using _cloth_front and _cloth_back_red images
 ##########################################
 
-# Load first-pass images.
-cloth_front_path = f"./results/Fulden/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_front.png"
-cloth_back_path  = f"./results/Fulden/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_back.png"
+cloth_front_red_path = f"./results/Fulden/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_front_red.png"
+cloth_back_red_path  = f"./results/Fulden/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_back_red.png"
 
-tensor_front_1 = transforms.ToTensor()(Image.open(cloth_front_path))[:, :, :512]
-tensor_back_1  = transforms.ToTensor()(Image.open(cloth_back_path))[:, :, :512]
+tensor_front_1 = transforms.ToTensor()(Image.open(cloth_front_red_path))[:, :, :512]
+tensor_back_1  = transforms.ToTensor()(Image.open(cloth_back_red_path))[:, :, :512]
 H, W = tensor_front_1.shape[1], tensor_front_1.shape[2]
 
-# Normalize to [-1,1] and add batch dimension.
 front_image_1 = ((tensor_front_1 - 0.5) * 2.0).unsqueeze(0).to(device)
 back_image_1  = ((tensor_back_1  - 0.5) * 2.0).unsqueeze(0).to(device)
 
-# Query colors for pass 1.
 verts_tensor = torch.tensor(econ_pose.vertices).float().to(device)
 faces_tensor = torch.tensor(econ_pose.faces).long().to(device)
 
@@ -287,9 +285,7 @@ final_rgb_pass1 = query_color(
     device=device,
 ).numpy()
 
-# Generate UV texture map for pass 1.
 uv_rasterizer = Pytorch3dRasterizer(image_size=8192, device=device)
-# Generate UV coordinates using xatlas (if not already generated)
 if not ('vt' in globals() and 'ft' in globals() and 'vmapping' in globals()):
     import xatlas
     atlas = xatlas.Atlas()
@@ -300,7 +296,7 @@ if not ('vt' in globals() and 'ft' in globals() and 'vmapping' in globals()):
     pack_options.resolution = 8192
     pack_options.bruteForce = True
     atlas.generate(chart_options=chart_options)
-    vmapping, ft_np, vt_np = atlas[0]  # mapping from original vertices to UV indices.
+    vmapping, ft_np, vt_np = atlas[0]
     vt = torch.from_numpy(vt_np.astype(np.float32)).float().to(device)
     ft = torch.from_numpy(ft_np.astype(np.int64)).int().to(device)
 
@@ -313,20 +309,19 @@ texture_map1 = uv_rasterizer.get_texture(
     torch.tensor(f_np).unsqueeze(0).long(),
     torch.tensor(final_rgb_pass1).unsqueeze(0).float() / 255.0,
 )
-# Save first-pass texture map.
 texture_map1_8bit = (texture_map1 * 255.0).astype(np.uint8)
 Image.fromarray(texture_map1_8bit).save(f"{cache_path}/texture_map1.png")
 print("First-pass texture map saved as texture_map1.png.")
 
 ##########################################
-# Second Pass: Using _cloth_front_II and _cloth_back_II images
+# Second Pass: Using _cloth_front_red_blue and _cloth_back_blue images
 ##########################################
 
-cloth_front_path_II = f"./results/Fulden/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_front_II.png"
-cloth_back_path_II  = f"./results/Fulden/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_back_II.png"
+cloth_front_path_blue = f"./results/Fulden/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_front_blue.png"
+cloth_back_path_blue  = f"./results/Fulden/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_back_blue.png"
 
-tensor_front_2 = transforms.ToTensor()(Image.open(cloth_front_path_II))[:, :, :512]
-tensor_back_2  = transforms.ToTensor()(Image.open(cloth_back_path_II))[:, :, :512]
+tensor_front_2 = transforms.ToTensor()(Image.open(cloth_front_path_blue))[:, :, :512]
+tensor_back_2  = transforms.ToTensor()(Image.open(cloth_back_path_blue))[:, :, :512]
 
 front_image_2 = ((tensor_front_2 - 0.5) * 2.0).unsqueeze(0).to(device)
 back_image_2  = ((tensor_back_2  - 0.5) * 2.0).unsqueeze(0).to(device)
@@ -339,7 +334,6 @@ final_rgb_pass2 = query_color(
     device=device,
 ).numpy()
 
-# Generate second UV texture map.
 texture_map2 = uv_rasterizer.get_texture(
     torch.cat([(vt - 0.5) * 2.0, torch.ones_like(vt[:, :1])], dim=1),
     ft,
@@ -347,7 +341,6 @@ texture_map2 = uv_rasterizer.get_texture(
     torch.tensor(f_np).unsqueeze(0).long(),
     torch.tensor(final_rgb_pass2).unsqueeze(0).float() / 255.0,
 )
-
 texture_map2_8bit = (texture_map2 * 255.0).astype(np.uint8)
 Image.fromarray(texture_map2_8bit).save(f"{cache_path}/texture_map2.png")
 print("Second-pass texture map saved as texture_map2.png.")
@@ -356,10 +349,9 @@ print("Second-pass texture map saved as texture_map2.png.")
 # Compare Texture Maps and Create Difference Mask
 ##########################################
 
-# Compute per-pixel absolute difference.
 diff_map = np.abs(texture_map1_8bit.astype(np.float32) - texture_map2_8bit.astype(np.float32)) / 255.0
-threshold = 0.1  # threshold in normalized space
-mask_diff = np.any(diff_map > threshold, axis=2)  # Boolean mask of shape (H, W)
+threshold = 0.1
+mask_diff = np.any(diff_map > threshold, axis=2)
 Image.fromarray((mask_diff.astype(np.uint8) * 255)).save(f"{cache_path}/diff_mask.png")
 print("Difference mask saved as diff_mask.png.")
 
@@ -367,9 +359,7 @@ print("Difference mask saved as diff_mask.png.")
 # Assign Final Vertex Colors and Export Mesh
 ##########################################
 
-# Use the second pass colors directly.
 final_rgb = final_rgb_pass2
-
 econ_pose.visual.vertex_colors = final_rgb
 econ_pose.export(f"{prefix}/econ_icp_rgb.ply")
 
@@ -455,65 +445,30 @@ if args.uv:
     )
     
     import cv2
-    # Create a mask for missing (zero-sum) pixels in the texture.
+    # Create a mask for missing (zero-sum) pixels.
     missing_mask = (texture_npy.sum(axis=2) == 0).astype(np.uint8) * 255
 
-    # Resize the diff mask (from 512x512) to texture resolution.
+    # Resize the diff mask from 512x512 to the texture resolution.
     diff_mask_resized = cv2.resize((mask_diff.astype(np.uint8) * 255),
                                    (texture_npy.shape[1], texture_npy.shape[0]),
                                    interpolation=cv2.INTER_NEAREST)
 
-    # Combine the missing areas with the diff mask.
+    # Combine the missing mask with the diff mask.
     combined_mask = cv2.bitwise_or(missing_mask, diff_mask_resized)
     
-    # Erode the combined mask using a 5x5 kernel to slightly shrink the inpainting region.
-    kernel = np.ones((5, 5), np.uint8)
-    eroded_mask = cv2.erode(combined_mask, kernel, iterations=1)
-
-    # Convert texture_npy (in [0,1]) to an 8-bit image.
+    # (No erosion is performed here.)
+    
+    # Convert texture_npy to an 8-bit image.
     texture_8bit = (texture_npy * 255).astype(np.uint8)
+    
+    # Use inpaintRadius = 3 for NS inpainting.
+    inpainted_ns = cv2.inpaint(texture_8bit, combined_mask, inpaintRadius=3, flags=cv2.INPAINT_NS)
+    result = inpainted_ns.astype(np.float32) / 255.0
+    filename = f"{cache_path}/texture.png"
+    Image.fromarray((result * 255.0).astype(np.uint8)).save(filename)
+    print(f"Saved inpainted texture: {filename}")
 
-    # Inpaint the combined regions using the Navier–Stokes (NS) algorithm.
-    inpainted_texture_ns = cv2.inpaint(texture_8bit, eroded_mask, inpaintRadius=3, flags=cv2.INPAINT_NS)
-
-    # Create a smooth weight mask by blurring the eroded mask.
-    smooth_mask = cv2.GaussianBlur(eroded_mask, (15, 15), sigmaX=0)
-    alpha = smooth_mask.astype(np.float32) / 255.0
-    alpha = alpha[..., np.newaxis]  # Expand dims to match (H,W,3)
-
-    # Blend the original texture with the NS inpainted result using the smooth mask.
-    moderate_texture_ns = (texture_8bit.astype(np.float32) * (1 - alpha) +
-                           inpainted_texture_ns.astype(np.float32) * alpha).astype(np.uint8)
-    moderate_texture_ns = moderate_texture_ns.astype(np.float32) / 255.0
-
-    print("Starting texture generation...")
-
-    try:
-        if not osp.exists(cache_path):
-            os.makedirs(cache_path)
-
-        # Save the moderately inpainted texture (NS only).
-        Image.fromarray((moderate_texture_ns * 255.0).astype(np.uint8)).save(f"{cache_path}/texture_ns.png")
-        
-        # Also, save a white mask (for areas that were originally missing) for reference.
-        white_texture = texture_npy.copy()
-        white_texture[texture_npy.sum(axis=2) == 0.0] = 1.0
-        Image.fromarray((white_texture * 255.0).astype(np.uint8)).save(f"{cache_path}/mask.png")
-        
-        new_pose = smpl_out_lst[0].full_pose
-        new_pose[:, :3] = 0.0
-        posed_econ_verts, _ = general_lbs(
-            pose=new_pose,
-            v_template=econ_cano_verts.unsqueeze(0),
-            posedirs=econ_posedirs,
-            J_regressor=econ_J_regressor,
-            parents=smpl_model.parents,
-            lbs_weights=econ_lbs_weights,
-        )
-
-        print("Texture generation successful: texture_ns.png saved.")
-    except Exception as e:
-        print("Error saving texture:", e)
+    print("UV texture generation complete. Compare the saved texture for best results.")
 
     with open(f"{cache_path}/material.mtl", "w") as fp:
         fp.write("newmtl mat0 \n")
@@ -523,5 +478,7 @@ if args.uv:
         fp.write("Tr 1.000000 \n")
         fp.write("illum 1 \n")
         fp.write("Ns 0.000000 \n")
-        fp.write("map_Kd texture_ns.png \n")
-    export_obj(posed_econ_verts[0].detach().cpu().numpy(), f_np, vt, ft, f"{cache_path}/mesh.obj")
+        fp.write("map_Kd texture.png \n")
+    
+    # Export the mesh using the original vertices.
+    export_obj(np.array(econ_pose.vertices), f_np, vt, ft, f"{cache_path}/mesh.obj")

@@ -23,7 +23,6 @@ from lib.common.train_util import *
 
 torch.backends.cudnn.benchmark = True
 
-
 class IFGeo(pl.LightningModule):
     def __init__(self, cfg):
         super(IFGeo, self).__init__()
