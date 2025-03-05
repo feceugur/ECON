@@ -350,8 +350,8 @@ print("Second-pass texture map saved as texture_map2.png.")
 ##########################################
 
 diff_map = np.abs(texture_map1_8bit.astype(np.float32) - texture_map2_8bit.astype(np.float32)) / 255.0
-threshold = 0.1
-mask_diff = np.any(diff_map > threshold, axis=2)
+# threshold = 0.1
+mask_diff = np.any(diff_map > 0, axis=2)
 Image.fromarray((mask_diff.astype(np.uint8) * 255)).save(f"{cache_path}/diff_mask.png")
 print("Difference mask saved as diff_mask.png.")
 
@@ -456,15 +456,19 @@ if args.uv:
     # Combine the missing mask with the diff mask.
     combined_mask = cv2.bitwise_or(missing_mask, diff_mask_resized)
     
-    # (No erosion is performed here.)
+    # Instead of erosion, we now dilate the mask.
+    kernel = np.ones((7, 7), np.uint8)  # 7x7 kernel
+    dilated_mask = cv2.dilate(combined_mask, kernel, iterations=2)
+    # Save the dilated mask for reference.
+    cv2.imwrite(f"{cache_path}/mask_dilated.png", dilated_mask)
     
     # Convert texture_npy to an 8-bit image.
     texture_8bit = (texture_npy * 255).astype(np.uint8)
     
-    # Use inpaintRadius = 3 for NS inpainting.
-    inpainted_ns = cv2.inpaint(texture_8bit, combined_mask, inpaintRadius=3, flags=cv2.INPAINT_NS)
-    result = inpainted_ns.astype(np.float32) / 255.0
-    filename = f"{cache_path}/texture.png"
+    # Inpaint the texture using the dilated mask, inpaintRadius=3, and TELEA method.
+    inpainted_image = cv2.inpaint(texture_8bit, dilated_mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+    result = inpainted_image.astype(np.float32) / 255.0
+    filename = f"{cache_path}/texture_TELEA.png"
     Image.fromarray((result * 255.0).astype(np.uint8)).save(filename)
     print(f"Saved inpainted texture: {filename}")
 
@@ -478,7 +482,7 @@ if args.uv:
         fp.write("Tr 1.000000 \n")
         fp.write("illum 1 \n")
         fp.write("Ns 0.000000 \n")
-        fp.write("map_Kd texture.png \n")
+        fp.write("map_Kd texture_TELEA.png \n")
     
     # Export the mesh using the original vertices.
     export_obj(np.array(econ_pose.vertices), f_np, vt, ft, f"{cache_path}/mesh.obj")

@@ -802,11 +802,11 @@ def process_sample_second_pass(data, data_b, args, cfg, device, normal_net, sapi
                 "right_hand_pose": rotation_matrix_to_angle_axis(data["right_hand_pose"][idx]).cpu().unsqueeze(0),
                 "scale": data["scale"][idx].cpu(),
             }
-            # np.save(
-            #     smpl_obj_path.replace(".obj", ".npy"),
-            #     smpl_info,
-            #     allow_pickle=True,
-            # )
+            np.save(
+                smpl_obj_path.replace(".obj", ".npy"),
+                smpl_info,
+                allow_pickle=True,
+            )
         smpl_obj_lst.append(smpl_obj)
 
     del optimizer_smpl, optimed_betas, optimed_orient, optimed_pose, optimed_trans
@@ -860,13 +860,13 @@ def process_sample_second_pass(data, data_b, args, cfg, device, normal_net, sapi
             occupancies = VoxelGrid.from_mesh(side_mesh, cfg.vol_res, loc=[0, 0, 0], scale=2.0).data.transpose(2, 1, 0)
             occupancies = np.flip(occupancies, axis=1)
             in_tensor["body_voxels"] = torch.tensor(occupancies.copy()).float().unsqueeze(0).to(device)
-            # with torch.no_grad():
-            #     sdf = ifnet.reconEngine(netG=ifnet.netG, batch=in_tensor)
-                # verts_IF, faces_IF = ifnet.reconEngine.export_mesh(sdf)
+            with torch.no_grad():
+                sdf = ifnet.reconEngine(netG=ifnet.netG, batch=in_tensor)
+                verts_IF, faces_IF = ifnet.reconEngine.export_mesh(sdf)
             if ifnet.clean_mesh_flag:
                 verts_IF, faces_IF = clean_mesh(verts_IF, faces_IF)
             side_mesh = trimesh.Trimesh(verts_IF, faces_IF)
-            side_mesh = remesh_laplacian(side_mesh, side_mesh_path)
+            # side_mesh = remesh_laplacian(side_mesh, side_mesh_path)
         else:
             side_mesh = apply_vertex_mask(
                 side_mesh,
@@ -946,20 +946,20 @@ def process_sample_second_pass(data, data_b, args, cfg, device, normal_net, sapi
         # )
         # side_mesh.export(f"{args.out_dir}/{cfg.name}/obj/{sample_name}_{idx}_side.obj")
 
-        if cfg.bni.use_poisson:
-            final_mesh = poisson(
-                sum(full_lst),
-                final_path,
-                cfg.bni.poisson_depth,
-            )
-            print(
-                colored(
-                    f"\n Poisson completion to {Format.start} {final_path} {Format.end}",
-                    "yellow"
-                )
-            )
-        else:
-            final_mesh = sum(full_lst)
+        # if cfg.bni.use_poisson:
+        #     final_mesh = poisson(
+        #         sum(full_lst),
+        #         final_path,
+        #         cfg.bni.poisson_depth,
+        #     )
+        #     print(
+        #         colored(
+        #             f"\n Poisson completion to {Format.start} {final_path} {Format.end}",
+        #             "yellow"
+        #         )
+        #     )
+        # else:
+        final_mesh = sum(full_lst)
             # final_mesh.export(final_path)
 
         if not args.novis:
@@ -991,13 +991,13 @@ def process_sample_second_pass(data, data_b, args, cfg, device, normal_net, sapi
                 in_tensor, osp.join(args.out_dir, cfg.name, f"vid/{sample_name}_in_tensor.pt")
             )
 
-    final_watertight_path = f"{args.out_dir}/{cfg.name}/obj/{sample_name}_{idx}_full_wt.obj"
-    watertightifier = MeshWatertightifier(final_path, final_watertight_path)
-    result = watertightifier.process(reconstruction_method='poisson', depth=10)
-    if result:
-        print("The mesh is watertight and has been saved successfully!")
-    else:
-        print("The mesh is not watertight. Further inspection may be needed.")
+    # final_watertight_path = f"{args.out_dir}/{cfg.name}/obj/{sample_name}_{idx}_full_wt.obj"
+    # watertightifier = MeshWatertightifier(final_path, final_watertight_path)
+    # result = watertightifier.process(reconstruction_method='poisson', depth=10)
+    # if result:
+    #     print("The mesh is watertight and has been saved successfully!")
+    # else:
+    #     print("The mesh is not watertight. Further inspection may be needed.")
 
 
 def main():
@@ -1025,7 +1025,7 @@ def main():
     pbar = tqdm(dataset_blue)
     for data, data_b in pbar:
         pbar.set_description(f"{data['name']}")
-        process_sample(data, data_b, args, cfg, device, normal_net, sapiens_normal_net, ifnet, SMPLX_object, dataset_blue, bg_color="blue")
+        process_sample_second_pass(data, data_b, args, cfg, device, normal_net, sapiens_normal_net, ifnet, SMPLX_object, dataset_blue, bg_color="blue")
 
 if __name__ == "__main__":
     main()

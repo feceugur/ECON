@@ -22,3 +22,4 @@ gradio_cached_examples/
 *.blend
 *.blend1
 examples/junxuan
+rafa_tests_deleteme/*
