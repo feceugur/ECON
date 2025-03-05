@@ -55,6 +55,7 @@ from lib.dataset.mesh_util import (
 from lib.smplx.lbs import general_lbs
 
 from rembg import remove
+from clean_mesh import MeshCleanProcess
 
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -563,13 +564,21 @@ def process_sample(data, data_b, args, cfg, device, normal_net, sapiens_normal_n
                 in_tensor, osp.join(args.out_dir, cfg.name, f"vid/{sample_name}_in_tensor.pt")
             )
 
-    final_watertight_path = f"{args.out_dir}/{cfg.name}/obj/{sample_name}_{idx}_full_wt.obj"
-    watertightifier = MeshWatertightifier(final_path, final_watertight_path)
+    final_watertight_path = f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_full_wt.obj"
+    watertightifier = MeshCleanProcess(final_path, final_watertight_path)
     result = watertightifier.process(reconstruction_method='poisson', depth=10)
+
     if result:
         print("The mesh is watertight and has been saved successfully!")
     else:
         print("The mesh is not watertight. Further inspection may be needed.")
+
+    final_mesh = MeshCleanProcess.process_watertight_mesh(
+        final_watertight_path=f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_full_wt.obj",
+        output_path=f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_final.obj",
+        face_vertex_mask=SMPLX_object.front_flame_vertex_mask,
+        target_faces=15000 #desired number of vertices
+    )        
 
 def process_sample_second_pass(data, data_b, args, cfg, device, normal_net, sapiens_normal_net, ifnet, SMPLX_object, dataset, bg_color):
     losses = init_loss()
