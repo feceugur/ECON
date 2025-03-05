@@ -55,7 +55,6 @@ from lib.dataset.mesh_util import (
 from lib.smplx.lbs import general_lbs
 
 from rembg import remove
-from clean_mesh import MeshCleanProcess
 
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -564,21 +563,14 @@ def process_sample(data, data_b, args, cfg, device, normal_net, sapiens_normal_n
                 in_tensor, osp.join(args.out_dir, cfg.name, f"vid/{sample_name}_in_tensor.pt")
             )
 
-    final_watertight_path = f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_full_wt.obj"
-    watertightifier = MeshCleanProcess(final_path, final_watertight_path)
+    final_watertight_path = f"{args.out_dir}/{cfg.name}/obj/{sample_name}_{idx}_full_wt.obj"
+    watertightifier = MeshWatertightifier(final_path, final_watertight_path)
     result = watertightifier.process(reconstruction_method='poisson', depth=10)
-
     if result:
         print("The mesh is watertight and has been saved successfully!")
     else:
         print("The mesh is not watertight. Further inspection may be needed.")
-
-    final_mesh = MeshCleanProcess.process_watertight_mesh(
-        final_watertight_path=f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_full_wt.obj",
-        output_path=f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_final.obj",
-        face_vertex_mask=SMPLX_object.front_flame_vertex_mask,
-        target_faces=15000 #desired number of vertices
-    )        
+        
 
 def process_sample_second_pass(data, data_b, args, cfg, device, normal_net, sapiens_normal_net, ifnet, SMPLX_object, dataset, bg_color):
     losses = init_loss()
@@ -955,20 +947,20 @@ def process_sample_second_pass(data, data_b, args, cfg, device, normal_net, sapi
         # )
         # side_mesh.export(f"{args.out_dir}/{cfg.name}/obj/{sample_name}_{idx}_side.obj")
 
-        # if cfg.bni.use_poisson:
-        #     final_mesh = poisson(
-        #         sum(full_lst),
-        #         final_path,
-        #         cfg.bni.poisson_depth,
-        #     )
-        #     print(
-        #         colored(
-        #             f"\n Poisson completion to {Format.start} {final_path} {Format.end}",
-        #             "yellow"
-        #         )
-        #     )
-        # else:
-        final_mesh = sum(full_lst)
+        if cfg.bni.use_poisson:
+            final_mesh = poisson(
+                sum(full_lst),
+                final_path,
+                cfg.bni.poisson_depth,
+            )
+            print(
+                colored(
+                    f"\n Poisson completion to {Format.start} {final_path} {Format.end}",
+                    "yellow"
+                )
+            )
+        else:
+            final_mesh = sum(full_lst)
             # final_mesh.export(final_path)
 
         if not args.novis:
@@ -1017,11 +1009,11 @@ def main():
     dataset_blue = setup_dataset(args, cfg, device,[0,0,255,255])
 
     # Update output directory based on people list and IFNet usage.
-    people = ['Fulden', 'Rafa', 'Jon', 'Jon2', 'Roger', 'Albert', 'Stefan']
+    people = ['Fulden', 'Carla', 'Rafa', 'Jon', 'Jon2', 'Roger', 'Albert', 'Stefan']
     if cfg.bni.use_ifnet:
-        args.out_dir = f'{args.out_dir}/{people[0]}/IFN+_face_thresh_{cfg.bni.face_thres:.2f}'
+        args.out_dir = f'{args.out_dir}/{people[1]}/IFN+_face_thresh_{cfg.bni.face_thres:.2f}'
     else:
-        args.out_dir = f'{args.out_dir}/{people[0]}/face_thresh_{cfg.bni.face_thres:.2f}'
+        args.out_dir = f'{args.out_dir}/{people[1]}/face_thresh_{cfg.bni.face_thres:.2f}'
     os.makedirs(args.out_dir, exist_ok=True)
 
     pbar = tqdm(dataset_red)

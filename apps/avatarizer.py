@@ -33,7 +33,7 @@ device = torch.device(f"cuda:{args.gpu}")
 
 # loading SMPL-X and econ objs inferred with ECON
 # prefix = f"./results_fulden/econ/obj/{args.name}"
-prefix = f"./results/Fulden/IFN+_face_thresh_0.31/econ/obj/{args.name}"
+prefix = f"./results/Carla/IFN+_face_thresh_0.31/econ/obj/{args.name}"
 
 smpl_path = f"{prefix}_smpl_00.npy"
 smplx_param = np.load(smpl_path, allow_pickle=True).item()
@@ -264,8 +264,8 @@ from lib.dataset.mesh_util import export_obj
 # First Pass: Using _cloth_front and _cloth_back_red images
 ##########################################
 
-cloth_front_red_path = f"./results/Fulden/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_front_red.png"
-cloth_back_red_path  = f"./results/Fulden/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_back_red.png"
+cloth_front_red_path = f"./results/Carla/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_front_red.png"
+cloth_back_red_path  = f"./results/Carla/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_back_red.png"
 
 tensor_front_1 = transforms.ToTensor()(Image.open(cloth_front_red_path))[:, :, :512]
 tensor_back_1  = transforms.ToTensor()(Image.open(cloth_back_red_path))[:, :, :512]
@@ -317,8 +317,8 @@ print("First-pass texture map saved as texture_map1.png.")
 # Second Pass: Using _cloth_front_red_blue and _cloth_back_blue images
 ##########################################
 
-cloth_front_path_blue = f"./results/Fulden/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_front_blue.png"
-cloth_back_path_blue  = f"./results/Fulden/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_back_blue.png"
+cloth_front_path_blue = f"./results/Carla/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_front_blue.png"
+cloth_back_path_blue  = f"./results/Carla/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_back_blue.png"
 
 tensor_front_2 = transforms.ToTensor()(Image.open(cloth_front_path_blue))[:, :, :512]
 tensor_back_2  = transforms.ToTensor()(Image.open(cloth_back_path_blue))[:, :, :512]
@@ -351,7 +351,7 @@ print("Second-pass texture map saved as texture_map2.png.")
 
 diff_map = np.abs(texture_map1_8bit.astype(np.float32) - texture_map2_8bit.astype(np.float32)) / 255.0
 # threshold = 0.1
-mask_diff = np.any(diff_map > 0, axis=2)
+mask_diff = np.any(diff_map > 0.01, axis=2)
 Image.fromarray((mask_diff.astype(np.uint8) * 255)).save(f"{cache_path}/diff_mask.png")
 print("Difference mask saved as diff_mask.png.")
 
