@@ -33,7 +33,7 @@ device = torch.device(f"cuda:{args.gpu}")
 
 # loading SMPL-X and econ objs inferred with ECON
 # prefix = f"./results_fulden/econ/obj/{args.name}"
-prefix = f"./results/Carla/IFN+_face_thresh_0.31/econ/obj/{args.name}"
+prefix = f"./results/Eric/IFN+_face_thresh_0.31/econ/obj/{args.name}"
 
 smpl_path = f"{prefix}_smpl_00.npy"
 smplx_param = np.load(smpl_path, allow_pickle=True).item()
@@ -264,8 +264,8 @@ from lib.dataset.mesh_util import export_obj
 # First Pass: Using _cloth_front and _cloth_back_red images
 ##########################################
 
-cloth_front_red_path = f"./results/Carla/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_front_red.png"
-cloth_back_red_path  = f"./results/Carla/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_back_red.png"
+cloth_front_red_path = f"./results/Eric/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_front_red.png"
+cloth_back_red_path  = f"./results/Eric/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_back_red.png"
 
 tensor_front_1 = transforms.ToTensor()(Image.open(cloth_front_red_path))[:, :, :512]
 tensor_back_1  = transforms.ToTensor()(Image.open(cloth_back_red_path))[:, :, :512]
@@ -317,8 +317,8 @@ print("First-pass texture map saved as texture_map1.png.")
 # Second Pass: Using _cloth_front_red_blue and _cloth_back_blue images
 ##########################################
 
-cloth_front_path_blue = f"./results/Carla/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_front_blue.png"
-cloth_back_path_blue  = f"./results/Carla/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_back_blue.png"
+cloth_front_path_blue = f"./results/Eric/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_front_blue.png"
+cloth_back_path_blue  = f"./results/Eric/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_back_blue.png"
 
 tensor_front_2 = transforms.ToTensor()(Image.open(cloth_front_path_blue))[:, :, :512]
 tensor_back_2  = transforms.ToTensor()(Image.open(cloth_back_path_blue))[:, :, :512]
@@ -472,7 +472,7 @@ if args.uv:
     Image.fromarray((result * 255.0).astype(np.uint8)).save(filename)
     print(f"Saved inpainted texture: {filename}")
 
-    print("UV texture generation complete. Compare the saved texture for best results.")
+    print("UV texture generation complete.")
 
     with open(f"{cache_path}/material.mtl", "w") as fp:
         fp.write("newmtl mat0 \n")
@@ -482,7 +482,7 @@ if args.uv:
         fp.write("Tr 1.000000 \n")
         fp.write("illum 1 \n")
         fp.write("Ns 0.000000 \n")
-        fp.write("map_Kd texture_TELEA.png \n")
+        fp.write("map_Kd texture.png \n")
     
     # Export the mesh using the original vertices.
     export_obj(np.array(econ_pose.vertices), f_np, vt, ft, f"{cache_path}/mesh.obj")

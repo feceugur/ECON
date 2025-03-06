@@ -1,8 +1,7 @@
 import pymeshlab
-import trimesh
-import numpy as np
 
-class MeshCleanProcess:
+
+class MeshWatertightifier:
     def __init__(self, input_path, output_path):
         """
         Initialize the MeshWatertightifier class.
@@ -27,6 +26,7 @@ class MeshCleanProcess:
         self.ms. meshing_repair_non_manifold_edges()
         self.ms.meshing_repair_non_manifold_vertices()
         self.ms.meshing_remove_unreferenced_vertices()
+
 
     def fill_holes(self):
         """
@@ -90,52 +90,3 @@ class MeshCleanProcess:
         is_watertight = self.check_watertight()
         self.save_mesh()
         return is_watertight
-
-    def process_watertight_mesh(final_watertight_path, output_path, face_vertex_mask, target_faces=25000):
-        """
-        Processes a watertight mesh by reducing polygon count while preserving the face region.
-
-        Parameters:
-        - final_watertight_path (str): Path to the watertight mesh file.
-        - output_path (str): Path to save the final processed mesh.
-        - face_vertex_mask (np.ndarray): Array of face vertex indices that should remain unchanged.
-        - target_faces (int): Desired number of polygons in the final mesh.
-
-        Returns:
-        - final_mesh (trimesh.Trimesh): Processed and optimized mesh.
-        """
-        # === STEP 1: Reload the watertight mesh ===
-        watertight_trimesh = trimesh.load(final_watertight_path)
-
-        # === STEP 2: Extract the Face Region Again ===
-        face_vids = np.array(face_vertex_mask, dtype=np.int32)
-
-        # Get all vertices and faces
-        vertices = watertight_trimesh.vertices
-        faces = watertight_trimesh.faces
-
-        # Find faces that contain at least one face vertex (to exclude from simplification)
-        face_mask = np.isin(faces, face_vids).any(axis=1)
-
-        # Separate face and body meshes again
-        face_mesh = trimesh.Trimesh(vertices=vertices, faces=faces[face_mask])  # Keep face unchanged
-        body_mesh = trimesh.Trimesh(vertices=vertices, faces=faces[~face_mask])  # Simplify body
-
-        # === STEP 3: Decimate Only the Body Part ===
-        current_body_faces = len(body_mesh.faces)
-        target_reduction = max(0.0, min(1.0, 1 - (target_faces / current_body_faces)))
-
-        if target_reduction > 0.0:
-            simplified_body = body_mesh.simplify_quadric_decimation(target_reduction)
-        else:
-            simplified_body = body_mesh  # No reduction needed
-
-        # === STEP 4: Merge the Unchanged Face and Simplified Body ===
-        final_mesh = trimesh.util.concatenate([face_mesh, simplified_body])
-
-        # Save the final reduced and watertight mesh
-        final_mesh.export(output_path)
-
-        print(f"Final mesh saved with {len(final_mesh.faces)} faces at {output_path}")
-
-        return final_mesh
