@@ -694,11 +694,16 @@ def double_side_bilateral_normal_integration(
     back_mesh = clean_floats(trimesh.Trimesh(vertices_back, faces_back))
 
     result = {
-        "F_verts": torch.as_tensor(front_mesh.vertices).float(), "F_faces": torch.as_tensor(
+        "F_verts": torch.as_tensor(front_mesh.vertices).float(), 
+        "F_faces": torch.as_tensor(
             front_mesh.faces
-        ).long(), "B_verts": torch.as_tensor(back_mesh.vertices).float(), "B_faces":
-        torch.as_tensor(back_mesh.faces).long(), "F_depth":
-        torch.as_tensor(depth_map_front_est).float(), "B_depth":
+        ).long(), 
+        "B_verts": torch.as_tensor(back_mesh.vertices).float(), 
+        "B_faces":
+        torch.as_tensor(back_mesh.faces).long(), 
+        "F_depth":
+        torch.as_tensor(depth_map_front_est).float(), 
+        "B_depth":
         torch.as_tensor(depth_map_back_est).float()
     }
 

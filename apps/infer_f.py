@@ -17,6 +17,8 @@
 import logging
 import warnings
 
+from apps.transform_normals import transform_normals
+
 warnings.filterwarnings("ignore")
 logging.getLogger("lightning").setLevel(logging.ERROR)
 logging.getLogger("trimesh").setLevel(logging.ERROR)
@@ -36,7 +38,7 @@ from tqdm.auto import tqdm
 from apps.IFGeo import IFGeo
 from apps.Normal_f import Normal
 from apps.sapiens import ImageProcessor
-from apps.clean_mesh import MeshCleanProcess, MeshWatertightifier
+from apps.clean_mesh import MeshCleanProcess
 
 from lib.common.BNI import BNI
 from lib.common.BNI_utils import save_normal_tensor
@@ -160,7 +162,7 @@ if __name__ == "__main__":
         os.makedirs(osp.join(args.out_dir, cfg.name, "obj"), exist_ok=True)
 
         in_tensor = {
-            "smpl_faces": data["smpl_faces"], 
+            "smpl_faces": data["smpl_faces"],
             "image": data["img_icon"].to(device), 
             "image_back": data_b["img_icon"].to(device),
             "mask": data["img_mask"].to(device),
@@ -211,6 +213,7 @@ if __name__ == "__main__":
             sapiens_normal_square = torch.cat(sapiens_normal_square_lst)
 
         # remove this line if you change the loop_smpl and obtain different SMPL-X fits
+        
         if osp.exists(smpl_path) and (not cfg.force_smpl_optim):
             smpl_verts_lst = []
             smpl_faces_lst = []
@@ -237,7 +240,7 @@ if __name__ == "__main__":
 
             in_tensor["smpl_verts"] = batch_smpl_verts * torch.tensor([1., -1., 1.]).to(device)
             in_tensor["smpl_faces"] = batch_smpl_faces[:, :, [0, 2, 1]]
-
+        
         else:
             # smpl optimization
             loop_smpl = tqdm(range(args.loop_smpl))
@@ -288,18 +291,43 @@ if __name__ == "__main__":
                     in_tensor["smpl_faces"],
                 )
 
+                img_norm_path_f = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_smpl_front_normal.png")
+                torchvision.utils.save_image((in_tensor['T_normal_F'].detach().cpu()),img_norm_path_f)
+                img_norm_path_b = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_smpl_back_normal.png")
+                torchvision.utils.save_image((in_tensor['T_normal_B'].detach().cpu()),img_norm_path_b)
+
                 T_mask_F, T_mask_B = dataset.render.get_image(type="mask")
 
                 with torch.no_grad():
                     # [1, 3, 512, 512], (-1.0, 1.0)
                     in_tensor["normal_F"], in_tensor["normal_B"] = normal_net.netG(in_tensor)
-                """
-                img_norm_path_f = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_front_normal.png")
-                torchvision.utils.save_image((in_tensor['normal_F'].detach().cpu()),img_norm_path_f)
-                img_norm_path_b = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_back_normal.png")
-                torchvision.utils.save_image((in_tensor['normal_B'].detach().cpu()),img_norm_path_b)"""
 
                 img_crop_path = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_normal_and_mask.png")
+                row1 = torch.cat([data["img_crop"][:, :3], data_b["img_crop"][:, :3]], dim=3)  # Concatenate front and back images
+                row2 = torch.cat([(in_tensor['normal_F'].detach().cpu() + 1.0) * 0.5, 
+                                (in_tensor['normal_B'].detach().cpu() + 1.0) * 0.5], dim=3)  # Concatenate normal front and back
+                row3 = torch.cat([in_tensor["mask"].unsqueeze(1).repeat(1, 3, 1, 1).detach().cpu(),
+                                in_tensor["mask_back"].unsqueeze(1).repeat(1, 3, 1, 1).detach().cpu()], dim=3)  # Concatenate mask and mask_back
+                # Now stack the rows vertically (along dim=2)
+                final_tensor = torch.cat([row1, row2, row3], dim=2)
+
+                # Save the final vertically stacked image
+                torchvision.utils.save_image(final_tensor, img_crop_path)
+                
+                # Convert T_back to a tensor and extract rotation matrix
+                T_back_tensor = torch.tensor([
+                    [-1.00000000e+00, -3.22578062e-08,  1.23496643e-07, -6.84291201e-08],
+                    [ 3.22577886e-08, -1.00000000e+00, -1.42392824e-07,  6.84291228e-08],
+                    [ 1.23496647e-07, -1.42392820e-07,  1.00000000e+00, -4.00848333e-08],
+                    [ 0.00000000e+00,  0.00000000e+00,  0.00000000e+00,  1.00000000e+00]
+                ], dtype=torch.float32)
+
+                R_back_tensor = T_back_tensor[:3, :3]  # Extract 3x3 rotation matrix
+
+                # Apply the transformation
+                in_tensor["normal_B"] = transform_normals(in_tensor["normal_B"], R_back_tensor)
+                
+                img_crop_path = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_after_transform.png")
                 row1 = torch.cat([data["img_crop"][:, :3], data_b["img_crop"][:, :3]], dim=3)  # Concatenate front and back images
                 row2 = torch.cat([(in_tensor['normal_F'].detach().cpu() + 1.0) * 0.5, 
                                 (in_tensor['normal_B'].detach().cpu() + 1.0) * 0.5], dim=3)  # Concatenate normal front and back
@@ -311,6 +339,7 @@ if __name__ == "__main__":
 
                 # Save the final vertically stacked image
                 torchvision.utils.save_image(final_tensor, img_crop_path)
+                
 
                 # only replace the front cloth normals, and the back cloth normals will get improved accordingly
                 # as the back cloth normals are conditioned on the body cloth normals

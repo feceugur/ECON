@@ -81,14 +81,20 @@ class NormalNet_f(BasePIFuNet):
 
         # Use back image for calculating back normals
         for name in self.in_nmlB:
+            """
             if name == "image_back":
-                inB_list.append(in_tensor["image_back"])  
+                inB_list.append(in_tensor["image_back"])
+            elif name == "T_normal_B"  :
+                inB_list.append(in_tensor["T_normal_B"])
             else:
                 inB_list.append(in_tensor[name])  # For shared inputs 
+            """
+            inB_list.append(in_tensor[name])
 
         # Concatenate inputs along the channel dimension
         nmlF = self.netF(torch.cat(inF_list, dim=1))  # Forward network
-        nmlB = self.netB(torch.cat(inB_list, dim=1))  # Backward network
+        #nmlB = self.netB(torch.cat(inB_list, dim=1))  # Backward network
+        nmlB = self.netF(torch.cat(inB_list, dim=1))
 
         # Normalize normals to ensure ||normal|| == 1
         nmlF_normalized = nmlF / torch.norm(nmlF, dim=1, keepdim=True)
@@ -200,8 +206,8 @@ class NormalNet_f(BasePIFuNet):
         back_mask_img = Image.fromarray(back_mask_np, mode='L')
 
         # Save images
-        mask_img.save("./results_rafa/mask_image.png")
-        back_mask_img.save("./results_rafa/back_mask_image.png")
+        mask_img.save("./results_fulden/mask_image.png")
+        back_mask_img.save("./results_fulden/back_mask_image.png")
 
     def save_nml_image(self, nmlF_normalized, nmlB_normalized):
         # Normalize to [0, 1] range for image representation
@@ -221,5 +227,5 @@ class NormalNet_f(BasePIFuNet):
         nmlB_img = Image.fromarray(nmlB_np, mode='RGB')
 
         # Save images
-        nmlF_img.save("./results_rafa/nmlF_image.png")
-        nmlB_img.save("./results_rafa/nmlB_image.png")
+        nmlF_img.save("./results_fulden/nmlF_image.png")
+        nmlB_img.save("./results_fulden/nmlB_image.png")

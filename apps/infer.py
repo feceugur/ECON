@@ -744,5 +744,5 @@ if __name__ == "__main__":
             final_watertight_path=f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_full_wt.obj",
             output_path=f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_final.obj",
             face_vertex_mask=SMPLX_object.front_flame_vertex_mask,
-            target_faces=25000
-)
+            target_faces=15000
+        )

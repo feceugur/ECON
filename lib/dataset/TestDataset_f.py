@@ -15,6 +15,7 @@
 # Contact: ps-license@tuebingen.mpg.de
 
 import logging
+import os
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -48,8 +49,13 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 class TestDataset:
     def __init__(self, cfg, device):
-        self.image_dir = cfg["image_dir"]
-        self.image_b_dir = cfg["image_b_dir"]
+        if "image_dir" in cfg and "image_b_dir" in cfg:
+            self.image_dir = cfg["image_dir"]
+            self.image_b_dir = cfg["image_b_dir"]
+        else:
+            self.image_dir = cfg["front_image_dir"]
+            self.image_b_dir = cfg["back_image_dir"]
+
         self.seg_dir = cfg["seg_dir"]
         self.use_seg = cfg["use_seg"]
         self.hps_type = cfg["hps_type"]
@@ -243,13 +249,11 @@ class TestDataset:
 
 
     def render_normal(self, verts, faces):
-
         # render optimized mesh (normal, T_normal, image [-1,1])
         self.render.load_meshes(verts, faces)
         return self.render.get_image(type="rgb")
 
     def render_depth(self, verts, faces):
-
         # render optimized mesh (normal, T_normal, image [-1,1])
         self.render.load_meshes(verts, faces)
         return self.render.get_image(type="depth")
