@@ -1,6 +1,9 @@
 import argparse
 import os
-import os.path as osp
+import os.path as osp    
+import cv2
+import re
+import subprocess, glob
 
 import numpy as np
 import torch
@@ -33,7 +36,7 @@ device = torch.device(f"cuda:{args.gpu}")
 
 # loading SMPL-X and econ objs inferred with ECON
 # prefix = f"./results_fulden/econ/obj/{args.name}"
-prefix = f"./results/Eric/IFN+_face_thresh_0.31/econ/obj/{args.name}"
+prefix = f"./results/Carla/IFN+_face_thresh_0.30/econ/obj/{args.name}"
 
 smpl_path = f"{prefix}_smpl_00.npy"
 smplx_param = np.load(smpl_path, allow_pickle=True).item()
@@ -264,8 +267,8 @@ from lib.dataset.mesh_util import export_obj
 # First Pass: Using _cloth_front and _cloth_back_red images
 ##########################################
 
-cloth_front_red_path = f"./results/Eric/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_front_red.png"
-cloth_back_red_path  = f"./results/Eric/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_back_red.png"
+cloth_front_red_path = f"./results/Carla/IFN+_face_thresh_0.30/econ/png/{args.name}_cloth_front_red.png"
+cloth_back_red_path  = f"./results/Carla/IFN+_face_thresh_0.30/econ/png/{args.name}_cloth_back_red.png"
 
 tensor_front_1 = transforms.ToTensor()(Image.open(cloth_front_red_path))[:, :, :512]
 tensor_back_1  = transforms.ToTensor()(Image.open(cloth_back_red_path))[:, :, :512]
@@ -310,15 +313,16 @@ texture_map1 = uv_rasterizer.get_texture(
     torch.tensor(final_rgb_pass1).unsqueeze(0).float() / 255.0,
 )
 texture_map1_8bit = (texture_map1 * 255.0).astype(np.uint8)
-Image.fromarray(texture_map1_8bit).save(f"{cache_path}/texture_map1.png")
-print("First-pass texture map saved as texture_map1.png.")
+os.makedirs(f"{cache_path}/red", exist_ok=True)
+Image.fromarray(texture_map1_8bit).save(f"{cache_path}/red/texture_red.png")
+print("First-pass texture map saved as texture_red.png.")
 
 ##########################################
 # Second Pass: Using _cloth_front_red_blue and _cloth_back_blue images
 ##########################################
 
-cloth_front_path_blue = f"./results/Eric/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_front_blue.png"
-cloth_back_path_blue  = f"./results/Eric/IFN+_face_thresh_0.31/econ/png/{args.name}_cloth_back_blue.png"
+cloth_front_path_blue = f"./results/Carla/IFN+_face_thresh_0.30/econ/png/{args.name}_cloth_front_blue.png"
+cloth_back_path_blue  = f"./results/Carla/IFN+_face_thresh_0.30/econ/png/{args.name}_cloth_back_blue.png"
 
 tensor_front_2 = transforms.ToTensor()(Image.open(cloth_front_path_blue))[:, :, :512]
 tensor_back_2  = transforms.ToTensor()(Image.open(cloth_back_path_blue))[:, :, :512]
@@ -342,18 +346,19 @@ texture_map2 = uv_rasterizer.get_texture(
     torch.tensor(final_rgb_pass2).unsqueeze(0).float() / 255.0,
 )
 texture_map2_8bit = (texture_map2 * 255.0).astype(np.uint8)
-Image.fromarray(texture_map2_8bit).save(f"{cache_path}/texture_map2.png")
-print("Second-pass texture map saved as texture_map2.png.")
+os.makedirs(f"{cache_path}/blue", exist_ok=True)
+Image.fromarray(texture_map2_8bit).save(f"{cache_path}/blue/texture_blue.png")
+print("Second-pass texture map saved as texture_blue.png.")
 
 ##########################################
 # Compare Texture Maps and Create Difference Mask
 ##########################################
 
-diff_map = np.abs(texture_map1_8bit.astype(np.float32) - texture_map2_8bit.astype(np.float32)) / 255.0
-# threshold = 0.1
-mask_diff = np.any(diff_map > 0.01, axis=2)
-Image.fromarray((mask_diff.astype(np.uint8) * 255)).save(f"{cache_path}/diff_mask.png")
-print("Difference mask saved as diff_mask.png.")
+# diff_map = np.abs(texture_map1_8bit.astype(np.float32) - texture_map2_8bit.astype(np.float32)) / 255.0
+# # threshold = 0.1
+# mask_diff = np.any(diff_map > 0.01, axis=2)
+# Image.fromarray((mask_diff.astype(np.uint8) * 255)).save(f"{cache_path}/diff_mask.png")
+# print("Difference mask saved as diff_mask.png.")
 
 ##########################################
 # Assign Final Vertex Colors and Export Mesh
@@ -407,7 +412,6 @@ print(
 
 args.uv = True
 args.dress = False
-
 if args.uv:
     print("Start UV texture generation...")
     v_np = econ_pose.vertices
@@ -443,38 +447,16 @@ if args.uv:
         torch.tensor(f_np).unsqueeze(0).long(),
         torch.tensor(final_rgb).unsqueeze(0).float() / 255.0,
     )
-    
-    import cv2
-    # Create a mask for missing (zero-sum) pixels.
-    missing_mask = (texture_npy.sum(axis=2) == 0).astype(np.uint8) * 255
-
-    # Resize the diff mask from 512x512 to the texture resolution.
-    diff_mask_resized = cv2.resize((mask_diff.astype(np.uint8) * 255),
-                                   (texture_npy.shape[1], texture_npy.shape[0]),
-                                   interpolation=cv2.INTER_NEAREST)
-
-    # Combine the missing mask with the diff mask.
-    combined_mask = cv2.bitwise_or(missing_mask, diff_mask_resized)
-    
-    # Instead of erosion, we now dilate the mask.
-    kernel = np.ones((7, 7), np.uint8)  # 7x7 kernel
-    dilated_mask = cv2.dilate(combined_mask, kernel, iterations=2)
-    # Save the dilated mask for reference.
-    cv2.imwrite(f"{cache_path}/mask_dilated.png", dilated_mask)
-    
-    # Convert texture_npy to an 8-bit image.
-    texture_8bit = (texture_npy * 255).astype(np.uint8)
-    
-    # Inpaint the texture using the dilated mask, inpaintRadius=3, and TELEA method.
-    inpainted_image = cv2.inpaint(texture_8bit, dilated_mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
-    result = inpainted_image.astype(np.float32) / 255.0
-    filename = f"{cache_path}/texture_TELEA.png"
-    Image.fromarray((result * 255.0).astype(np.uint8)).save(filename)
-    print(f"Saved inpainted texture: {filename}")
-
     print("UV texture generation complete.")
 
-    with open(f"{cache_path}/material.mtl", "w") as fp:
+    # Export meshes and temporary MTL files.
+    red_dir = osp.join(cache_path, "red")
+    blue_dir = osp.join(cache_path, "blue")
+    os.makedirs(red_dir, exist_ok=True)
+    os.makedirs(blue_dir, exist_ok=True)
+
+    export_obj(np.array(econ_pose.vertices), f_np, vt, ft, osp.join(red_dir, "mesh_red.obj"))
+    with open(osp.join(red_dir, "material.mtl"), "w") as fp:
         fp.write("newmtl mat0 \n")
         fp.write("Ka 1.000000 1.000000 1.000000 \n")
         fp.write("Kd 1.000000 1.000000 1.000000 \n")
@@ -482,7 +464,159 @@ if args.uv:
         fp.write("Tr 1.000000 \n")
         fp.write("illum 1 \n")
         fp.write("Ns 0.000000 \n")
-        fp.write("map_Kd texture.png \n")
+        fp.write("map_Kd texture_red.png \n")
+
+    export_obj(np.array(econ_pose.vertices), f_np, vt, ft, osp.join(blue_dir, "mesh_blue.obj"))
+    with open(osp.join(blue_dir, "material.mtl"), "w") as fp:
+        fp.write("newmtl mat0 \n")
+        fp.write("Ka 1.000000 1.000000 1.000000 \n")
+        fp.write("Kd 1.000000 1.000000 1.000000 \n")
+        fp.write("Ks 0.000000 0.000000 0.000000 \n")
+        fp.write("Tr 1.000000 \n")
+        fp.write("illum 1 \n")
+        fp.write("Ns 0.000000 \n")
+        fp.write("map_Kd texture_blue.png \n")
     
-    # Export the mesh using the original vertices.
-    export_obj(np.array(econ_pose.vertices), f_np, vt, ft, f"{cache_path}/mesh.obj")
+    # Create a folder for intermediate defrag outputs.
+    defrag_path = osp.join(cache_path, "defrag_assets")
+    os.makedirs(defrag_path, exist_ok=True)
+    
+    # Create a separate folder for final outputs.
+    final_dir = osp.join(cache_path, "final_files")
+    os.makedirs(final_dir, exist_ok=True)
+
+    # Run texture-defrag on both meshes.
+    texture_defrag_exe = os.path.abspath("./texture-defrag/build/texture-defrag")
+    mesh_file_red = os.path.abspath(osp.join(red_dir, "mesh_red.obj"))
+    output_file_red = os.path.abspath(osp.join(defrag_path, "defrag_red.obj"))
+    cmd_red = ["xvfb-run", "-a", texture_defrag_exe, mesh_file_red, "-l", "0", "-o", output_file_red, "-m", "3", "-b", "0.3"]
+    print("Running texture-defrag for red mesh:", " ".join(cmd_red))
+    subprocess.run(cmd_red, check=True)
+
+    mesh_file_blue = os.path.abspath(osp.join(blue_dir, "mesh_blue.obj"))
+    output_file_blue = os.path.abspath(osp.join(defrag_path, "defrag_blue.obj"))
+    cmd_blue = ["xvfb-run", "-a", texture_defrag_exe, mesh_file_blue, "-l", "0", "-o", output_file_blue, "-m", "3", "-b", "0.3"]
+    print("Running texture-defrag for blue mesh:", " ".join(cmd_blue))
+    subprocess.run(cmd_blue, check=True)
+
+    # Process texture pairs in the defrag_assets folder.
+    red_pattern = re.compile(r"defrag_red_texture_(.+)\.png")
+    blue_pattern = re.compile(r"defrag_blue_texture_(.+)\.png")
+    red_images = {}
+    blue_images = {}
+
+    for file in os.listdir(defrag_path):
+        if "defrag" in file and file.endswith(".png"):
+            match_red = red_pattern.search(file)
+            if match_red:
+                img_id = match_red.group(1)
+                red_images[img_id] = osp.join(defrag_path, file)
+            match_blue = blue_pattern.search(file)
+            if match_blue:
+                img_id = match_blue.group(1)
+                blue_images[img_id] = osp.join(defrag_path, file)
+
+    # For each matching texture pair, compute and save a difference mask,
+    # then run the inpainting process and save a final texture per ID in final_dir.
+    for img_id in red_images:
+        if img_id in blue_images:
+            red_path = red_images[img_id]
+            blue_path = blue_images[img_id]
+            print(f"Processing textures for ID: {img_id}")
+            
+            red_img = np.array(Image.open(red_path).convert("RGB"), dtype=np.float32)
+            blue_img = np.array(Image.open(blue_path).convert("RGB"), dtype=np.float32)
+            
+            diff = np.abs(red_img - blue_img)
+            diff_sum = np.sum(diff, axis=2)
+            diff_mask = (diff_sum > 0.01).astype(np.uint8) * 255
+            missing_mask = ((red_img.sum(axis=2) == 0) | (blue_img.sum(axis=2) == 0)).astype(np.uint8) * 255
+            final_mask = np.maximum(diff_mask, missing_mask)
+            
+            output_mask_path = osp.join(defrag_path, f"difference_mask_{img_id}.png")
+            Image.fromarray(final_mask).save(output_mask_path)
+            print(f"Saved difference mask for ID {img_id} at {output_mask_path}")
+            
+            # Inpainting process:
+            texture_8bit = red_img.astype(np.uint8)
+            small_kernel = np.ones((5, 5), np.uint8)
+            eroded_mask = cv2.erode(final_mask, small_kernel, iterations=1)
+            dilation_kernel = np.ones((50, 50), np.uint8)
+            dilated_mask = cv2.dilate(eroded_mask, dilation_kernel, iterations=2)
+            
+            diffmask_dilated_path = osp.join(defrag_path, f"diffmask_dilated_{img_id}.png")
+            cv2.imwrite(diffmask_dilated_path, dilated_mask)
+            print("Saved dilated difference mask at:", diffmask_dilated_path)
+            
+            if dilated_mask.shape != texture_8bit.shape[:2]:
+                dilated_mask = cv2.resize(dilated_mask, (texture_8bit.shape[1], texture_8bit.shape[0]), interpolation=cv2.INTER_NEAREST)
+                
+            # Use the dilated mask for inpainting.
+            inpainted_texture = cv2.inpaint(texture_8bit, dilated_mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+            inpainted_texture = cv2.cvtColor(inpainted_texture, cv2.COLOR_RGB2BGR)
+            final_texture_filename = f"texture_map_inpainted_{img_id}.png"
+            final_texture_path = osp.join(final_dir, final_texture_filename)
+            cv2.imwrite(final_texture_path, inpainted_texture)
+            print("Saved inpainted texture at:", final_texture_path)
+
+    texture_pattern = osp.join(final_dir, "texture_map_inpainted*.png")
+    texture_paths = sorted(glob.glob(texture_pattern))
+    print("Found final texture files:", texture_paths)
+
+    # === 2. Read the defrag_blue OBJ's MTL file to extract material names ===
+    # Read the MTL from the defrag_assets folder since defrag_blue.obj.mtl is output there.
+    defrag_blue_mtl_path = os.path.abspath(osp.join(defrag_path, "defrag_blue.obj.mtl"))
+    with open(defrag_blue_mtl_path, "r") as f:
+        mtl_lines = f.readlines()
+
+    material_names = []
+    for line in mtl_lines:
+        if line.startswith("newmtl"):
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                material_names.append(parts[1])
+    # Remove duplicates while preserving order.
+    seen = set()
+    material_names = [x for x in material_names if x not in seen and not seen.add(x)]
+    print("Extracted material names from defrag_blue MTL:", material_names)
+
+    # === 3. Create the final MTL file with a material for each texture ===
+    # Textures are assigned to materials in a round-robin manner.
+    final_mtl_path = osp.join(final_dir, "final_material.mtl")
+    with open(final_mtl_path, "w") as fp:
+        for i, mat_name in enumerate(material_names):
+            if texture_paths:
+                tex_file = os.path.basename(texture_paths[i % len(texture_paths)])
+            else:
+                tex_file = "default_texture.png"
+            fp.write(f"newmtl {mat_name}\n")
+            fp.write("Ka 1.000000 1.000000 1.000000\n")
+            fp.write("Kd 1.000000 1.000000 1.000000\n")
+            fp.write("Ks 0.000000 0.000000 0.000000\n")
+            fp.write("Tr 1.000000\n")
+            fp.write("illum 1\n")
+            fp.write("Ns 0.000000\n")
+            fp.write(f"map_Kd {tex_file}\n\n")
+    print("Final material file saved at:", final_mtl_path)
+
+    # === 4. Update the OBJ file to reference the new MTL file and save it in final_dir ===
+    final_obj_path = osp.join(final_dir, "final_model.obj")
+    new_obj_lines = []
+    mtllib_updated = False
+    # Use the blue defrag OBJ as the base.
+    with open(output_file_blue, "r") as f:
+        obj_lines = f.readlines()
+
+    for line in obj_lines:
+        if line.startswith("mtllib"):
+            new_obj_lines.append("mtllib final_material.mtl")
+            mtllib_updated = True
+        else:
+            new_obj_lines.append(line.rstrip())
+    if not mtllib_updated:
+        new_obj_lines.insert(0, "mtllib final_material.mtl")
+
+    final_obj_contents = "\n".join(new_obj_lines)
+    with open(final_obj_path, "w") as f:
+        f.write(final_obj_contents)
+    print("Final OBJ file saved at:", final_obj_path)

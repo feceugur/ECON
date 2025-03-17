@@ -24,7 +24,7 @@ class MeshCleanProcess:
         """Cleans the mesh by removing duplicate vertices, faces, and merging close vertices."""
         self.ms.meshing_remove_duplicate_faces()
         self.ms.meshing_remove_duplicate_vertices()
-        self.ms. meshing_repair_non_manifold_edges()
+        self.ms.meshing_repair_non_manifold_edges()
         self.ms.meshing_repair_non_manifold_vertices()
         self.ms.meshing_remove_unreferenced_vertices()
 

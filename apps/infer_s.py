@@ -577,7 +577,7 @@ def process_sample(data, data_b, args, cfg, device, normal_net, sapiens_normal_n
             final_watertight_path=f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_full_wt.obj",
             output_path=f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_final.obj",
             face_vertex_mask=SMPLX_object.front_flame_vertex_mask,
-            target_faces=15000 #desired number of vertices
+            target_faces=15000
         )        
 
 def process_sample_second_pass(data, data_b, args, cfg, device, normal_net, sapiens_normal_net, ifnet, SMPLX_object, dataset, bg_color):
@@ -1019,9 +1019,9 @@ def main():
     # Update output directory based on people list and IFNet usage.
     people = ['Fulden', 'Carla', 'Eric','Rafa', 'Jon', 'Jon2', 'Roger', 'Albert', 'Stefan']
     if cfg.bni.use_ifnet:
-        args.out_dir = f'{args.out_dir}/{people[2]}/IFN+_face_thresh_{cfg.bni.face_thres:.2f}'
+        args.out_dir = f'{args.out_dir}/{people[1]}/IFN+_face_thresh_{cfg.bni.face_thres:.2f}'
     else:
-        args.out_dir = f'{args.out_dir}/{people[2]}/face_thresh_{cfg.bni.face_thres:.2f}'
+        args.out_dir = f'{args.out_dir}/{people[1]}/face_thresh_{cfg.bni.face_thres:.2f}'
     os.makedirs(args.out_dir, exist_ok=True)
 
     pbar = tqdm(dataset_red)

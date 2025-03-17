@@ -23,3 +23,5 @@ gradio_cached_examples/
 *.blend1
 examples/junxuan
 rafa_tests_deleteme/*
+xatlas-python/*
+rafa_tests_delete/*
