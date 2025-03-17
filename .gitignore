@@ -22,6 +22,6 @@ gradio_cached_examples/
 *.blend
 *.blend1
 examples/junxuan
-rafa_tests_deleteme/*
-xatlas-python/*
+xatlas-python/
 rafa_tests_delete/*
+texture-defrag/
