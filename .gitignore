@@ -23,5 +23,5 @@ gradio_cached_examples/
 *.blend1
 examples/junxuan
 xatlas-python/
-rafa_tests_delete/*
+rafa_tests_delete/
 texture-defrag/
