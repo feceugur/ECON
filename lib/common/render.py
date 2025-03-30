@@ -302,7 +302,7 @@ class Render:
             if type == "depth":
                 fragments = self.meshRas(current_mesh.extend(len(self.cam_pos[cam_type])))
                 images = fragments.zbuf[..., 0]
-
+                
             elif type == "rgb":
                 images = self.renderer(current_mesh.extend(len(self.cam_pos[cam_type])))
                 images = (images[:, :, :, :3].permute(0, 3, 1, 2) - 0.5) * 2.0

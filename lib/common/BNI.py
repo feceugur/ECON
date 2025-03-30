@@ -1,6 +1,9 @@
 import torch
 import trimesh
+import cv2
+import os
 
+from lib.common.bni_numpy import bilateral_normal_integration
 from lib.common.BNI_utils import (
     depth_inverse_transform,
     double_side_bilateral_normal_integration,
@@ -44,7 +47,7 @@ class BNI:
     # paper: Bilateral Normal Integration
 
     def extract_surface(self, verbose=True):
-
+        
         bni_result = double_side_bilateral_normal_integration(
             normal_front=self.normal_front,
             normal_back=self.normal_back,
@@ -59,6 +62,62 @@ class BNI:
             lambda_boundary_consistency=self.boundary_consist,
             cut_intersection=self.cut_intersection,
         )
+        
+
+        """
+        # Front estimation
+        depth_front_est, front_surface, wu_map_front, wv_map_front, energy_list_front = bilateral_normal_integration(
+            normal_map=self.normal_front,
+            normal_mask=self.mask,
+            k=2,  # or other value you prefer
+            depth_map=self.depth_front,  # optional, if you have it
+            depth_mask=self.depth_mask,  # optional, if you have it
+            lambda1=1e-4,  # or other value depending on your need
+            K=None,
+            step_size=1,
+            max_iter=150
+        )
+
+        # Back estimation
+        depth_back_est, back_surface, wu_map_back, wv_map_back, energy_list_back = bilateral_normal_integration(
+            normal_map=self.normal_back,
+            normal_mask=self.mask,
+            k=2,
+            depth_map=self.depth_back,  # optional
+            depth_mask=self.depth_mask,  # optional
+            lambda1=1e-4,  # typically stronger if you have a good prior for back
+            K=None,
+            step_size=1,
+            max_iter=150
+        )
+
+        bni_result = {
+            "F_verts": torch.as_tensor(front_surface.points).float(), 
+            "F_faces": torch.as_tensor(front_surface.faces.reshape(-1, 5)[:, 1:]).long(), 
+            "B_verts": torch.as_tensor(back_surface.points).float(), 
+            "B_faces": torch.as_tensor(back_surface.faces.reshape(-1, 5)[:, 1:]).long(), 
+            "F_depth": torch.as_tensor(depth_front_est).float(), 
+            "B_depth": torch.as_tensor(depth_back_est).float()
+        }
+
+        def save_mesh_as_obj(vertices, faces, save_path):
+            mesh = trimesh.Trimesh(vertices, faces)
+            mesh.export(save_path)
+            print(f"Saved mesh to {save_path}")
+
+        # Get numpy arrays from result tensors
+        F_verts_np = bni_result["F_verts"].cpu().numpy()
+        F_faces_np = bni_result["F_faces"].cpu().numpy()
+        B_verts_np = bni_result["B_verts"].cpu().numpy()
+        B_faces_np = bni_result["B_faces"].cpu().numpy()
+
+        # Save paths
+        save_dir = "./results_thuman/infer_two/carla/obj"
+        os.makedirs(save_dir, exist_ok=True)
+
+        save_mesh_as_obj(F_verts_np, F_faces_np, os.path.join(save_dir, "front_mesh.obj"))
+        save_mesh_as_obj(B_verts_np, B_faces_np, os.path.join(save_dir, "back_mesh.obj"))
+        """
 
         F_verts = verts_inverse_transform(bni_result["F_verts"], self.scale)
         B_verts = verts_inverse_transform(bni_result["B_verts"], self.scale)
@@ -75,14 +134,19 @@ class BNI:
             F_B_verts.float(), F_B_faces.long(), process=False, maintain_order=True
         )
 
-        # self.F_trimesh = trimesh.Trimesh(
-        #     F_verts.float(), bni_result["F_faces"].long(), process=False, maintain_order=True
-        # )
+        self.F_trimesh = trimesh.Trimesh(
+            F_verts.float(), bni_result["F_faces"].long(), process=False, maintain_order=True
+        )
 
-        # self.B_trimesh = trimesh.Trimesh(
-        #     B_verts.float(), bni_result["B_faces"].long(), process=False, maintain_order=True
-        # )
+        self.B_trimesh = trimesh.Trimesh(
+            B_verts.float(), bni_result["B_faces"].long(), process=False, maintain_order=True
+        )
 
+        # Save front mesh
+        self.F_trimesh.export("front_mesh.obj")
+
+        # Save back mesh
+        self.B_trimesh.export("back_mesh.obj")
 
 if __name__ == "__main__":
 

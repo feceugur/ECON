@@ -275,12 +275,34 @@ if __name__ == "__main__":
 
             optimizer_smpl_f.zero_grad()
 
+            # ---------------------------------------------------------------
+            # Derive back SMPL by rotating the front SMPL 
+            # ---------------------------------------------------------------
+
+            T_back_tensor = torch.tensor([
+                [-1.00000000e+00, -3.22578062e-08,  1.23496643e-07, -6.84291201e-08],
+                [ 3.22577886e-08, -1.00000000e+00, -1.42392824e-07,  6.84291228e-08],
+                [ 1.23496647e-07, -1.42392820e-07,  1.00000000e+00, -4.00848333e-08],
+                [ 0.00000000e+00,  0.00000000e+00,  0.00000000e+00,  1.00000000e+00]
+            ], dtype=torch.float32).to(device)
+            
+            R_back_tensor = T_back_tensor[:3, :3]  # Extract 3x3 rotation matrix
+
+            R_back = torch.tensor([
+                [-1.0,  0.0,  0.0],  # Keep X negative
+                [ 0.0,  1.0,  0.0],  # Keep Y unchanged
+                [ 0.0,  0.0, -1.0],  # Flip Z
+            ], dtype=torch.float32).to(device)
+
             N_body_f, N_pose_f = optimed_pose_f.shape[:2]
+            N_body_b, N_pose_b = optimed_pose_b.shape[:2]
 
             # 6d_rot to rot_mat for front
             optimed_orient_mat_f = rot6d_to_rotmat(optimed_orient_f.view(-1, 6)).view(N_body_f, 1, 3, 3)
             optimed_pose_mat_f = rot6d_to_rotmat(optimed_pose_f.view(-1, 6)).view(N_body_f, N_pose_f, 3, 3)
-
+           
+            optimed_orient_mat_b = rot6d_to_rotmat(optimed_orient_b.view(-1, 6)).view(N_body_b, 1, 3, 3)
+            optimed_pose_mat_b = rot6d_to_rotmat(optimed_pose_b.view(-1, 6)).view(N_body_b, N_pose_b, 3, 3)
             # ---------------------------
             # Compute front SMPL outputs
             # ---------------------------
@@ -294,29 +316,30 @@ if __name__ == "__main__":
                 right_hand_pose=tensor2variable(data["right_hand_pose"], device),
             )
 
+            # ---------------------------
+            # Compute back SMPL outputs
+            # ---------------------------
+            smpl_verts_b, smpl_landmarks_b, smpl_joints_b = dataset.smpl_model(
+                shape_params=optimed_betas_b,
+                expression_params=tensor2variable(data2["exp"], device),
+                body_pose=optimed_pose_mat_b,
+                global_pose=optimed_orient_mat_b,
+                jaw_pose=tensor2variable(data2["jaw_pose"], device),
+                left_hand_pose=tensor2variable(data2["left_hand_pose"], device),
+                right_hand_pose=tensor2variable(data2["right_hand_pose"], device),
+            )
+
             # Apply translation and scaling for front
             smpl_verts_f = (smpl_verts_f + optimed_trans_f) * data["scale"]
             smpl_joints_f = (smpl_joints_f + optimed_trans_f) * data["scale"] * torch.tensor([1.0, 1.0, -1.0]).to(device)
+            """
+            # Apply translation and scaling for back
+            smpl_verts_b = (smpl_verts_b + optimed_trans_b) * data["scale"]
+            smpl_joints_b = (smpl_joints_b + optimed_trans_b) * data["scale"] * torch.tensor([1.0, 1.0, -1.0]).to(device)
+            """
+            smpl_verts_b = (torch.matmul(smpl_verts_f, R_back) + optimed_trans_b) * data2["scale"]
+            smpl_joints_b = (torch.matmul(smpl_joints_f, R_back) + optimed_trans_b) * data2["scale"] * torch.tensor([1.0, 1.0, -1.0]).to(device)
 
-            # ---------------------------------------------------------------
-            # Derive back SMPL by rotating the front SMPL 180° about Y-axis
-            # ---------------------------------------------------------------
-            # Define a 180 degree rotation matrix (about Y-axis)
-
-            T_back_tensor = torch.tensor([
-                [-1.00000000e+00, -3.22578062e-08,  1.23496643e-07, -6.84291201e-08],
-                [ 3.22577886e-08, -1.00000000e+00, -1.42392824e-07,  6.84291228e-08],
-                [ 1.23496647e-07, -1.42392820e-07,  1.00000000e+00, -4.00848333e-08],
-                [ 0.00000000e+00,  0.00000000e+00,  0.00000000e+00,  1.00000000e+00]
-            ], dtype=torch.float32).to(device)
-            
-            R_back_tensor = T_back_tensor[:3, :3]  # Extract 3x3 rotation matrix
-            
-            # Use the extracted rotation matrix to transform the front SMPL outputs.
-            # Note: We still add the back-specific translation and scale.
-            smpl_verts_b = (torch.matmul(smpl_verts_f, R_back_tensor.T) + optimed_trans_b) * data["scale"]
-            smpl_joints_b = (torch.matmul(smpl_joints_f, R_back_tensor.T) + optimed_trans_b) * data["scale"] * torch.tensor([1.0, 1.0, -1.0]).to(device)
-            
             # ----------------------
             # Process landmarks and joints
             # ----------------------
@@ -373,6 +396,27 @@ if __name__ == "__main__":
             save_obj(smpl_path_b,
                     smpl_verts_b[0].detach().cpu().numpy(),
                     in_tensor_b["smpl_faces"].detach().cpu().numpy())
+            
+
+            face_vids = SMPLX_object.smplx_front_flame_vid
+            face_verts = smpl_verts_f[:, face_vids, :]  # shape: [batch_size, face_vids, 3]
+            with torch.no_grad():
+                rig_data_json = {
+                    'expression_params': data["exp"].detach().cpu().numpy().tolist(),  
+                    'jaw_pose': data["jaw_pose"].detach().cpu().numpy().tolist(),  
+                    'face_vertex_ids': face_vids.tolist(),
+                    'face_verts': face_verts[0].detach().cpu().numpy().tolist(),
+                }
+
+                out_dir_rig = osp.join(args.out_dir, cfg.name, "rig_params_json")
+                os.makedirs(out_dir_rig, exist_ok=True)
+
+                json_path = f"{out_dir_rig}/{data['name']}_face_rig.json"
+
+                with open(json_path, 'w') as f:
+                    json.dump(rig_data_json, f, indent=4)  # indent=4 for pretty-printing
+
+
 
             with torch.no_grad():
                 # [1, 3, 512, 512], (-1.0, 1.0)
@@ -383,6 +427,7 @@ if __name__ == "__main__":
                 in_tensor_b["normal_F"], in_tensor_b["normal_B"] = normal_net.netG(in_tensor_b)
 
             # Apply the transformation
+            R_back_tensor = T_back_tensor[:3, :3] 
             in_tensor_b["normal_F"] = transform_normals(in_tensor_b["normal_F"], R_back_tensor)
             
             ##########################################################
@@ -589,6 +634,29 @@ if __name__ == "__main__":
             hand_mesh = smpl_obj_lst[idx].copy()
             smplx_mesh = smpl_obj_lst[idx].copy()
 
+            """
+            img_norm_path_f = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_front_normal.png")
+            torchvision.utils.save_image((in_tensor_f['normal_F'].detach().cpu()),img_norm_path_f)
+            img_norm_path_b = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_back_normal.png")
+            torchvision.utils.save_image((in_tensor_b['normal_F'].detach().cpu()),img_norm_path_b)
+            img_depth_path_f = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_front_depth.png")
+            torchvision.utils.save_image((in_tensor_f['depth_F'].detach().cpu()),img_depth_path_f)
+            img_depth_path_b = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_back_depth.png")
+            torchvision.utils.save_image((in_tensor_b['depth_F'].detach().cpu()),img_depth_path_b)
+            """
+
+            img_crop_path = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_normal_and_depth.png")
+            row1 = torch.cat([data["img_crop"][:, :3], data2["img_crop"][:, :3]], dim=3)  # Concatenate front and back images
+            row2 = torch.cat([(in_tensor_f['normal_F'].detach().cpu() + 1.0) * 0.5, 
+                            (in_tensor_b['normal_F'].detach().cpu() + 1.0) * 0.5], dim=3)  # Concatenate normal front and back
+            row3 = torch.cat([in_tensor_f["depth_F"].unsqueeze(1).repeat(1, 3, 1, 1).detach().cpu(),
+                            in_tensor_b["depth_F"].unsqueeze(1).repeat(1, 3, 1, 1).detach().cpu()], dim=3)  # Concatenate mask and mask_back
+
+            # save the normal and depth images
+            torchvision.utils.save_image(
+                torch.cat([row1, row2, row3], dim=2) / 255., img_crop_path
+            )
+
             # save normals, depths and masks
             BNI_dict= save_normal_tensor_upt(
                 in_tensor_f,
@@ -607,6 +675,7 @@ if __name__ == "__main__":
                 device=device
             )
 
+            # BNI_object.extract_surface_single(False)
             BNI_object.extract_surface(False)
 
             in_tensor_f["body_verts"].append(torch.tensor(smpl_obj_lst[idx].vertices).float())

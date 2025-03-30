@@ -17,6 +17,9 @@ from cupyx.scipy.sparse import (
 from cupyx.scipy.sparse.linalg import cg
 from PIL import Image
 from tqdm.auto import tqdm
+import time
+import pyvista as pv
+
 
 from lib.dataset.mesh_util import clean_floats
 
@@ -464,6 +467,7 @@ def double_side_bilateral_normal_integration(
     #      [0,  fy, cy],
     #      [0,  0,  1]]
 
+    
     num_normals = cp.sum(normal_mask)
     normal_map_front = cp.asarray(normal_front)
     normal_map_back = cp.asarray(normal_back)
@@ -668,6 +672,48 @@ def double_side_bilateral_normal_integration(
     depth_map_front_est[normal_mask] = z_front
     depth_map_back_est[normal_mask] = z_back
 
+    """
+    # === SAVE FRONT AND BACK SURFACES BEFORE CUTTING INTERSECTIONS ===
+    vertices_front_pre_cut = cp.asnumpy(
+        map_depth_map_to_point_clouds(
+            depth_map_front_est, normal_mask, K=None, step_size=step_size
+        )
+    )
+    vertices_back_pre_cut = cp.asnumpy(
+        map_depth_map_to_point_clouds(
+            depth_map_back_est, normal_mask, K=None, step_size=step_size
+        )
+    )
+
+    facets_back_pre_cut = cp.asnumpy(construct_facets_from(normal_mask))
+    faces_back_pre_cut = np.concatenate(
+        (facets_back_pre_cut[:, [1, 4, 3]], facets_back_pre_cut[:, [1, 3, 2]]), axis=0
+    )
+    faces_front_pre_cut = np.concatenate(
+        (facets_back_pre_cut[:, [1, 2, 3]], facets_back_pre_cut[:, [1, 3, 4]]), axis=0
+    )
+
+    vertices_front_pre_cut, faces_front_pre_cut = remove_stretched_faces(
+        vertices_front_pre_cut, faces_front_pre_cut
+    )
+    vertices_back_pre_cut, faces_back_pre_cut = remove_stretched_faces(
+        vertices_back_pre_cut, faces_back_pre_cut
+    )
+
+    front_mesh_pre_cut = clean_floats(trimesh.Trimesh(vertices_front_pre_cut, faces_front_pre_cut))
+    back_mesh_pre_cut = clean_floats(trimesh.Trimesh(vertices_back_pre_cut, faces_back_pre_cut))
+
+    # Define export paths
+    pre_cut_front_mesh_path = osp.join("/home/ubuntu/projects/induxr/ECON/results_thuman/infer_two/carla/econ/obj", "front_mesh_pre_cut.obj")
+    pre_cut_back_mesh_path = osp.join("/home/ubuntu/projects/induxr/ECON/results_thuman/infer_two/carla/econ/obj", "back_mesh_pre_cut.obj")
+
+    # Save meshes before intersection cutting
+    front_mesh_pre_cut.export(pre_cut_front_mesh_path)
+    back_mesh_pre_cut.export(pre_cut_back_mesh_path)
+
+    # === CONTINUE WITH INTERSECTION CUT ===
+    """
+
     if cut_intersection:
         # manually cut the intersection
         normal_mask[depth_map_front_est >= depth_map_back_est] = False
@@ -675,9 +721,7 @@ def double_side_bilateral_normal_integration(
         depth_map_back_est[~normal_mask] = cp.nan
 
     vertices_front = cp.asnumpy(
-        map_depth_map_to_point_clouds(
-            depth_map_front_est, normal_mask, K=None, step_size=step_size
-        )
+        map_depth_map_to_point_clouds(depth_map_front_est, normal_mask, K=None, step_size=step_size)
     )
     vertices_back = cp.asnumpy(
         map_depth_map_to_point_clouds(depth_map_back_est, normal_mask, K=None, step_size=step_size)
@@ -695,19 +739,15 @@ def double_side_bilateral_normal_integration(
 
     result = {
         "F_verts": torch.as_tensor(front_mesh.vertices).float(), 
-        "F_faces": torch.as_tensor(
-            front_mesh.faces
-        ).long(), 
+        "F_faces": torch.as_tensor(front_mesh.faces).long(), 
         "B_verts": torch.as_tensor(back_mesh.vertices).float(), 
-        "B_faces":
-        torch.as_tensor(back_mesh.faces).long(), 
-        "F_depth":
-        torch.as_tensor(depth_map_front_est).float(), 
-        "B_depth":
-        torch.as_tensor(depth_map_back_est).float()
+        "B_faces": torch.as_tensor(back_mesh.faces).long(), 
+        "F_depth": torch.as_tensor(depth_map_front_est).float(), 
+        "B_depth": torch.as_tensor(depth_map_back_est).float()
     }
 
     return result
+
 
 
 def save_normal_tensor_upt(in_tensor_f, in_tensor_b, idx, png_path, thickness=0.0):
@@ -729,6 +769,7 @@ def save_normal_tensor_upt(in_tensor_f, in_tensor_b, idx, png_path, thickness=0.
     BNI_dict["mask"] = mask_normal_arr > 0.
     BNI_dict["depth_F"] = depth_F_arr - 100. - thickness
     BNI_dict["depth_B"] = 100. - depth_B_arr + thickness
+    # BNI_dict["depth_B"] = depth_B_arr - 100. - thickness
     BNI_dict["depth_mask"] = depth_F_arr != -1.0
 
     np.save(png_path + ".npy", BNI_dict, allow_pickle=True)
@@ -759,3 +800,5 @@ def save_normal_tensor(in_tensor, idx, png_path, thickness=0.0):
     np.save(png_path + ".npy", BNI_dict, allow_pickle=True)
 
     return BNI_dict
+
+
