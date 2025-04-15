@@ -1166,11 +1166,10 @@ class SMPLX(SMPLH):
         return_verts: bool = True,
         return_full_pose: bool = False,
         pose2rot: bool = True,
-        return_joint_transformation: bool = False,
-        return_vertex_transformation: bool = False,
-        pose_type: str = 'posed',
         **kwargs,
     ) -> SMPLXOutput:
+        device = self.shapedirs.device
+        dtype = self.shapedirs.dtype
         """
         Forward pass for the SMPLX model
 
@@ -1222,7 +1221,83 @@ class SMPLX(SMPLH):
                 output: ModelOutput
                 A named tuple of type `ModelOutput`
         """
+        def get_param(name, passed_value, default_shape):
+            if passed_value is not None:
+                return passed_value
+            elif hasattr(self, name):
+                return getattr(self, name)
+            else:
+                return torch.zeros(default_shape, dtype=dtype, device=device)
 
+        batch_size = (
+            betas.shape[0]
+            if betas is not None
+            else 1
+        )
+
+        global_orient = get_param("global_orient", global_orient, (batch_size, 3))
+        body_pose = get_param("body_pose", body_pose, (batch_size, self.NUM_BODY_JOINTS * 3))
+        jaw_pose = get_param("jaw_pose", jaw_pose, (batch_size, 3))
+        leye_pose = get_param("leye_pose", leye_pose, (batch_size, 3))
+        reye_pose = get_param("reye_pose", reye_pose, (batch_size, 3))
+        left_hand_pose = get_param("left_hand_pose", left_hand_pose, (batch_size, 45))
+        right_hand_pose = get_param("right_hand_pose", right_hand_pose, (batch_size, 45))
+        expression = get_param("expression", expression, (batch_size, self.num_expression_coeffs))
+        betas = get_param("betas", betas, (batch_size, self.num_betas))
+        transl = get_param("transl", transl, (batch_size, 3))
+
+        if self.use_pca:
+            hand_pose_dim = self.num_pca_comps if self.use_pca else 45
+            left_hand_pose = get_param("left_hand_pose", left_hand_pose, (batch_size, hand_pose_dim))
+            right_hand_pose = get_param("right_hand_pose", right_hand_pose, (batch_size, hand_pose_dim))
+
+
+        full_pose = torch.cat([
+            global_orient,
+            body_pose,
+            jaw_pose,
+            leye_pose,
+            reye_pose,
+            left_hand_pose,
+            right_hand_pose,
+        ], dim=1)
+
+        shape_components = torch.cat([betas, expression], dim=-1)
+        shapedirs = torch.cat([self.shapedirs, self.expr_dirs], dim=-1)
+
+        vertices, joints = lbs(
+            shape_components,
+            full_pose,
+            self.v_template,
+            shapedirs,
+            self.posedirs,
+            self.J_regressor,
+            self.parents,
+            self.lbs_weights,
+            pose2rot=pose2rot,
+        )
+
+        joints = self.vertex_joint_selector(vertices, joints)
+        if self.joint_mapper is not None:
+            joints = self.joint_mapper(joints=joints, vertices=vertices)
+
+        if transl is not None:
+            joints += transl.unsqueeze(1)
+            vertices += transl.unsqueeze(1)
+
+        return SMPLXOutput(
+            vertices=vertices if return_verts else None,
+            joints=joints,
+            betas=betas,
+            expression=expression,
+            global_orient=global_orient,
+            body_pose=body_pose,
+            left_hand_pose=left_hand_pose,
+            right_hand_pose=right_hand_pose,
+            jaw_pose=jaw_pose,
+            full_pose=full_pose if return_full_pose else None,
+        )
+        """
         # If no shape and pose parameters are passed along, then use the
         # ones from the module
         global_orient = (global_orient if global_orient is not None else self.global_orient)
@@ -1386,7 +1461,7 @@ class SMPLX(SMPLH):
             vertex_transformation=vertex_transformation if return_vertex_transformation else None,
         )
         return output
-
+    """
 
 class SMPLXLayer(SMPLX):
     def __init__(self, *args, **kwargs) -> None:
@@ -2520,8 +2595,7 @@ def create(model_path: str,
         ValueError: In case the model type is not one of SMPL, SMPLH,
         SMPLX, MANO or FLAME
     """
-
-    # If it's a folder, assume
+    
     if osp.isdir(model_path):
         model_path = os.path.join(model_path, model_type)
     else:

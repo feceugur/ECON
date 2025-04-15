@@ -399,18 +399,37 @@ if __name__ == "__main__":
             
 
             face_vids = SMPLX_object.smplx_front_flame_vid
-            face_verts = smpl_verts_f[:, face_vids, :]  # shape: [batch_size, face_vids, 3]
+            face_verts = smpl_verts_f[:, face_vids, :]  # [B, N_face, 3]
+
+            # Define facial joint indices (standard from SMPL-X)
+            facial_joint_indices = [66, 67, 68, 69, 70, 71, 72, 73, 127]
+            facial_kpt3d = data["smplx_kpt3d"][0, facial_joint_indices].detach().cpu().numpy().tolist()
+            facial_kpt2d = data["smplx_kpt"][0, facial_joint_indices].detach().cpu().numpy().tolist()
+
             with torch.no_grad():
                 rig_data_json = {
-                    'expression_params': data["exp"].detach().cpu().numpy().tolist(),  
-                    'jaw_pose': data["jaw_pose"].detach().cpu().numpy().tolist(),  
+                    # Expression & pose
+                    'expression_params': data["exp"].detach().cpu().numpy().tolist(),
+                    'jaw_pose': data["jaw_pose"].detach().cpu().numpy().tolist(),
+                    'head_pose': data["head_pose"].detach().cpu().numpy().tolist(),
+                    'abs_head_pose': data["abs_head_pose"].detach().cpu().numpy().tolist(),
+                    'neck_pose': data["neck_pose"].detach().cpu().numpy().tolist(),
+
+                    # Geometry
+                    'shape_params': data["shape"].detach().cpu().numpy().tolist(),
                     'face_vertex_ids': face_vids.tolist(),
                     'face_verts': face_verts[0].detach().cpu().numpy().tolist(),
+
+                    # Joints and keypoints
+                    'smplx_kpt3d': data["smplx_kpt3d"][0].detach().cpu().numpy().tolist(),
+                    'smplx_kpt': data["smplx_kpt"][0].detach().cpu().numpy().tolist(),
+                    'facial_joint_indices': facial_joint_indices,
+                    'facial_kpt3d': facial_kpt3d,
+                    'facial_kpt2d': facial_kpt2d,
                 }
 
                 out_dir_rig = osp.join(args.out_dir, cfg.name, "rig_params_json")
                 os.makedirs(out_dir_rig, exist_ok=True)
-
                 json_path = f"{out_dir_rig}/{data['name']}_face_rig.json"
 
                 with open(json_path, 'w') as f:

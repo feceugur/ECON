@@ -17,6 +17,8 @@
 import logging
 import warnings
 
+from apps.FaceRigExporter import FaceRigExporter
+
 warnings.filterwarnings("ignore")
 logging.getLogger("lightning").setLevel(logging.ERROR)
 logging.getLogger("trimesh").setLevel(logging.ERROR)
@@ -31,11 +33,15 @@ import trimesh
 from pytorch3d.ops import SubdivideMeshes
 from termcolor import colored
 from tqdm.auto import tqdm
+import numpy as np
+import smplx
 
 from apps.IFGeo import IFGeo
 from apps.Normal import Normal
 from apps.sapiens import ImageProcessor
 from apps.clean_mesh import MeshCleanProcess
+from apps.SMPLXJointAligner import SMPLXJointAligner
+from apps.CameraTransformManager import CameraTransformManager
 
 from lib.common.BNI import BNI
 from lib.common.BNI_utils import save_normal_tensor
@@ -102,6 +108,8 @@ if __name__ == "__main__":
     # SMPLX object
     SMPLX_object = SMPLX()
 
+    lmk_ids = np.load("/home/ubuntu/Data/Fulden/smpl_related/smplx_vertex_lmkid.npy")  # shape: [N]
+
     dataset_param = {
         "image_dir": args.in_dir,
         "seg_dir": args.seg_dir,
@@ -130,37 +138,6 @@ if __name__ == "__main__":
     canonical_smpl_joints = None
     canonical_smpl_landmarks = None
     canonical_saved = False
-
-    # Load transforms once
-    with open("./examples/thuman/multi/cam_params/transforms_to_frame_1.json", "r") as f:
-        transform_dict = json.load(f)
-
-    def get_transform_matrix_for_frame(frame, device):
-        """
-        Get the transformation matrix from the given frame to frame 1 as a torch tensor.
-        Applies Blender-to-ComputerVision axis conversion.
-        """
-        if str(frame) in transform_dict:
-            matrix = transform_dict[str(frame)]
-        else:
-            # Identity matrix for frame 1
-            matrix = [[1.0 if i == j else 0.0 for j in range(4)] for i in range(4)]
-
-        T = torch.tensor(matrix, dtype=torch.float32).to(device)
-
-        # Blender-to-CV axis conversion
-        blender_to_cv = torch.tensor([
-            [1,  0,  0, 0],  # X stays X
-            [0,  0,  -1, 0],  # Z becomes Y
-            [0,  -1,  0, 0],  # Y becomes Z
-            [0,  0,  0, 1]
-        ], dtype=torch.float32).to(device)
-
-        # Sandwich the transformation
-        T_cv = blender_to_cv @ T @ torch.linalg.inv(blender_to_cv)
-        return T_cv
-
-
 
     def apply_homogeneous_transform(x, T):
         """
@@ -283,16 +260,20 @@ if __name__ == "__main__":
             is_first_input = not canonical_saved
 
             if is_first_input:
-                # Optimization for first input (front view)
-                pass  # Keep smpl_verts/joints/landmarks as-is
+                target_frame_id = int(data["name"].split("_")[1])
+                cam_param_path = os.path.join(args.in_dir, "cam_params", "camera_parameters.json")
+                transform_manager = CameraTransformManager(cam_param_path, target_frame=target_frame_id, device=device, debug=True)
+
+                print(f"[INFO] Using frame {target_frame_id} as canonical target.")
             else:
                 # Reuse canonical SMPL mesh, apply rotation
-                current_frame = int(data["name"])  # frame ID is stored in 'data["name"]' like "2", "3", etc.
-                T_frame_to_1 = get_transform_matrix_for_frame(current_frame, device)
+                current_frame = int(data["name"].split("_")[1])  # "frame_0002" → 2
+                T_frame_to_target = transform_manager.get_transform_to_target(current_frame)
+                T_frame_to_target[:3, 3] = 0.0
 
-                smpl_verts = apply_homogeneous_transform(canonical_smpl_verts, T_frame_to_1)
-                smpl_joints = apply_homogeneous_transform(canonical_smpl_joints, T_frame_to_1)
-                smpl_landmarks = apply_homogeneous_transform(canonical_smpl_landmarks, T_frame_to_1)
+                smpl_verts = apply_homogeneous_transform(canonical_smpl_verts, T_frame_to_target)
+                smpl_joints = apply_homogeneous_transform(canonical_smpl_joints, T_frame_to_target)
+                smpl_landmarks = apply_homogeneous_transform(canonical_smpl_landmarks, T_frame_to_target)
 
             # === Save canonical SMPL after last iteration ===
             if is_first_input and i == args.loop_smpl - 1:
@@ -812,8 +793,70 @@ if __name__ == "__main__":
             torch.save(
                 in_tensor, osp.join(args.out_dir, cfg.name, f"vid/{data['name']}_in_tensor.pt")
             )
+        
+        def save_obj(vertices, faces, out_path):
+            with open(out_path, 'w') as f:
+                for v in vertices:
+                    f.write(f"v {v[0]} {v[1]} {v[2]}\n")
+                for face in faces + 1:  # OBJ is 1-indexed
+                    f.write(f"f {face[0]} {face[1]} {face[2]}\n")
+                    
+        def generate_expression_blendshapes(model_path, gender="neutral", num_expr=10, device='cpu'):
+            smplx_model = smplx.create(
+                model_path=model_path,
+                model_type='smplx',
+                gender=gender,
+                model_filename='SMPLX_NEUTRAL_2020.npz',
+                num_expression_coeffs=num_expr,
+                use_face_contour=True,
+                create_expression=True,
+                create_betas=False,
+                create_global_orient=False,
+                create_body_pose=False,
+                create_jaw_pose=False,
+                create_left_hand_pose=False,
+                create_right_hand_pose=False,
+                create_transl=False
+            ).to(device)
+
+            expression_meshes = []
+            faces = smplx_model.faces
+
+            os.makedirs(args.out_dir, exist_ok=True)
+
+            with torch.no_grad():
+                for i in range(num_expr):
+                    expr_vector = torch.zeros(1, num_expr).to(device)
+                    expr_vector[0, i] = 1.0
+                    output = smplx_model(expression=expr_vector, return_verts=True)
+                    expr_verts = output.vertices[0].cpu().numpy()
+                    expression_meshes.append(expr_verts)  # <- full expression mesh
+
+                    # Save .obj file
+                    os.makedirs(os.path.join(args.out_dir, f"expressions"), exist_ok=True)
+                    out_path = os.path.join(args.out_dir, f"expressions/expression_{i:02d}.obj")
+                    save_obj(expr_verts, faces, out_path)
+
+            return expression_meshes, smplx_model
 
 
+        #expression_meshes, smplx_model = generate_expression_blendshapes(
+            model_path="/home/ubuntu/Data/Fulden/HPS/pixie_data",
+            gender="neutral",
+            num_expr=100,
+            device="cuda"
+        #)
+        
+        # exporter = FaceRigExporter(smplx_object=SMPLX_object, final_mesh=final_mesh, align_mode='smplx')
+
+        # exporter.export(
+            data=data,
+            smpl_verts=smpl_verts,  # shape: [1, N, 3]
+            out_dir=args.out_dir,
+            cfg_name=cfg.name,
+            expression_meshes=expression_meshes  # shape: List[np.ndarray of (N, 3)]
+        # )
+        
         final_watertight_path = f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_full_wt.obj"
         watertightifier = MeshCleanProcess(final_path, final_watertight_path)
         result = watertightifier.process(reconstruction_method='poisson', depth=10)
