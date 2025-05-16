@@ -124,6 +124,9 @@ if __name__ == "__main__":
     else:
         print(colored(f"Complete with {Format.start} SMPL-X (Explicit) {Format.end}", "green"))
 
+    rgb_masks = []
+    smpl_masks = []
+    
     dataset = TestDataset(dataset_param, device)
 
     print(colored(f"Dataset Size: {len(dataset)}", "green"))

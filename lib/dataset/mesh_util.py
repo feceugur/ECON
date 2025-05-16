@@ -144,11 +144,36 @@ class SMPLX:
         #                                      (30, 34), (31, 29), (32, 32)]).long()
 
         # remove the hips, knees, ankles to reduce bending legs
+        """
         self.ghum_smpl_pairs = torch.tensor([(0, 24), (2, 26), (5, 25), (7, 28), (8, 27), (11, 16),
                                              (12, 17), (13, 18), (14, 19), (15, 20), (16, 21),
                                              (17, 39), (18, 44), (19, 36), (20, 41), (21, 35),
                                              (22, 40), (29, 31), (30, 34), (31, 29),
                                              (32, 32)]).long()
+        """
+        self.ghum_smpl_pairs = torch.tensor([
+            (0, 24),   # 
+            (2, 25),   # was 26, now 25
+            (5, 26),   #  was 25, now 26
+            (7, 27),   #  was 28, now 27
+            (8, 28),   #  was 27, now 28
+            (11, 17),  #  (was 16, now 17)
+            (12, 16),  #  (was 17, now 16)
+            (13, 19),  #  (was 18, now 19)
+            (14, 18),  #  (was 19, now 18)
+            (15, 21),  #  (was 20, now 21)
+            (16, 20),  #  (was 21, now 20)
+            (17, 40),  #  (was 39, now 40)
+            (18, 39),  #  (was 44, now 39)
+            (19, 44),  #  (was 35, now 44)
+            (20, 36),  #  (was 41, now 36)
+            (21, 41),  #  (was 35, now 41)
+            (22, 35),  #  (was 44, now 35)
+            (29, 32),  #  (was 31, now 32)
+            (30, 31),  #  (was 34, now 31)
+            (31, 34),  #  (was 29, now 34)
+            (32, 29),  #  (was 32, now 29)
+        ]).long()
 
         # smpl-smplx correspondence
         self.smpl_joint_ids_24 = np.arange(22).tolist() + [68, 73]

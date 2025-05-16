@@ -202,6 +202,7 @@ class TestDataset:
         arr_dict["body_pose"] = arr_dict["body_pose"][:, :, :, :2].reshape(N_body, N_pose, -1)
         arr_dict["global_orient"] = arr_dict["global_orient"][:, :, :, :2].reshape(N_body, 1, -1)
 
+
         return arr_dict
 
     def render_normal(self, verts, faces):
