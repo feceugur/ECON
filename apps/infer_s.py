@@ -21,6 +21,7 @@ from apps.Normal_f import Normal
 from apps.sapiens import ImageProcessor
 # from apps.clean_mesh import MeshWatertightifier
 from apps.clean_mesh import MeshCleanProcess
+from apps.face_rig_exporter import FaceRigExporter
 
 from lib.common.BNI import BNI
 from lib.common.BNI_utils import save_normal_tensor
@@ -54,6 +55,7 @@ from lib.dataset.mesh_util import (
     poisson,
 )
 from lib.smplx.lbs import general_lbs
+from trimesh import util
 
 from rembg import remove
 
@@ -82,6 +84,7 @@ def parse_args():
 
 def setup_configuration(args):
     # Load and merge configuration files.
+    cfg.bni.graft_v5_stitch_method = "trimesh_boundary_loft"
     cfg.merge_from_file(args.config)
     cfg.merge_from_file("./lib/pymafx/configs/pymafx_config.yaml")
     device = torch.device(f"cuda:{args.gpu_device}")
@@ -143,8 +146,93 @@ def setup_dataset(args, cfg, device, bg_color):
     print(colored(f"Dataset Size: {len(dataset)}", "green"))
     return dataset
 
+def save_obj(vertices, faces, out_path):
+            with open(out_path, 'w') as f:
+                for v in vertices:
+                    f.write(f"v {v[0]} {v[1]} {v[2]}\n")
+                for face in faces + 1:  # OBJ is 1-indexed
+                    f.write(f"f {face[0]} {face[1]} {face[2]}\n")
+                    
+def generate_expression_blendshapes(model_path, args, gender="neutral", num_expr=10, device='cpu'):
+    """
+    Generates expression blendshape meshes for the first num_expr expressions,
+    applying weights [-2.0, -1.0, 0.0, 1.0, 2.0] to each.
 
-def process_sample(data, data_b, args, cfg, device, normal_net, sapiens_normal_net, ifnet, SMPLX_object, dataset, bg_color):
+    Args:
+        model_path (str): Path to the directory containing SMPL-X model files.
+        args (object): Arguments object containing args.out_dir.
+        gender (str): Model gender ('neutral', 'male', 'female').
+        num_expr (int): The number of expression coefficients/dimensions to use
+                        and generate blendshapes for.
+        device (str): PyTorch device ('cpu' or 'cuda').
+
+    Returns:
+        tuple: (list, smplx.SMPLX)
+            - expression_meshes: A list containing NumPy arrays of vertex positions.
+                                 The list will contain num_expr * 5 meshes.
+                                 Order: [expr0_w-2, expr0_w-1, ..., expr0_w2, expr1_w-2, ...]
+            - smplx_model: The loaded SMPL-X model instance.
+    """
+    smplx_model = smplx.create(
+        model_path=model_path,
+        model_type='smplx',
+        gender=gender,
+        # Assuming the neutral model filename is standard, adjust if needed
+        model_filename='SMPLX_NEUTRAL_2020.npz', # Or specific like SMPLX_NEUTRAL_2020.npz
+        num_expression_coeffs=num_expr, # Use the passed num_expr
+        use_face_contour=True,
+        create_expression=True,
+        create_betas=False, # Keep other params as potentially needed by the model
+        create_global_orient=True,
+        create_body_pose=True,
+        create_jaw_pose=True,
+        create_left_hand_pose=False,
+        create_right_hand_pose=False,
+        create_transl=False
+    ).to(device)
+
+    expression_meshes = []
+    # It's safer to get faces directly from the loaded model instance
+    faces = smplx_model.faces_tensor.cpu().numpy() # Get faces as numpy array
+
+    # Define the weights to iterate over
+    weights_to_permute = [-5.0, -2.5, 0.0, 2.5, 5.0]
+
+    # Prepare output directory for expression objs
+    expression_obj_dir = os.path.join(args.out_dir, "expressions")
+    os.makedirs(expression_obj_dir, exist_ok=True)
+
+    with torch.no_grad():
+        # Loop through the first num_expr expression indices
+        for i in range(num_expr):
+            # Loop through the desired weights for the current expression i
+            for weight in weights_to_permute:
+                # Create a zero vector for expression parameters for each weight iteration
+                expr_vector = torch.zeros(1, num_expr).to(device)
+                # Set the i-th expression coefficient to the current weight
+                expr_vector[0, i] = weight
+
+                # Run the SMPL-X model with the specific expression vector
+                output = smplx_model(expression=expr_vector, return_verts=True)
+                expr_verts = output.vertices[0].cpu().numpy()
+
+                # Append the resulting mesh vertices to the list
+                expression_meshes.append(expr_verts)
+
+                # Save .obj file with a name indicating expression index and weight
+                # Create a safe string label for the weight (e.g., neg2p0, 0p0, 1p0)
+                weight_label = f"{weight}".replace(".", "p").replace("-", "neg")
+                out_path = os.path.join(expression_obj_dir, f"expression_{i:02d}_w{weight_label}.obj")
+                save_obj(expr_verts, faces, out_path)
+                # print(f"Saved: {out_path}") # Optional: print progress
+
+    return expression_meshes, smplx_model
+
+def process_sample_combined(data, data_b, args, cfg, device, normal_net, sapiens_normal_net, ifnet, SMPLX_object, dataset, bg_color):
+    """
+    Combined function to process a sample, using the provided background color for rendering.
+    Based primarily on the logic of the original 'process_sample' function.
+    """
     losses = init_loss()
     sample_name = data['name']
 
@@ -246,10 +334,30 @@ def process_sample(data, data_b, args, cfg, device, normal_net, sapiens_normal_n
             ghum_conf = data["landmark"][:, SMPLX_object.ghum_smpl_pairs[:, 0], -1].to(device)
             smpl_lmks = smpl_joints_3d[:, SMPLX_object.ghum_smpl_pairs[:, 1], :2]
 
+            # Face rig JSON export (from original process_sample)
+            face_vids = SMPLX_object.smplx_front_flame_vid
+            face_verts = smpl_verts[:, face_vids, :]  # shape: [batch_size, face_vids, 3]
+            with torch.no_grad():
+                rig_data_json = {
+                'expression_params': data["exp"].detach().cpu().numpy().tolist(),
+                'jaw_pose': data["jaw_pose"].detach().cpu().numpy().tolist(),
+                'face_vertex_ids': face_vids.tolist(),
+                'face_verts': face_verts[0].detach().cpu().numpy().tolist(),
+                }
+
+            out_dir_rig = osp.join(args.out_dir, cfg.name, "rig_params_json")
+            os.makedirs(out_dir_rig, exist_ok=True)
+
+            json_path = f"{out_dir_rig}/{data['name']}_face_rig.json"
+
+            with open(json_path, 'w') as f:
+                json.dump(rig_data_json, f, indent=4)  # indent=4 for pretty-printing
+
             in_tensor["T_normal_F"], in_tensor["T_normal_B"] = dataset.render_normal(
                 smpl_verts * torch.tensor([1.0, -1.0, -1.0]).to(device),
                 in_tensor["smpl_faces"]
             )
+            # Use the bg_color parameter here
             T_mask_F, T_mask_B = dataset.render.get_image(type="mask", bg=bg_color)
             with torch.no_grad():
                 in_tensor["normal_F"], in_tensor["normal_B"] = normal_net.netG(in_tensor, args.out_dir)
@@ -329,6 +437,7 @@ def process_sample(data, data_b, args, cfg, device, normal_net, sapiens_normal_n
             smpl_loss.backward()
             optimizer_smpl.step()
             scheduler_smpl.step(smpl_loss)
+
         in_tensor["smpl_verts"] = smpl_verts * torch.tensor([1.0, 1.0, -1.0]).to(device)
         in_tensor["smpl_faces"] = in_tensor["smpl_faces"][:, :, [0, 2, 1]]
         if not args.novis:
@@ -362,8 +471,9 @@ def process_sample(data, data_b, args, cfg, device, normal_net, sapiens_normal_n
             maintains_order=True,
         )
         smpl_obj_path = f"{args.out_dir}/{cfg.name}/obj/{sample_name}_smpl_{idx:02d}.obj"
+        # Save SMPL obj and info (from original process_sample)
         if not osp.exists(smpl_obj_path) or cfg.force_smpl_optim:
-            smpl_obj.export(smpl_obj_path)
+            smpl_obj.export(smpl_obj_path) # Export SMPL .obj
             smpl_info = {
                 "betas": optimed_betas[idx].detach().cpu().unsqueeze(0),
                 "body_pose": rotation_matrix_to_angle_axis(optimed_pose_mat[idx].detach()).cpu().unsqueeze(0),
@@ -439,6 +549,7 @@ def process_sample(data, data_b, args, cfg, device, normal_net, sapiens_normal_n
             if ifnet.clean_mesh_flag:
                 verts_IF, faces_IF = clean_mesh(verts_IF, faces_IF)
             side_mesh = trimesh.Trimesh(verts_IF, faces_IF)
+            # Remesh laplacian (from original process_sample)
             side_mesh = remesh_laplacian(side_mesh, side_mesh_path)
         else:
             side_mesh = apply_vertex_mask(
@@ -457,7 +568,15 @@ def process_sample(data, data_b, args, cfg, device, normal_net, sapiens_normal_n
         full_lst = []
 
         if "face" in cfg.bni.use_smpl:
-            face_mesh = apply_vertex_mask(face_mesh, SMPLX_object.front_flame_vertex_mask)
+            # NEW: keep both the skin (front-flame) **and** the eyeball spheres
+            face_plus_eye_mask = (
+                    SMPLX_object.front_flame_vertex_mask
+                + SMPLX_object.eyeball_vertex_mask        # =1 on the two spheres
+            ).clamp_max(1.0)                                # ensure mask ∈ {0,1}
+
+            face_mesh = apply_vertex_mask(face_mesh, face_plus_eye_mask)
+
+            # face_mesh = apply_vertex_mask(face_mesh, SMPLX_object.front_flame_vertex_mask)
             if not face_mesh.is_empty:
                 face_mesh.vertices = face_mesh.vertices - np.array([0, 0, cfg.bni.thickness])
                 BNI_object.F_B_trimesh = part_removal(
@@ -471,6 +590,7 @@ def process_sample(data, data_b, args, cfg, device, normal_net, sapiens_normal_n
                 side_mesh = part_removal(
                     side_mesh, face_mesh, cfg.bni.face_thres, device, smplx_mesh, region="face"
                 )
+                # Export face mesh (from original process_sample)
                 face_mesh.export(f"{args.out_dir}/{cfg.name}/obj/{sample_name}_{idx}_face.obj")
                 full_lst += [face_mesh]
 
@@ -505,6 +625,7 @@ def process_sample(data, data_b, args, cfg, device, normal_net, sapiens_normal_n
                 side_mesh = part_removal(
                     side_mesh, hand_mesh, cfg.bni.hand_thres, device, smplx_mesh, region="hand"
                 )
+                # Export hand mesh (from original process_sample)
                 hand_mesh.export(f"{args.out_dir}/{cfg.name}/obj/{sample_name}_{idx}_hand.obj")
                 full_lst += [hand_mesh]
 
@@ -514,6 +635,7 @@ def process_sample(data, data_b, args, cfg, device, normal_net, sapiens_normal_n
         )
         full_lst += [side_mesh]
 
+        # Export intermediate meshes (from original process_sample)
         BNI_object.F_B_trimesh.export(
             f"{args.out_dir}/{cfg.name}/obj/{sample_name}_{idx}_BNI.obj"
         )
@@ -533,26 +655,30 @@ def process_sample(data, data_b, args, cfg, device, normal_net, sapiens_normal_n
             )
         else:
             final_mesh = sum(full_lst)
+            # Export final mesh if not using Poisson (from original process_sample)
             final_mesh.export(final_path)
 
         if not args.novis:
             dataset.render.load_meshes(final_mesh.vertices, final_mesh.faces)
+            # Use the bg_color parameter here
             rotate_recon_lst = dataset.render.get_image(cam_type="four", bg=bg_color)
             per_loop_lst_front = [in_tensor['image'][idx:idx + 1]] + rotate_recon_lst
             per_loop_lst_back  = [in_tensor['image_back'][idx:idx + 1]] + rotate_recon_lst
 
+            # Export final mesh if texturing from image (from original process_sample)
             if cfg.bni.texture_src == 'image':
-                final_mesh.export(final_path)
+                 final_mesh.export(final_path)
             elif cfg.bni.texture_src == 'SD':
-                pass
+                pass # No export needed based on original logic
 
             if len(per_loop_lst_front) > 0 and len(per_loop_lst_back) > 0:
                 cloth_front = get_optim_grid_image(per_loop_lst_front, None, nrow=5, type="cloth_front")
-                bg_color = bg_color.strip('"').strip("'")
-                cloth_front_path = osp.join(args.out_dir, cfg.name, f"png/{sample_name}_cloth_front_{bg_color}.png")
+                # Use bg_color in filename
+                clean_bg_color = bg_color.strip('"').strip("'") if isinstance(bg_color, str) else str(bg_color) # Handle potential tuple/list
+                cloth_front_path = osp.join(args.out_dir, cfg.name, f"png/{sample_name}_cloth_front_{clean_bg_color}.png")
                 cloth_front.save(cloth_front_path)
                 cloth_back = get_optim_grid_image(per_loop_lst_back, None, nrow=5, type="cloth_back")
-                cloth_back_path = osp.join(args.out_dir, cfg.name, f"png/{sample_name}_cloth_back_{bg_color}.png")
+                cloth_back_path = osp.join(args.out_dir, cfg.name, f"png/{sample_name}_cloth_back_{clean_bg_color}.png")
                 cloth_back.save(cloth_back_path)
 
             in_tensor["BNI_verts"].append(torch.tensor(final_mesh.vertices).float())
@@ -564,450 +690,86 @@ def process_sample(data, data_b, args, cfg, device, normal_net, sapiens_normal_n
                 in_tensor, osp.join(args.out_dir, cfg.name, f"vid/{sample_name}_in_tensor.pt")
             )
 
+        # Expression Blendshapes (from original process_sample)
+        expression_meshes, smplx_model = generate_expression_blendshapes(
+            "/home/ubuntu/Data/Fulden/HPS/pixie_data", # Assuming this path is correct or configured elsewhere
+            args,
+            gender="neutral",
+            num_expr=10,
+            device="cuda" # Assuming device is cuda, adjust if needed
+        )
+
+        # Face Rig Export (from original process_sample)
+        exporter = FaceRigExporter(smplx_object=SMPLX_object, final_mesh=final_mesh, align_mode='smplx')
+
+        exporter.export(
+            data=data,
+            smpl_verts=smpl_verts,  # shape: [1, N, 3] - Make sure smpl_verts is accessible here
+            out_dir=args.out_dir,
+            cfg_name=cfg.name,
+            expression_meshes=expression_meshes  # shape: List[np.ndarray of (N, 3)]
+        )
+
+        # Watertightening (from original process_sample)
         final_watertight_path = f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_full_wt.obj"
         watertightifier = MeshCleanProcess(final_path, final_watertight_path)
-        result = watertightifier.process(reconstruction_method='poisson', depth=10)
+        # Pass poisson depth from config if available, e.g., cfg.bni.poisson_depth
+        # Ensure cfg.bni.poisson_depth exists or use a default like 10
+        poisson_depth_wt = getattr(cfg.bni, 'poisson_depth', 9)
+        result = watertightifier.process(reconstruction_method='poisson', depth=poisson_depth_wt)
 
-        if result:
-            print("The mesh is watertight and has been saved successfully!")
-        else:
-            print("The mesh is not watertight. Further inspection may be needed.")
+        if result: # result from watertightifier.process (e.g., True if _full_wt.obj was created successfully)
+            print(f"Watertight base mesh for grafting (V4) saved successfully to {final_watertight_path}")
 
-        final_mesh = MeshCleanProcess.process_watertight_mesh(
-            final_watertight_path=f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_full_wt.obj",
-            output_path=f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_final.obj",
-            face_vertex_mask=SMPLX_object.front_flame_vertex_mask,
-            target_faces=15000
-        )        
+            # Define output path for this V4 grafting attempt
+            original_smplx_face_path = f"{args.out_dir}/{cfg.name}/obj/{sample_name}_{idx}_face.obj" # Your SMPLX face mask
 
-def process_sample_second_pass(data, data_b, args, cfg, device, normal_net, sapiens_normal_net, ifnet, SMPLX_object, dataset, bg_color):
-    losses = init_loss()
-    sample_name = data['name']
+            if not osp.exists(original_smplx_face_path):
+                print(f"ERROR: SMPLX face mesh {original_smplx_face_path} not found. Cannot perform grafting_v4.")
+            elif not osp.exists(final_watertight_path): # This is the input body mesh (_full_wt.obj)
+                print(f"ERROR: Base body mesh {final_watertight_path} not found. Cannot perform grafting_v4.")
+            else: # SMPLX face and body mesh exist
+                
+                grafted_output_path_v5 = f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_final_grafted_v5.obj"
 
-    # Create output directories.
-    png_dir = osp.join(args.out_dir, cfg.name, "png")
-    obj_dir = osp.join(args.out_dir, cfg.name, "obj")
-    os.makedirs(png_dir, exist_ok=True)
-    os.makedirs(obj_dir, exist_ok=True)
+                debug_graft_dir_sample_v5 = None
+                if not args.novis:
+                    debug_graft_dir_sample_v5 = osp.join(args.out_dir, cfg.name, "debug_grafting_v5", f"{data['name']}_{idx}")
+                
+                print(f"\nCalling MeshCleanProcess.process_mesh_graft_smplx_face_v5:")
 
-    # Build input tensor.
-    in_tensor = {
-        "smpl_faces": data["smpl_faces"],
-        "image": data["img_icon"].to(device),
-        "image_back": data_b["img_icon"].to(device),
-        "mask": data["img_mask"].to(device),
-        "mask_back": data_b["img_mask"].to(device)
-    }
-
-    # Set optimizable parameters.
-    optimed_pose = data["body_pose"].requires_grad_(True)
-    optimed_trans = data["trans"].requires_grad_(True)
-    optimed_betas = data["betas"].requires_grad_(True)
-    optimed_orient = data["global_orient"].requires_grad_(True)
-
-    optimizer_smpl = torch.optim.Adam(
-        [optimed_pose, optimed_trans, optimed_betas, optimed_orient],
-        lr=1e-2,
-        amsgrad=True
-    )
-    scheduler_smpl = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer_smpl,
-        mode="min",
-        factor=0.5,
-        verbose=0,
-        min_lr=1e-5,
-        patience=args.patience,
-    )
-
-    per_data_lst = []
-    N_body, N_pose = optimed_pose.shape[:2]
-    smpl_path = f"{args.out_dir}/{cfg.name}/obj/{sample_name}_smpl_00.obj"
-
-    # Sapiens inference (if enabled).
-    if cfg.sapiens.use:
-        sapiens_normal = sapiens_normal_net.process_image(
-            Image.fromarray(
-                data["img_raw"].squeeze(0).permute(1, 2, 0).numpy().astype(np.uint8)
-            ), "1b", cfg.sapiens.seg_model
-        )
-        print(colored("Estimating normal maps from input image, using Sapiens-normal", "green"))
-        sapiens_normal_square_lst = []
-        for idx in range(len(data["img_icon"])):
-            sapiens_normal_square_lst.append(wrap(sapiens_normal, data["uncrop_param"], idx))
-        sapiens_normal_square = torch.cat(sapiens_normal_square_lst)
-
-    if osp.exists(smpl_path) and (not cfg.force_smpl_optim):
-        # Load SMPL meshes.
-        smpl_verts_lst = []
-        smpl_faces_lst = []
-        for idx in range(N_body):
-            smpl_obj = f"{args.out_dir}/{cfg.name}/obj/{sample_name}_smpl_{idx:02d}.obj"
-            smpl_mesh = trimesh.load(smpl_obj)
-            smpl_verts = torch.tensor(smpl_mesh.vertices).to(device).float()
-            smpl_faces = torch.tensor(smpl_mesh.faces).to(device).long()
-            smpl_verts_lst.append(smpl_verts)
-            smpl_faces_lst.append(smpl_faces)
-        batch_smpl_verts = torch.stack(smpl_verts_lst)
-        batch_smpl_faces = torch.stack(smpl_faces_lst)
-        in_tensor["T_normal_F"], in_tensor["T_normal_B"] = dataset.render_normal(batch_smpl_verts, batch_smpl_faces)
-        with torch.no_grad():
-            in_tensor["normal_F"], in_tensor["normal_B"] = normal_net.netG(in_tensor)
-        in_tensor["smpl_verts"] = batch_smpl_verts * torch.tensor([1., -1., 1.]).to(device)
-        in_tensor["smpl_faces"] = batch_smpl_faces[:, :, [0, 2, 1]]
-    else:
-        loop_smpl = tqdm(range(args.loop_smpl))
-        for i in loop_smpl:
-            per_loop_lst = []
-            optimizer_smpl.zero_grad()
-
-            N_body, N_pose = optimed_pose.shape[:2]
-            optimed_orient_mat = rot6d_to_rotmat(optimed_orient.view(-1, 6)).view(N_body, 1, 3, 3)
-            optimed_pose_mat = rot6d_to_rotmat(optimed_pose.view(-1, 6)).view(N_body, N_pose, 3, 3)
-            smpl_verts, smpl_landmarks, smpl_joints = dataset.smpl_model(
-                shape_params=optimed_betas,
-                expression_params=tensor2variable(data["exp"], device),
-                body_pose=optimed_pose_mat,
-                global_pose=optimed_orient_mat,
-                jaw_pose=tensor2variable(data["jaw_pose"], device),
-                left_hand_pose=tensor2variable(data["left_hand_pose"], device),
-                right_hand_pose=tensor2variable(data["right_hand_pose"], device),
-            )
-            smpl_verts = (smpl_verts + optimed_trans) * data["scale"]
-            smpl_joints = (smpl_joints + optimed_trans) * data["scale"] * torch.tensor([1.0, 1.0, -1.0]).to(device)
-
-            smpl_joints_3d = (smpl_joints[:, dataset.smpl_data.smpl_joint_ids_45_pixie, :] + 1.0) * 0.5
-            in_tensor["smpl_joint"] = smpl_joints[:, dataset.smpl_data.smpl_joint_ids_24_pixie, :]
-
-            ghum_lmks = data["landmark"][:, SMPLX_object.ghum_smpl_pairs[:, 0], :2].to(device)
-            ghum_conf = data["landmark"][:, SMPLX_object.ghum_smpl_pairs[:, 0], -1].to(device)
-            smpl_lmks = smpl_joints_3d[:, SMPLX_object.ghum_smpl_pairs[:, 1], :2]
-
-            in_tensor["T_normal_F"], in_tensor["T_normal_B"] = dataset.render_normal(
-                smpl_verts * torch.tensor([1.0, -1.0, -1.0]).to(device),
-                in_tensor["smpl_faces"]
-            )
-            T_mask_F, T_mask_B = dataset.render.get_image(type="mask", bg=bg_color)
-            with torch.no_grad():
-                in_tensor["normal_F"], in_tensor["normal_B"] = normal_net.netG(in_tensor, args.out_dir)
-
-            img_crop_path = osp.join(args.out_dir, cfg.name, "png", f"{sample_name}_normal_and_mask.png")
-            row1 = torch.cat([data["img_crop"][:, :3], data_b["img_crop"][:, :3]], dim=3)
-            row2 = torch.cat([(in_tensor['normal_F'].detach().cpu() + 1.0) * 0.5,
-                              (in_tensor['normal_B'].detach().cpu() + 1.0) * 0.5], dim=3)
-            row3 = torch.cat([in_tensor["mask"].unsqueeze(1).repeat(1, 3, 1, 1).detach().cpu(),
-                              in_tensor["mask_back"].unsqueeze(1).repeat(1, 3, 1, 1).detach().cpu()], dim=3)
-            final_tensor = torch.cat([row1, row2, row3], dim=2)
-            torchvision.utils.save_image(final_tensor, img_crop_path)
-
-            if cfg.sapiens.use:
-                in_tensor["normal_F"] = sapiens_normal_square
-
-            diff_F_smpl = torch.abs(in_tensor["T_normal_F"] - in_tensor["normal_F"])
-            diff_B_smpl = torch.abs(in_tensor["T_normal_B"] - in_tensor["normal_B"])
-            smpl_arr = torch.cat([T_mask_F, T_mask_B], dim=-1)
-            gt_arr = in_tensor["mask"].repeat(1, 1, 2)
-            diff_S = torch.abs(smpl_arr - gt_arr)
-            losses["silhouette"]["value"] = diff_S.mean()
-
-            cloth_overlap = diff_S.sum(dim=[1, 2]) / gt_arr.sum(dim=[1, 2])
-            cloth_overlap_flag = cloth_overlap > cfg.cloth_overlap_thres
-            losses["joint"]["weight"] = [10.0 if flag else 1.0 for flag in cloth_overlap_flag]
-
-            bg_value = in_tensor["T_normal_F"][0, 0, 0, 0]
-            smpl_arr_fake = torch.cat([
-                in_tensor["T_normal_F"][:, 0].ne(bg_value).float(),
-                in_tensor["T_normal_B"][:, 0].ne(bg_value).float()
-            ], dim=-1)
-            body_overlap = (gt_arr * smpl_arr_fake.gt(0.0)).sum(dim=[1, 2]) / smpl_arr_fake.gt(0.0).sum(dim=[1, 2])
-            body_overlap_mask = (gt_arr * smpl_arr_fake).unsqueeze(1)
-            body_overlap_flag = body_overlap < cfg.body_overlap_thres
-
-            if not cfg.sapiens.use:
-                losses["normal"]["value"] = (diff_F_smpl * body_overlap_mask[..., :512] +
-                                             diff_B_smpl * body_overlap_mask[..., 512:]).mean() / 2.0
-            else:
-                losses["normal"]["value"] = diff_F_smpl * body_overlap_mask[..., :512]
-
-            losses["silhouette"]["weight"] = [0 if flag else 1.0 for flag in body_overlap_flag]
-            occluded_idx = torch.where(body_overlap_flag)[0]
-            ghum_conf[occluded_idx] *= ghum_conf[occluded_idx] > 0.95
-            losses["joint"]["value"] = (torch.norm(ghum_lmks - smpl_lmks, dim=2) * ghum_conf).mean(dim=1)
-
-            smpl_loss = 0.0
-            pbar_desc = "Body Fitting -- "
-            for k in ["normal", "silhouette", "joint"]:
-                per_loop_loss = (losses[k]["value"] * torch.tensor(losses[k]["weight"]).to(device)).mean()
-                pbar_desc += f"{k}: {per_loop_loss:.3f} | "
-                smpl_loss += per_loop_loss
-            pbar_desc += f"Total: {smpl_loss:.3f}"
-            loose_str = ''.join([str(j) for j in cloth_overlap_flag.int().tolist()])
-            occlude_str = ''.join([str(j) for j in body_overlap_flag.int().tolist()])
-            pbar_desc += colored(f"| loose:{loose_str}, occluded:{occlude_str}", "yellow")
-            loop_smpl.set_description(pbar_desc)
-
-            if (i == args.loop_smpl - 1) and (not args.novis):
-                per_loop_lst.extend([
-                    in_tensor["image"],
-                    in_tensor["T_normal_F"],
-                    in_tensor["normal_F"],
-                    diff_S[:, :, :512].unsqueeze(1).repeat(1, 3, 1, 1)
-                ])
-                per_loop_lst.extend([
-                    in_tensor["image_back"],
-                    in_tensor["T_normal_B"],
-                    in_tensor["normal_B"],
-                    diff_S[:, :, 512:].unsqueeze(1).repeat(1, 3, 1, 1)
-                ])
-                per_data_lst.append(
-                    get_optim_grid_image(per_loop_lst, None, nrow=N_body * 2, type="smpl")
+                final_grafted_mesh_obj_v5 = MeshCleanProcess.run_face_grafting_pipeline(
+                    full_body_mesh_path=final_watertight_path,
+                    output_path=grafted_output_path_v5,
+                    smplx_face_mesh_path=original_smplx_face_path,
+                    body_simplification_target_faces=15000,
+                    debug_dir=debug_graft_dir_sample_v5
                 )
 
-            smpl_loss.backward()
-            optimizer_smpl.step()
-            scheduler_smpl.step(smpl_loss)
-        in_tensor["smpl_verts"] = smpl_verts * torch.tensor([1.0, 1.0, -1.0]).to(device)
-        in_tensor["smpl_faces"] = in_tensor["smpl_faces"][:, :, [0, 2, 1]]
-        if not args.novis:
-            per_data_lst[-1].save(osp.join(args.out_dir, cfg.name, f"png/{sample_name}_smpl.png"))
+                if final_grafted_mesh_obj_v5 and not final_grafted_mesh_obj_v5.is_empty:
+                    print(f"Final grafted mesh (v5) saved to {grafted_output_path_v5}")
+                    prefix_for_ply = f"{data['name']}" # Using data['name'] as the base prefix
+                    
+                    # Construct the full path for the .ply file
+                    # It will be in the same directory as the .obj ({args.out_dir}/{cfg.name}/obj/)
+                    ply_output_filename = f"{prefix_for_ply}_{idx}_full_soups.ply" # Using idx as per typical naming
+                    # If you strictly need "_0_" regardless of idx:
+                    # ply_output_filename = f"{prefix_for_ply}_0_full_soups.ply"
 
-    if not args.novis:
-        img_crop_path = osp.join(args.out_dir, cfg.name, "png", f"{sample_name}_crop.png")
-        torchvision.utils.save_image(
-            torch.cat([
-                data["img_crop"][:, :3],
-                (in_tensor['normal_F'].detach().cpu() + 1.0) * 0.5,
-                (in_tensor['normal_B'].detach().cpu() + 1.0) * 0.5
-            ], dim=3),
-            img_crop_path
-        )
+                    ply_output_path = osp.join(args.out_dir, cfg.name, "obj", ply_output_filename)
 
-        rgb_norm_F = blend_rgb_norm(in_tensor["normal_F"], data)
-        rgb_norm_B = blend_rgb_norm(in_tensor["normal_B"], data)
-        img_overlap_path = osp.join(args.out_dir, cfg.name, f"png/{sample_name}_overlap.png")
-        torchvision.utils.save_image(
-            torch.cat([data["img_raw"], rgb_norm_F, rgb_norm_B], dim=-1) / 255.,
-            img_overlap_path
-        )
+                    try:
+                        # final_grafted_mesh_obj_v5 is the trimesh.Trimesh object
+                        final_grafted_mesh_obj_v5.export(ply_output_path)
+                        print(f"Additionally saved final grafted mesh as .ply to {ply_output_path}")
+                    except Exception as e_ply_export:
+                        print(f"Error exporting final grafted mesh to .ply ({ply_output_path}): {e_ply_export}")
 
-    smpl_obj_lst = []
-    for idx in range(N_body):
-        smpl_obj = trimesh.Trimesh(
-            in_tensor["smpl_verts"].detach().cpu()[idx] * torch.tensor([1.0, -1.0, 1.0]),
-            in_tensor["smpl_faces"].detach().cpu()[0][:, [0, 2, 1]],
-            process=False,
-            maintains_order=True,
-        )
-        smpl_obj_path = f"{args.out_dir}/{cfg.name}/obj/{sample_name}_smpl_{idx:02d}.obj"
-        if not osp.exists(smpl_obj_path) or cfg.force_smpl_optim:
-            # smpl_obj.export(smpl_obj_path)
-            smpl_info = {
-                "betas": optimed_betas[idx].detach().cpu().unsqueeze(0),
-                "body_pose": rotation_matrix_to_angle_axis(optimed_pose_mat[idx].detach()).cpu().unsqueeze(0),
-                "global_orient": rotation_matrix_to_angle_axis(optimed_orient_mat[idx].detach()).cpu().unsqueeze(0),
-                "transl": optimed_trans[idx].detach().cpu(),
-                "expression": data["exp"][idx].cpu().unsqueeze(0),
-                "jaw_pose": rotation_matrix_to_angle_axis(data["jaw_pose"][idx]).cpu().unsqueeze(0),
-                "left_hand_pose": rotation_matrix_to_angle_axis(data["left_hand_pose"][idx]).cpu().unsqueeze(0),
-                "right_hand_pose": rotation_matrix_to_angle_axis(data["right_hand_pose"][idx]).cpu().unsqueeze(0),
-                "scale": data["scale"][idx].cpu(),
-            }
-            np.save(
-                smpl_obj_path.replace(".obj", ".npy"),
-                smpl_info,
-                allow_pickle=True,
-            )
-        smpl_obj_lst.append(smpl_obj)
-
-    del optimizer_smpl, optimed_betas, optimed_orient, optimed_pose, optimed_trans
-    torch.cuda.empty_cache()
-
-    # --- Clothing Refinement ---
-    per_data_lst = []
-    batch_smpl_verts = in_tensor["smpl_verts"].detach() * torch.tensor([1.0, -1.0, 1.0], device=device)
-    batch_smpl_faces = in_tensor["smpl_faces"].detach()[:, :, [0, 2, 1]]
-    in_tensor["depth_F"], in_tensor["depth_B"] = dataset.render_depth(batch_smpl_verts, batch_smpl_faces)
-    per_loop_lst = []
-    in_tensor["BNI_verts"] = []
-    in_tensor["BNI_faces"] = []
-    in_tensor["body_verts"] = []
-    in_tensor["body_faces"] = []
-
-    for idx in range(N_body):
-        final_path = f"{args.out_dir}/{cfg.name}/obj/{sample_name}_{idx}_full.obj"
-        side_mesh = smpl_obj_lst[idx].copy()
-        face_mesh = smpl_obj_lst[idx].copy()
-        hand_mesh = smpl_obj_lst[idx].copy()
-        smplx_mesh = smpl_obj_lst[idx].copy()
-
-        BNI_dict = save_normal_tensor(
-            in_tensor,
-            idx,
-            osp.join(args.out_dir, cfg.name, f"BNI/{sample_name}_{idx}"),
-            cfg.bni.thickness,
-        )
-        BNI_object = BNI(
-            dir_path=osp.join(args.out_dir, cfg.name, "BNI"),
-            name=sample_name,
-            BNI_dict=BNI_dict,
-            cfg=cfg.bni,
-            device=device
-        )
-        BNI_object.extract_surface(False)
-
-        in_tensor["body_verts"].append(torch.tensor(smpl_obj_lst[idx].vertices).float())
-        in_tensor["body_faces"].append(torch.tensor(smpl_obj_lst[idx].faces).long())
-
-        if cfg.bni.use_ifnet:
-            side_mesh_path = f"{args.out_dir}/{cfg.name}/obj/{sample_name}_{idx}_IF.obj"
-            side_mesh = apply_face_mask(side_mesh, ~SMPLX_object.smplx_eyeball_fid_mask)
-            in_tensor.update(
-                dataset.depth_to_voxel({
-                    "depth_F": BNI_object.F_depth.unsqueeze(0),
-                    "depth_B": BNI_object.B_depth.unsqueeze(0)
-                })
-            )
-            occupancies = VoxelGrid.from_mesh(side_mesh, cfg.vol_res, loc=[0, 0, 0], scale=2.0).data.transpose(2, 1, 0)
-            occupancies = np.flip(occupancies, axis=1)
-            in_tensor["body_voxels"] = torch.tensor(occupancies.copy()).float().unsqueeze(0).to(device)
-            with torch.no_grad():
-                sdf = ifnet.reconEngine(netG=ifnet.netG, batch=in_tensor)
-                verts_IF, faces_IF = ifnet.reconEngine.export_mesh(sdf)
-            if ifnet.clean_mesh_flag:
-                verts_IF, faces_IF = clean_mesh(verts_IF, faces_IF)
-            side_mesh = trimesh.Trimesh(verts_IF, faces_IF)
-            # side_mesh = remesh_laplacian(side_mesh, side_mesh_path)
-        else:
-            side_mesh = apply_vertex_mask(
-                side_mesh,
-                (SMPLX_object.front_flame_vertex_mask + SMPLX_object.smplx_mano_vertex_mask + SMPLX_object.eyeball_vertex_mask).eq(0).float(),
-            )
-            side_mesh = Meshes(
-                verts=[torch.tensor(side_mesh.vertices).float()],
-                faces=[torch.tensor(side_mesh.faces).long()],
-            ).to(device)
-            sm = SubdivideMeshes(side_mesh)
-            side_mesh = register(BNI_object.F_B_trimesh, sm(side_mesh), device)
-
-        side_verts = torch.tensor(side_mesh.vertices).float().to(device)
-        side_faces = torch.tensor(side_mesh.faces).long().to(device)
-        full_lst = []
-
-        if "face" in cfg.bni.use_smpl:
-            face_mesh = apply_vertex_mask(face_mesh, SMPLX_object.front_flame_vertex_mask)
-            if not face_mesh.is_empty:
-                face_mesh.vertices = face_mesh.vertices - np.array([0, 0, cfg.bni.thickness])
-                BNI_object.F_B_trimesh = part_removal(
-                    BNI_object.F_B_trimesh,
-                    face_mesh,
-                    cfg.bni.face_thres,
-                    device,
-                    smplx_mesh,
-                    region="face"
-                )
-                side_mesh = part_removal(
-                    side_mesh, face_mesh, cfg.bni.face_thres, device, smplx_mesh, region="face"
-                )
-                # face_mesh.export(f"{args.out_dir}/{cfg.name}/obj/{sample_name}_{idx}_face.obj")
-                full_lst += [face_mesh]
-
-        if "hand" in cfg.bni.use_smpl:
-            hand_mask = torch.zeros(SMPLX_object.smplx_verts.shape[0], )
-            if data['hands_visibility'][idx][0]:
-                mano_left_vid = np.unique(
-                    np.concatenate([
-                        SMPLX_object.smplx_vert_seg["leftHand"],
-                        SMPLX_object.smplx_vert_seg["leftHandIndex1"],
-                    ])
-                )
-                hand_mask.index_fill_(0, torch.tensor(mano_left_vid), 1.0)
-            if data['hands_visibility'][idx][1]:
-                mano_right_vid = np.unique(
-                    np.concatenate([
-                        SMPLX_object.smplx_vert_seg["rightHand"],
-                        SMPLX_object.smplx_vert_seg["rightHandIndex1"],
-                    ])
-                )
-                hand_mask.index_fill_(0, torch.tensor(mano_right_vid), 1.0)
-            hand_mesh = apply_vertex_mask(hand_mesh, hand_mask)
-            if not hand_mesh.is_empty:
-                BNI_object.F_B_trimesh = part_removal(
-                    BNI_object.F_B_trimesh,
-                    hand_mesh,
-                    cfg.bni.hand_thres,
-                    device,
-                    smplx_mesh,
-                    region="hand"
-                )
-                side_mesh = part_removal(
-                    side_mesh, hand_mesh, cfg.bni.hand_thres, device, smplx_mesh, region="hand"
-                )
-                # hand_mesh.export(f"{args.out_dir}/{cfg.name}/obj/{sample_name}_{idx}_hand.obj")
-                full_lst += [hand_mesh]
-
-        full_lst += [BNI_object.F_B_trimesh]
-        side_mesh = part_removal(
-            side_mesh, sum(full_lst), 2e-2, device, smplx_mesh, region="", clean=False
-        )
-        full_lst += [side_mesh]
-
-        # BNI_object.F_B_trimesh.export(
-        #     f"{args.out_dir}/{cfg.name}/obj/{sample_name}_{idx}_BNI.obj"
-        # )
-        # side_mesh.export(f"{args.out_dir}/{cfg.name}/obj/{sample_name}_{idx}_side.obj")
-
-        if cfg.bni.use_poisson:
-            final_mesh = poisson(
-                sum(full_lst),
-                final_path,
-                cfg.bni.poisson_depth,
-            )
-            print(
-                colored(
-                    f"\n Poisson completion to {Format.start} {final_path} {Format.end}",
-                    "yellow"
-                )
-            )
-        else:
-            final_mesh = sum(full_lst)
-            # final_mesh.export(final_path)
-
-        if not args.novis:
-            dataset.render.load_meshes(final_mesh.vertices, final_mesh.faces)
-            rotate_recon_lst = dataset.render.get_image(cam_type="four", bg=bg_color)
-            per_loop_lst_front = [in_tensor['image'][idx:idx + 1]] + rotate_recon_lst
-            per_loop_lst_back  = [in_tensor['image_back'][idx:idx + 1]] + rotate_recon_lst
-
-            # if cfg.bni.texture_src == 'image':
-            #     final_mesh.export(final_path)
-            # elif cfg.bni.texture_src == 'SD':
-            #     pass
-
-            if len(per_loop_lst_front) > 0 and len(per_loop_lst_back) > 0:
-                cloth_front = get_optim_grid_image(per_loop_lst_front, None, nrow=5, type="cloth_front")
-                bg_color = bg_color.strip('"').strip("'")
-                cloth_front_path = osp.join(args.out_dir, cfg.name, f"png/{sample_name}_cloth_front_{bg_color}.png")
-                cloth_front.save(cloth_front_path)
-                cloth_back = get_optim_grid_image(per_loop_lst_back, None, nrow=5, type="cloth_back")
-                cloth_back_path = osp.join(args.out_dir, cfg.name, f"png/{sample_name}_cloth_back_{bg_color}.png")
-                cloth_back.save(cloth_back_path)
-
-            in_tensor["BNI_verts"].append(torch.tensor(final_mesh.vertices).float())
-            in_tensor["BNI_faces"].append(torch.tensor(final_mesh.faces).long())
-            os.makedirs(osp.join(args.out_dir, cfg.name, "vid"), exist_ok=True)
-            in_tensor["uncrop_param"] = data["uncrop_param"]
-            in_tensor["img_raw"] = data["img_raw"]
-            torch.save(
-                in_tensor, osp.join(args.out_dir, cfg.name, f"vid/{sample_name}_in_tensor.pt")
-            )
-
-    # final_watertight_path = f"{args.out_dir}/{cfg.name}/obj/{sample_name}_{idx}_full_wt.obj"
-    # watertightifier = MeshWatertightifier(final_path, final_watertight_path)
-    # result = watertightifier.process(reconstruction_method='poisson', depth=10)
-    # if result:
-    #     print("The mesh is watertight and has been saved successfully!")
-    # else:
-    #     print("The mesh is not watertight. Further inspection may be needed.")
-
+                else:
+                    print(f"Failed to create valid grafted mesh (v5) for {grafted_output_path_v5}")
+        
+        else: # This 'else' corresponds to 'if result:' from watertightifier.process
+            print(f"Failed to create or save watertight base mesh from {final_path}. Skipping grafting process.")
 
 def main():
     args = parse_args()
@@ -1027,14 +789,14 @@ def main():
     pbar = tqdm(dataset_red)
     for data, data_b in pbar:
         pbar.set_description(f"{data['name']}")
-        process_sample(data, data_b, args, cfg, device, normal_net, sapiens_normal_net, ifnet, SMPLX_object, dataset_red, bg_color="red")
+        process_sample_combined(data, data_b, args, cfg, device, normal_net, sapiens_normal_net, ifnet, SMPLX_object, dataset_red, bg_color="red")
     
     torch.cuda.empty_cache()
     
     pbar = tqdm(dataset_blue)
     for data, data_b in pbar:
         pbar.set_description(f"{data['name']}")
-        process_sample_second_pass(data, data_b, args, cfg, device, normal_net, sapiens_normal_net, ifnet, SMPLX_object, dataset_blue, bg_color="blue")
+        process_sample_combined(data, data_b, args, cfg, device, normal_net, sapiens_normal_net, ifnet, SMPLX_object, dataset_blue, bg_color="blue")
 
 if __name__ == "__main__":
     main()

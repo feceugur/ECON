@@ -932,6 +932,10 @@ class SMPLHLayer(SMPLH):
 
         return output
 
+# Assume necessary imports like torch, nn, Tensor, Optional, np, os, osp, pickle, etc.
+# Assume SMPLH, lbs, find_dynamic_lmk_idx_and_bcoords, vertices2landmarks,
+# Struct, to_tensor, to_np, find_joint_kin_chain, VERTEX_IDS, SMPLXOutput
+# are defined elsewhere in the file or imported correctly.
 
 class SMPLX(SMPLH):
     """
@@ -944,10 +948,14 @@ class SMPLX(SMPLH):
 
     NUM_BODY_JOINTS = SMPLH.NUM_BODY_JOINTS    # 21
     NUM_HAND_JOINTS = 15
-    NUM_FACE_JOINTS = 3
-    NUM_JOINTS = NUM_BODY_JOINTS + 2 * NUM_HAND_JOINTS + NUM_FACE_JOINTS
-    EXPRESSION_SPACE_DIM = 100
+    NUM_FACE_JOINTS = 3 # Jaw, left eye, right eye
+    NUM_JOINTS = NUM_BODY_JOINTS + 2 * NUM_HAND_JOINTS + NUM_FACE_JOINTS # 21 + 30 + 3 = 54
+    EXPRESSION_SPACE_DIM = 100 # Max possible expression coeffs
     NECK_IDX = 12
+    # Assuming NUM_LANDMARKS might be needed by vertices2landmarks or joint concatenation logic
+    # If landmarks are concatenated, the final joint count will be NUM_JOINTS + NUM_LANDMARKS
+    # Let's define a standard number, though it might depend on the specific landmark set used.
+    NUM_LANDMARKS = 68 # Standard face landmarks, adjust if different
 
     def __init__(
         self,
@@ -970,49 +978,7 @@ class SMPLX(SMPLH):
         ext: str = "npz",
         **kwargs,
     ) -> None:
-        """SMPLX model constructor
-
-        Parameters
-        ----------
-        model_path: str
-            The path to the folder or to the file where the model
-            parameters are stored
-        num_expression_coeffs: int, optional
-            Number of expression components to use
-            (default = 10).
-        create_expression: bool, optional
-            Flag for creating a member variable for the expression space
-            (default = True).
-        expression: torch.tensor, optional, Bx10
-            The default value for the expression member variable.
-            (default = None)
-        create_jaw_pose: bool, optional
-            Flag for creating a member variable for the jaw pose.
-            (default = False)
-        jaw_pose: torch.tensor, optional, Bx3
-            The default value for the jaw pose variable.
-            (default = None)
-        create_leye_pose: bool, optional
-            Flag for creating a member variable for the left eye pose.
-            (default = False)
-        leye_pose: torch.tensor, optional, Bx10
-            The default value for the left eye pose variable.
-            (default = None)
-        create_reye_pose: bool, optional
-            Flag for creating a member variable for the right eye pose.
-            (default = False)
-        reye_pose: torch.tensor, optional, Bx10
-            The default value for the right eye pose variable.
-            (default = None)
-        use_face_contour: bool, optional
-            Whether to compute the keypoints that form the facial contour
-        batch_size: int, optional
-            The batch size used for creating the member variables
-        gender: str, optional
-            Which gender to load
-        dtype: torch.dtype
-            The data type for the created variables
-        """
+        """SMPLX model constructor (parameters as before)"""
 
         # Load the model
         if osp.isdir(model_path):
@@ -1030,21 +996,37 @@ class SMPLX(SMPLH):
         else:
             raise ValueError("Unknown extension: {}".format(ext))
 
+        # Compatibility step for potentially sparse J_regressor
+        if 'J_regressor' in model_data and not isinstance(model_data['J_regressor'], np.ndarray):
+            model_data['J_regressor'] = model_data['J_regressor'].toarray()
+
         data_struct = Struct(**model_data)
 
+        # Pass necessary kwargs to SMPLH/base class
+        # Filter kwargs relevant to the base class constructor to avoid unexpected argument errors
+        # (Assuming base class signature is known or handled appropriately)
+        base_kwargs = {k: v for k, v in kwargs.items() if k in [
+             'use_pca', 'num_pca_comps', 'num_betas', 'flat_hand_mean',
+             'vertex_ids', 'joint_mapper', 'vertex_joint_selector', # Add others if needed by SMPLH
+             'data_struct' # Pass data_struct if SMPLH needs it directly
+             ]}
+        # Ensure required args for SMPLH are present, potentially adding defaults if not in kwargs
+        base_kwargs.setdefault('vertex_ids', VERTEX_IDS.get("smplx")) # Use .get for safety
+
         super(SMPLX, self).__init__(
-            model_path=model_path,
+            model_path=model_path, # Pass along for potential use in base class
             kid_template_path=kid_template_path,
-            data_struct=data_struct,
+            data_struct=data_struct, # Pass the loaded data struct
             dtype=dtype,
-            batch_size=batch_size,
-            vertex_ids=VERTEX_IDS["smplx"],
+            batch_size=batch_size, # Pass batch_size
             gender=gender,
             age=age,
             ext=ext,
-            **kwargs,
+            **base_kwargs, # Pass filtered kwargs
         )
 
+        # SMPL-X specific initializations
+        # Ensure data from struct is converted correctly
         lmk_faces_idx = data_struct.lmk_faces_idx
         self.register_buffer("lmk_faces_idx", torch.tensor(lmk_faces_idx, dtype=torch.long))
         lmk_bary_coords = data_struct.lmk_bary_coords
@@ -1052,104 +1034,147 @@ class SMPLX(SMPLH):
 
         self.use_face_contour = use_face_contour
         if self.use_face_contour:
-            dynamic_lmk_faces_idx = data_struct.dynamic_lmk_faces_idx
+            # Ensure these exist in the model file if use_face_contour is True
+            if not hasattr(data_struct, 'dynamic_lmk_faces_idx') or not hasattr(data_struct, 'dynamic_lmk_bary_coords'):
+                 raise ValueError("use_face_contour=True but dynamic landmark data not found in model file.")
+
+            dynamic_lmk_faces_idx = np.array(data_struct.dynamic_lmk_faces_idx)
             dynamic_lmk_faces_idx = torch.tensor(dynamic_lmk_faces_idx, dtype=torch.long)
             self.register_buffer("dynamic_lmk_faces_idx", dynamic_lmk_faces_idx)
 
             dynamic_lmk_bary_coords = data_struct.dynamic_lmk_bary_coords
-            dynamic_lmk_bary_coords = torch.tensor(dynamic_lmk_bary_coords, dtype=dtype)
+            dynamic_lmk_bary_coords = torch.tensor(np.array(dynamic_lmk_bary_coords), dtype=dtype)
             self.register_buffer("dynamic_lmk_bary_coords", dynamic_lmk_bary_coords)
+
+            # Ensure parents buffer is already registered by base class or here
+            if not hasattr(self, 'parents'):
+                 # This should typically be handled by the base class init
+                 self.register_buffer('parents', torch.tensor(data_struct.kintree_table[0], dtype=torch.long))
 
             neck_kin_chain = find_joint_kin_chain(self.NECK_IDX, self.parents)
             self.register_buffer("neck_kin_chain", torch.tensor(neck_kin_chain, dtype=torch.long))
 
+        # Create parameters for face poses if requested
         if create_jaw_pose:
-            if jaw_pose is None:
-                default_jaw_pose = torch.zeros([batch_size, 3], dtype=dtype)
-            else:
-                default_jaw_pose = torch.tensor(jaw_pose, dtype=dtype)
-            jaw_pose_param = nn.Parameter(default_jaw_pose, requires_grad=True)
-            self.register_parameter("jaw_pose", jaw_pose_param)
+            default_jaw_pose = torch.zeros([batch_size, 3], dtype=dtype) if jaw_pose is None else torch.tensor(jaw_pose, dtype=dtype)
+            self.register_parameter("jaw_pose", nn.Parameter(default_jaw_pose, requires_grad=True))
 
         if create_leye_pose:
-            if leye_pose is None:
-                default_leye_pose = torch.zeros([batch_size, 3], dtype=dtype)
-            else:
-                default_leye_pose = torch.tensor(leye_pose, dtype=dtype)
-            leye_pose_param = nn.Parameter(default_leye_pose, requires_grad=True)
-            self.register_parameter("leye_pose", leye_pose_param)
+            default_leye_pose = torch.zeros([batch_size, 3], dtype=dtype) if leye_pose is None else torch.tensor(leye_pose, dtype=dtype)
+            self.register_parameter("leye_pose", nn.Parameter(default_leye_pose, requires_grad=True))
 
         if create_reye_pose:
-            if reye_pose is None:
-                default_reye_pose = torch.zeros([batch_size, 3], dtype=dtype)
-            else:
-                default_reye_pose = torch.tensor(reye_pose, dtype=dtype)
-            reye_pose_param = nn.Parameter(default_reye_pose, requires_grad=True)
-            self.register_parameter("reye_pose", reye_pose_param)
+            default_reye_pose = torch.zeros([batch_size, 3], dtype=dtype) if reye_pose is None else torch.tensor(reye_pose, dtype=dtype)
+            self.register_parameter("reye_pose", nn.Parameter(default_reye_pose, requires_grad=True))
 
-        shapedirs = data_struct.shapedirs
-        if len(shapedirs.shape) < 3:
-            shapedirs = shapedirs[:, :, None]
-        if shapedirs.shape[-1] < self.SHAPE_SPACE_DIM + self.EXPRESSION_SPACE_DIM:
-            # print(f'WARNING: You are using a {self.name()} model, with only'
-            #       ' 10 shape and 10 expression coefficients.')
-            expr_start_idx = 10
-            expr_end_idx = 20
-            num_expression_coeffs = min(num_expression_coeffs, 10)
+        # Handle expression blend shapes from shapedirs
+        # Assumes self.shapedirs (shape part) is already registered by base class
+        shapedirs_full = to_tensor(data_struct.shapedirs, dtype=dtype) # Load the full shapedirs
+        # Ensure shapedirs is 3D [num_vertices, 3, num_shapes]
+        if len(shapedirs_full.shape) < 3:
+             shapedirs_full = shapedirs_full[:, :, None]
+
+        total_shape_dims = shapedirs_full.shape[-1]
+        # Assumes self.SHAPE_SPACE_DIM is correctly defined (e.g., 10 or 300)
+        available_expr_dims = total_shape_dims - self.SHAPE_SPACE_DIM
+        if available_expr_dims < 0:
+             print(f"Warning: Model shapedirs have {total_shape_dims} modes, expected at least {self.SHAPE_SPACE_DIM} for shape.")
+             available_expr_dims = 0
+
+        # Determine the number of expression coefficients to actually use
+        if num_expression_coeffs > self.EXPRESSION_SPACE_DIM:
+             print(f"Warning: Requested {num_expression_coeffs} expression coeffs, exceeding max {self.EXPRESSION_SPACE_DIM}. Clamping.")
+             num_expression_coeffs = self.EXPRESSION_SPACE_DIM
+
+        if available_expr_dims < num_expression_coeffs:
+            print(f"Warning: Requested {num_expression_coeffs} expression coeffs, but model only provides {available_expr_dims} beyond shape space. Using {available_expr_dims}.")
+            self._num_expression_coeffs = available_expr_dims
         else:
+            self._num_expression_coeffs = num_expression_coeffs
+
+        # Register the expression blend shapes buffer if there are any to use
+        if self._num_expression_coeffs > 0:
             expr_start_idx = self.SHAPE_SPACE_DIM
-            expr_end_idx = self.SHAPE_SPACE_DIM + num_expression_coeffs
-            num_expression_coeffs = min(num_expression_coeffs, self.EXPRESSION_SPACE_DIM)
+            expr_end_idx = self.SHAPE_SPACE_DIM + self._num_expression_coeffs
+            expr_dirs = shapedirs_full[:, :, expr_start_idx:expr_end_idx]
+            self.register_buffer("expr_dirs", expr_dirs) # Already a tensor
+        else:
+            # Register an empty buffer if no expression blend shapes are used/available
+            # Ensure v_template exists from base class init
+            if not hasattr(self, 'v_template'):
+                 self.register_buffer('v_template', to_tensor(data_struct.v_template, dtype=dtype))
+            self.register_buffer("expr_dirs", torch.empty((self.v_template.shape[0], 3, 0), dtype=dtype))
 
-        self._num_expression_coeffs = num_expression_coeffs
 
-        expr_dirs = shapedirs[:, :, expr_start_idx:expr_end_idx]
-        self.register_buffer("expr_dirs", to_tensor(to_np(expr_dirs), dtype=dtype))
-
-        if create_expression:
+        # Create expression parameter if requested and possible
+        if create_expression and self._num_expression_coeffs > 0:
             if expression is None:
-                default_expression = torch.zeros([batch_size, self.num_expression_coeffs],
-                                                 dtype=dtype)
+                default_expression = torch.zeros([batch_size, self.num_expression_coeffs], dtype=dtype)
             else:
-                default_expression = torch.tensor(expression, dtype=dtype)
-            expression_param = nn.Parameter(default_expression, requires_grad=True)
-            self.register_parameter("expression", expression_param)
+                # Ensure provided expression matches the number of coeffs being used
+                expression = torch.tensor(expression, dtype=dtype)
+                if expression.shape[-1] != self.num_expression_coeffs:
+                     # Adjust shape if possible, or raise error
+                     if expression.shape[-1] > self.num_expression_coeffs:
+                         print(f"Warning: Provided expression has {expression.shape[-1]} coeffs, using first {self.num_expression_coeffs}.")
+                         expression = expression[:, :self.num_expression_coeffs]
+                     else: # expression.shape[-1] < self.num_expression_coeffs
+                         raise ValueError(f"Provided expression shape {expression.shape} has fewer coeffs than requested {self.num_expression_coeffs}")
+                default_expression = expression
+            self.register_parameter("expression", nn.Parameter(default_expression, requires_grad=True))
+        elif create_expression and self._num_expression_coeffs == 0:
+             print("Warning: create_expression=True but num_expression_coeffs is 0. No expression parameter created.")
+
 
     def name(self) -> str:
         return "SMPL-X"
 
     @property
     def num_expression_coeffs(self):
+        # Returns the *actual* number of expression coefficients being used
         return self._num_expression_coeffs
 
     def create_mean_pose(self, data_struct, flat_hand_mean=False):
-        # Create the array for the mean pose. If flat_hand is false, then use
-        # the mean that is given by the data, rather than the flat open hand
+        # Overwrite base class mean pose to include face joints
+        # Ensure base class has run its __init__ first if it sets hand means
         global_orient_mean = torch.zeros([3], dtype=self.dtype)
         body_pose_mean = torch.zeros([self.NUM_BODY_JOINTS * 3], dtype=self.dtype)
         jaw_pose_mean = torch.zeros([3], dtype=self.dtype)
         leye_pose_mean = torch.zeros([3], dtype=self.dtype)
         reye_pose_mean = torch.zeros([3], dtype=self.dtype)
 
+        # Use hand means potentially set by base class __init__
+        left_hand_mean = self.left_hand_mean if hasattr(self, 'left_hand_mean') else np.zeros(self.NUM_HAND_JOINTS * 3)
+        right_hand_mean = self.right_hand_mean if hasattr(self, 'right_hand_mean') else np.zeros(self.NUM_HAND_JOINTS * 3)
+
         pose_mean = np.concatenate(
             [
-                global_orient_mean,
-                body_pose_mean,
-                jaw_pose_mean,
-                leye_pose_mean,
-                reye_pose_mean,
-                self.left_hand_mean,
-                self.right_hand_mean,
+                to_np(global_orient_mean),
+                to_np(body_pose_mean),
+                to_np(jaw_pose_mean),
+                to_np(leye_pose_mean),
+                to_np(reye_pose_mean),
+                left_hand_mean,
+                right_hand_mean,
             ],
             axis=0,
         )
-
         return pose_mean
 
     def extra_repr(self):
-        msg = super(SMPLX, self).extra_repr()
-        msg = [msg, f"Number of Expression Coefficients: {self.num_expression_coeffs}"]
-        return "\n".join(msg)
+        # Assumes base class extra_repr exists
+        msg_list = [super(SMPLX, self).extra_repr()]
+        msg_list.append(f"Number of Expression Coefficients: {self.num_expression_coeffs}")
+        if hasattr(self, 'expression'):
+             msg_list.append(f"Expression Parameter Created: True")
+        if hasattr(self, 'jaw_pose'):
+             msg_list.append(f"Jaw Pose Parameter Created: True")
+        if hasattr(self, 'leye_pose'):
+             msg_list.append(f"Left Eye Pose Parameter Created: True")
+        if hasattr(self, 'reye_pose'):
+             msg_list.append(f"Right Eye Pose Parameter Created: True")
+        msg_list.append(f"Using Face Contour Landmarks: {self.use_face_contour}")
+        return "\n".join(msg_list)
 
     def forward(
         self,
@@ -1165,228 +1190,257 @@ class SMPLX(SMPLH):
         reye_pose: Optional[Tensor] = None,
         return_verts: bool = True,
         return_full_pose: bool = False,
+        return_joint_transformation: bool = False, # Added back
+        return_vertex_transformation: bool = False, # Added back
         pose2rot: bool = True,
-        return_joint_transformation: bool = False,
-        return_vertex_transformation: bool = False,
-        pose_type: str = 'posed',
         **kwargs,
     ) -> SMPLXOutput:
         """
-        Forward pass for the SMPLX model
+        Forward pass for the SMPLX model (parameters mostly as before)
 
-            Parameters
-            ----------
-            global_orient: torch.tensor, optional, shape Bx3
-                If given, ignore the member variable and use it as the global
-                rotation of the body. Useful if someone wishes to predicts this
-                with an external model. (default=None)
-            betas: torch.tensor, optional, shape BxN_b
-                If given, ignore the member variable `betas` and use it
-                instead. For example, it can used if shape parameters
-                `betas` are predicted from some external model.
-                (default=None)
-            expression: torch.tensor, optional, shape BxN_e
-                If given, ignore the member variable `expression` and use it
-                instead. For example, it can used if expression parameters
-                `expression` are predicted from some external model.
-            body_pose: torch.tensor, optional, shape Bx(J*3)
-                If given, ignore the member variable `body_pose` and use it
-                instead. For example, it can used if someone predicts the
-                pose of the body joints are predicted from some external model.
-                It should be a tensor that contains joint rotations in
-                axis-angle format. (default=None)
-            left_hand_pose: torch.tensor, optional, shape BxP
-                If given, ignore the member variable `left_hand_pose` and
-                use this instead. It should either contain PCA coefficients or
-                joint rotations in axis-angle format.
-            right_hand_pose: torch.tensor, optional, shape BxP
-                If given, ignore the member variable `right_hand_pose` and
-                use this instead. It should either contain PCA coefficients or
-                joint rotations in axis-angle format.
-            jaw_pose: torch.tensor, optional, shape Bx3
-                If given, ignore the member variable `jaw_pose` and
-                use this instead. It should either joint rotations in
-                axis-angle format.
-            transl: torch.tensor, optional, shape Bx3
-                If given, ignore the member variable `transl` and use it
-                instead. For example, it can used if the translation
-                `transl` is predicted from some external model.
-                (default=None)
-            return_verts: bool, optional
-                Return the vertices. (default=True)
-            return_full_pose: bool, optional
-                Returns the full axis-angle pose vector (default=False)
-
-            Returns
-            -------
-                output: ModelOutput
-                A named tuple of type `ModelOutput`
+        Adds:
+            return_joint_transformation: bool, optional
+                If True, returns the transformations of the joints
+                (default=False)
+            return_vertex_transformation: bool, optional
+                If True, returns the transformations of the vertices
+                (default=False)
         """
+        # Get device and dtype from a registered buffer (e.g., v_template)
+        # Assumes v_template is registered by the base class or this class's init
+        device = self.v_template.device
+        dtype = self.v_template.dtype
 
-        # If no shape and pose parameters are passed along, then use the
-        # ones from the module
-        global_orient = (global_orient if global_orient is not None else self.global_orient)
-        body_pose = body_pose if body_pose is not None else self.body_pose
-        betas = betas if betas is not None else self.betas
+        # --- Parameter Handling & Batch Size Determination ---
+        # Store provided arguments
+        provided_args = {
+            'betas': betas, 'global_orient': global_orient, 'body_pose': body_pose,
+            'left_hand_pose': left_hand_pose, 'right_hand_pose': right_hand_pose,
+            'transl': transl, 'expression': expression, 'jaw_pose': jaw_pose,
+            'leye_pose': leye_pose, 'reye_pose': reye_pose
+        }
 
-        left_hand_pose = (left_hand_pose if left_hand_pose is not None else self.left_hand_pose)
-        right_hand_pose = (right_hand_pose if right_hand_pose is not None else self.right_hand_pose)
-        jaw_pose = jaw_pose if jaw_pose is not None else self.jaw_pose
-        leye_pose = leye_pose if leye_pose is not None else self.leye_pose
-        reye_pose = reye_pose if reye_pose is not None else self.reye_pose
-        expression = expression if expression is not None else self.expression
+        # Determine batch size robustly
+        batch_size = -1
+        inferred_from = None
+        for name, arg in provided_args.items():
+            if arg is not None:
+                current_bs = arg.shape[0]
+                if batch_size == -1:
+                    batch_size = current_bs
+                    inferred_from = name
+                elif batch_size != current_bs:
+                    raise ValueError(f"Inconsistent batch sizes found: {name} has {current_bs}, but {inferred_from} has {batch_size}")
 
-        apply_trans = transl is not None or hasattr(self, "transl")
-        if transl is None:
-            if hasattr(self, "transl"):
-                transl = self.transl
+        # If no inputs provided, try to infer from registered parameters
+        if batch_size == -1:
+             # Check parameters that are likely to exist and be batched
+             param_check_order = ['betas', 'global_orient', 'body_pose', 'expression', 'jaw_pose', 'leye_pose', 'reye_pose', 'left_hand_pose', 'right_hand_pose', 'transl']
+             for name in param_check_order:
+                 if hasattr(self, name):
+                     param = getattr(self, name)
+                     # Check if it's a Parameter or Tensor and has a batch dimension
+                     if isinstance(param, (nn.Parameter, Tensor)) and param.dim() > 0:
+                         batch_size = param.shape[0]
+                         inferred_from = f"parameter self.{name}"
+                         break
+             if batch_size == -1: # Fallback if no parameters exist or are suitable
+                 batch_size = 1 # Default to 1 if nothing else is available
+                 inferred_from = "default"
+        # print(f"Inferred batch size: {batch_size} from {inferred_from}") # Optional debug print
 
+        # Helper to get parameters
+        def get_param(name, default_shape):
+            passed_value = provided_args.get(name)
+            if passed_value is not None:
+                # Ensure correct batch size if passed
+                if passed_value.shape[0] != batch_size:
+                     # This should ideally be caught earlier, but double-check
+                     raise ValueError(f"Input {name} has wrong batch size {passed_value.shape[0]}, expected {batch_size}")
+                return passed_value.to(device=device, dtype=dtype) # Ensure device/dtype
+            elif hasattr(self, name):
+                param = getattr(self, name)
+                # Ensure param is on the correct device/dtype
+                param = param.to(device=device, dtype=dtype)
+                # Expand parameter batch dim if needed (e.g., if model batch_size=1 but input implies larger batch)
+                if param.shape[0] == 1 and batch_size > 1:
+                    param = param.expand(batch_size, *param.shape[1:])
+                elif param.shape[0] != batch_size:
+                     # This might happen if model was created with batch_size > 1 and input implies batch_size = 1
+                     # Or if model batch size doesn't match inferred batch size from other inputs
+                     print(f"Warning: Parameter self.{name} batch size {param.shape[0]} doesn't match inferred batch size {batch_size}. Using parameter's first entry expanded.")
+                     # Take first slice along batch dim and expand
+                     param = param[0:1].expand(batch_size, *param.shape[1:])
+                return param
+            else:
+                # Create default zero tensor only if parameter doesn't exist
+                # print(f"Creating default tensor for {name}") # Optional debug print
+                return torch.zeros(default_shape, dtype=dtype, device=device)
+
+        # --- Get All Parameters ---
+        # Shape and Expression
+        # Assumes self.num_betas is defined (likely by base class)
+        betas = get_param("betas", (batch_size, self.num_betas))
+        # Handle expression only if it's supposed to exist
+        if self.num_expression_coeffs > 0:
+            expression = get_param("expression", (batch_size, self.num_expression_coeffs))
+            # Clamp expression values if needed (optional, depends on use case)
+            # expression = torch.clamp(expression, -expression_range, expression_range)
+        else:
+            # Create a zero tensor placeholder if no expressions are used
+            expression = torch.zeros((batch_size, 0), dtype=dtype, device=device)
+
+        # Pose Parameters
+        global_orient = get_param("global_orient", (batch_size, 3))
+        body_pose = get_param("body_pose", (batch_size, self.NUM_BODY_JOINTS * 3))
+        jaw_pose = get_param("jaw_pose", (batch_size, 3))
+        leye_pose = get_param("leye_pose", (batch_size, 3))
+        reye_pose = get_param("reye_pose", (batch_size, 3))
+
+        # Hand Poses (Handle PCA)
+        # Assumes self.use_pca and self.num_pca_comps are defined (likely by base class)
+        hand_pose_dim = self.num_pca_comps if self.use_pca else self.NUM_HAND_JOINTS * 3
+        left_hand_pose_input = get_param("left_hand_pose", (batch_size, hand_pose_dim))
+        right_hand_pose_input = get_param("right_hand_pose", (batch_size, hand_pose_dim))
+
+        # Apply PCA transformation if needed (assuming input is PCA coeffs)
         if self.use_pca:
-            left_hand_pose = torch.einsum("bi,ij->bj", [left_hand_pose, self.left_hand_components])
-            right_hand_pose = torch.einsum(
-                "bi,ij->bj", [right_hand_pose, self.right_hand_components]
-            )
+            # Assumes self.left_hand_components and self.right_hand_components are registered buffers
+            # Ensure components are on the correct device/dtype
+            left_hand_components = self.left_hand_components.to(device=device, dtype=dtype)
+            right_hand_components = self.right_hand_components.to(device=device, dtype=dtype)
+            # PCA coeffs to axis-angle
+            left_hand_pose = torch.einsum('bi,ij->bj', left_hand_pose_input, left_hand_components)
+            right_hand_pose = torch.einsum('bi,ij->bj', right_hand_pose_input, right_hand_components)
+            # Add hand mean pose if necessary (often PCA is relative to mean)
+            # Check if base class handles mean pose addition or if it should be done here
+            # if hasattr(self, 'left_hand_mean_tensor'): # Example check
+            #     left_hand_pose = left_hand_pose + self.left_hand_mean_tensor.to(device=device, dtype=dtype)
+            #     right_hand_pose = right_hand_pose + self.right_hand_mean_tensor.to(device=device, dtype=dtype)
+        else:
+            left_hand_pose = left_hand_pose_input
+            right_hand_pose = right_hand_pose_input
 
-        full_pose = torch.cat(
-            [
-                global_orient,
-                body_pose,
-                jaw_pose,
-                leye_pose,
-                reye_pose,
-                left_hand_pose,
-                right_hand_pose,
-            ],
-            dim=1,
+        # Translation
+        transl = get_param("transl", (batch_size, 3))
+        # Determine if translation should be applied based on input or existence of self.transl
+        apply_trans = provided_args['transl'] is not None or hasattr(self, "transl")
+
+        # --- Prepare for LBS ---
+        # Concatenate all pose parameters
+        full_pose = torch.cat([
+            global_orient, body_pose, jaw_pose,
+            leye_pose, reye_pose, left_hand_pose, right_hand_pose
+        ], dim=1)
+
+        # Concatenate shape and expression components
+        shape_components = torch.cat([betas, expression], dim=-1)
+        # Concatenate shape and expression blend shapes
+        # Assumes self.shapedirs (shape part) is registered buffer
+        # Ensure expr_dirs buffer is on the correct device/dtype
+        expr_dirs = self.expr_dirs.to(device=device, dtype=dtype)
+        shapedirs = torch.cat([self.shapedirs, expr_dirs], dim=-1)
+
+        # --- Call LBS ---
+        # Decide if transformations are needed based on flags
+        return_transformations = return_joint_transformation or return_vertex_transformation
+        # Assumes lbs function is available and handles the 'return_transformation' argument
+        lbs_output = lbs(
+            betas=shape_components, # Pass combined shape+expression betas
+            pose=full_pose,
+            v_template=self.v_template,
+            shapedirs=shapedirs, # Pass combined shape+expression dirs
+            posedirs=self.posedirs,
+            J_regressor=self.J_regressor,
+            parents=self.parents,
+            lbs_weights=self.lbs_weights,
+            pose2rot=pose2rot,
+            return_transformation=return_transformations,
         )
 
-        if pose_type == "t-pose":
-            full_pose *= 0.0
-        elif pose_type == "a-pose":
-            body_pose = torch.zeros_like(body_pose).view(body_pose.shape[0], -1, 3)
-            body_pose[:, 15] = torch.tensor([0., 0., -45 * np.pi / 180.])
-            body_pose[:, 16] = torch.tensor([0., 0., 45 * np.pi / 180.])
-            body_pose = body_pose.view(body_pose.shape[0], -1)
-
-            full_pose = torch.cat(
-                [
-                    global_orient * 0.,
-                    body_pose,
-                    jaw_pose * 0.,
-                    leye_pose * 0.,
-                    reye_pose * 0.,
-                    left_hand_pose * 0.,
-                    right_hand_pose * 0.,
-                ],
-                dim=1,
-            )
-        elif pose_type == "da-pose":
-            body_pose = torch.zeros_like(body_pose).view(body_pose.shape[0], -1, 3)
-            body_pose[:, 0] = torch.tensor([0., 0., 30 * np.pi / 180.])
-            body_pose[:, 1] = torch.tensor([0., 0., -30 * np.pi / 180.])
-            body_pose = body_pose.view(body_pose.shape[0], -1)
-
-            full_pose = torch.cat(
-                [
-                    global_orient * 0.,
-                    body_pose,
-                    jaw_pose * 0.,
-                    leye_pose * 0.,
-                    reye_pose * 0.,
-                    left_hand_pose * 0.,
-                    right_hand_pose * 0.,
-                ],
-                dim=1,
-            )
-
-        # Add the mean pose of the model. Does not affect the body, only the
-        # hands when flat_hand_mean == False
-        # full_pose += self.pose_mean
-
-        batch_size = max(betas.shape[0], global_orient.shape[0], body_pose.shape[0])
-        # Concatenate the shape and expression coefficients
-        scale = int(batch_size / betas.shape[0])
-        if scale > 1:
-            betas = betas.expand(scale, -1)
-        shape_components = torch.cat([betas, expression], dim=-1)
-
-        shapedirs = torch.cat([self.shapedirs, self.expr_dirs], dim=-1)
-
-        if return_joint_transformation or return_vertex_transformation:
-            vertices, joints, joint_transformation, vertex_transformation = lbs(
-                shape_components,
-                full_pose,
-                self.v_template,
-                shapedirs,
-                self.posedirs,
-                self.J_regressor,
-                self.parents,
-                self.lbs_weights,
-                pose2rot=pose2rot,
-                return_transformation=True,
-            )
+        # Unpack LBS output
+        if return_transformations:
+            vertices, joints, joint_transformation, vertex_transformation = lbs_output
         else:
-            vertices, joints = lbs(
-                shape_components,
-                full_pose,
-                self.v_template,
-                shapedirs,
-                self.posedirs,
-                self.J_regressor,
-                self.parents,
-                self.lbs_weights,
-                pose2rot=pose2rot,
-            )
+            vertices, joints = lbs_output
+            joint_transformation, vertex_transformation = None, None
 
-        lmk_faces_idx = (self.lmk_faces_idx.unsqueeze(dim=0).expand(batch_size, -1).contiguous())
-        lmk_bary_coords = self.lmk_bary_coords.unsqueeze(dim=0).repeat(self.batch_size, 1, 1)
+        # --- Calculate Landmarks ---
+        # Prepare landmark calculation inputs (ensure buffers are on correct device)
+        lmk_faces_idx = self.lmk_faces_idx.to(device=device)
+        lmk_bary_coords = self.lmk_bary_coords.to(device=device, dtype=dtype)
+
+        # Expand batch dim for landmark calculation
+        lmk_faces_idx_batch = lmk_faces_idx.unsqueeze(0).expand(batch_size, -1)
+        lmk_bary_coords_batch = lmk_bary_coords.unsqueeze(0).expand(batch_size, -1, -1)
+
+        # Calculate dynamic landmarks if requested
         if self.use_face_contour:
-            lmk_idx_and_bcoords = find_dynamic_lmk_idx_and_bcoords(
+            # Ensure dynamic landmark buffers are on correct device
+            dynamic_lmk_faces_idx = self.dynamic_lmk_faces_idx.to(device=device)
+            dynamic_lmk_bary_coords = self.dynamic_lmk_bary_coords.to(device=device, dtype=dtype)
+            neck_kin_chain = self.neck_kin_chain.to(device=device)
+
+            # Assumes find_dynamic_lmk_idx_and_bcoords function is available
+            dyn_lmk_faces_idx, dyn_lmk_bary_coords = find_dynamic_lmk_idx_and_bcoords(
                 vertices,
-                full_pose,
-                self.dynamic_lmk_faces_idx,
-                self.dynamic_lmk_bary_coords,
-                self.neck_kin_chain,
-                pose2rot=True,
+                full_pose, # Pass full pose for potential kinematic calculations
+                dynamic_lmk_faces_idx,
+                dynamic_lmk_bary_coords,
+                neck_kin_chain,
+                pose2rot=pose2rot, # Pass pose2rot flag
             )
-            dyn_lmk_faces_idx, dyn_lmk_bary_coords = lmk_idx_and_bcoords
+            # Concatenate static and dynamic landmarks (batch-wise)
+            lmk_faces_idx_batch = torch.cat([lmk_faces_idx_batch, dyn_lmk_faces_idx], dim=1)
+            lmk_bary_coords_batch = torch.cat([lmk_bary_coords_batch, dyn_lmk_bary_coords], dim=1)
 
-            lmk_faces_idx = torch.cat([lmk_faces_idx, dyn_lmk_faces_idx], 1)
-            lmk_bary_coords = torch.cat([
-                lmk_bary_coords.expand(batch_size, -1, -1), dyn_lmk_bary_coords
-            ], 1)
+        # Ensure faces tensor is on the correct device
+        # Assumes self.faces_tensor is registered buffer
+        faces_tensor = self.faces_tensor.to(device=device)
+        # Assumes vertices2landmarks function is available
+        landmarks = vertices2landmarks(vertices, faces_tensor,
+                                       lmk_faces_idx_batch, lmk_bary_coords_batch)
 
-        landmarks = vertices2landmarks(vertices, self.faces_tensor, lmk_faces_idx, lmk_bary_coords)
+        # --- Finalize Joints ---
+        # Apply vertex joint selector (if defined, e.g., in base class)
+        # Assumes self.vertex_joint_selector is defined
+        if hasattr(self, 'vertex_joint_selector') and self.vertex_joint_selector is not None:
+             joints = self.vertex_joint_selector(vertices, joints)
 
-        # Add any extra joints that might be needed
-        joints = self.vertex_joint_selector(vertices, joints)
-        # Add the landmarks to the joints
+        # Concatenate landmarks to joints
+        # Ensure landmarks are calculated before this step
         joints = torch.cat([joints, landmarks], dim=1)
-        # Map the joints to the current dataset
 
-        if self.joint_mapper is not None:
+        # Apply joint mapper (if defined, e.g., in base class)
+        # Assumes self.joint_mapper is defined
+        if hasattr(self, 'joint_mapper') and self.joint_mapper is not None:
             joints = self.joint_mapper(joints=joints, vertices=vertices)
 
+        # --- Apply Translation ---
         if apply_trans:
-            joints += transl.unsqueeze(dim=1)
-            vertices += transl.unsqueeze(dim=1)
+            # Ensure transl is on the correct device/dtype before applying
+            transl = transl.to(device=device, dtype=dtype)
+            joints = joints + transl.unsqueeze(1)
+            vertices = vertices + transl.unsqueeze(1)
 
+        # --- Create Output ---
+        # Assumes SMPLXOutput class is defined and accepts these arguments
         output = SMPLXOutput(
             vertices=vertices if return_verts else None,
             joints=joints,
             betas=betas,
-            expression=expression,
+            expression=expression if self.num_expression_coeffs > 0 else None, # Return expression only if used
             global_orient=global_orient,
             body_pose=body_pose,
-            left_hand_pose=left_hand_pose,
-            right_hand_pose=right_hand_pose,
+            left_hand_pose=left_hand_pose, # Return axis-angle version
+            right_hand_pose=right_hand_pose, # Return axis-angle version
             jaw_pose=jaw_pose,
             full_pose=full_pose if return_full_pose else None,
-            joint_transformation=joint_transformation if return_joint_transformation else None,
-            vertex_transformation=vertex_transformation if return_vertex_transformation else None,
+            joint_transformation=joint_transformation if return_joint_transformation else None, # Added back
+            vertex_transformation=vertex_transformation if return_vertex_transformation else None, # Added back
         )
-        return output
 
+        return output
 
 class SMPLXLayer(SMPLX):
     def __init__(self, *args, **kwargs) -> None:
@@ -2520,8 +2574,7 @@ def create(model_path: str,
         ValueError: In case the model type is not one of SMPL, SMPLH,
         SMPLX, MANO or FLAME
     """
-
-    # If it's a folder, assume
+    
     if osp.isdir(model_path):
         model_path = os.path.join(model_path, model_type)
     else:

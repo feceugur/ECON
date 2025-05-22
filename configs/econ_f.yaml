@@ -41,12 +41,12 @@ bni:
   # use_smpl: ["face"]
   use_ifnet: True
   # use_ifnet: False
-  use_poisson: True
+  use_poisson: False
   # hand_thres: 8e-2
   # face_thres: 6e-2
-  hand_thres: 0.5
-  face_thres: 0.30
-  thickness: 0.02
+  hand_thres: 0.05
+  face_thres: 0.01
+  thickness: 0.01
   hps_type: "pixie"
   texture_src: "image"
   cut_intersection: True

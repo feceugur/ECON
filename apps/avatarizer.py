@@ -29,14 +29,14 @@ parser.add_argument("-n", "--name", type=str, default="")
 parser.add_argument("-g", "--gpu", type=int, default=0)
 parser.add_argument("-uv", action="store_true")
 parser.add_argument("-dress", action="store_true")
-args = parser.parse_args()
+args = parser.parse_args() 
 
 smplx_container = SMPLX()
 device = torch.device(f"cuda:{args.gpu}")
 
 # loading SMPL-X and econ objs inferred with ECON
 # prefix = f"./results_fulden/econ/obj/{args.name}"
-prefix = f"./results/Carla/IFN+_face_thresh_0.30/econ/obj/{args.name}"
+prefix = f"./results/Fulden/IFN+_face_thresh_0.01/econ/obj/{args.name}"
 
 smpl_path = f"{prefix}_smpl_00.npy"
 smplx_param = np.load(smpl_path, allow_pickle=True).item()
@@ -60,8 +60,16 @@ smpl_model = smplx.create(
     model_type="smplx",
     gender="neutral",
     age="adult",
-    use_face_contour=False,
+    use_face_contour=True,
     use_pca=False,
+    create_expression=True,
+    create_betas=False,
+    create_global_orient=True,
+    create_body_pose=True,
+    create_jaw_pose=True,
+    create_left_hand_pose=False,
+    create_right_hand_pose=False,
+    create_transl=False,
     num_betas=smplx_param["betas"].shape[1],
     num_expression_coeffs=smplx_param["expression"].shape[1],
     ext="pkl",
@@ -187,9 +195,9 @@ if not osp.exists(f"{prefix}/econ_da.obj") or not osp.exists(f"{prefix}/smpl_da.
 
     # combination of ECON body, SMPL-X side parts, SMPL-X hands
     econ_da = sum([smpl_hand, smpl_da_body, econ_da_body])
-    econ_da = poisson(
-        econ_da, f"{prefix}/econ_da.obj", depth=10, face_count=1e5, laplacian_remeshing=True
-    )
+    # econ_da = poisson(
+    #     econ_da, f"{prefix}/econ_da.obj", depth=10, face_count=1e5, laplacian_remeshing=True
+    # )
 else:
     econ_da = trimesh.load(f"{prefix}/econ_da.obj")
     smpl_da = trimesh.load(f"{prefix}/smpl_da.obj", maintain_orders=True, process=False)
@@ -267,8 +275,8 @@ from lib.dataset.mesh_util import export_obj
 # First Pass: Using _cloth_front and _cloth_back_red images
 ##########################################
 
-cloth_front_red_path = f"./results/Carla/IFN+_face_thresh_0.30/econ/png/{args.name}_cloth_front_red.png"
-cloth_back_red_path  = f"./results/Carla/IFN+_face_thresh_0.30/econ/png/{args.name}_cloth_back_red.png"
+cloth_front_red_path = f"./results/Fulden/IFN+_face_thresh_0.01/econ/png/{args.name}_cloth_front_red.png"
+cloth_back_red_path  = f"./results/Fulden/IFN+_face_thresh_0.01/econ/png/{args.name}_cloth_back_red.png"
 
 tensor_front_1 = transforms.ToTensor()(Image.open(cloth_front_red_path))[:, :, :512]
 tensor_back_1  = transforms.ToTensor()(Image.open(cloth_back_red_path))[:, :, :512]
@@ -321,8 +329,8 @@ print("First-pass texture map saved as texture_red.png.")
 # Second Pass: Using _cloth_front_red_blue and _cloth_back_blue images
 ##########################################
 
-cloth_front_path_blue = f"./results/Carla/IFN+_face_thresh_0.30/econ/png/{args.name}_cloth_front_blue.png"
-cloth_back_path_blue  = f"./results/Carla/IFN+_face_thresh_0.30/econ/png/{args.name}_cloth_back_blue.png"
+cloth_front_path_blue = f"./results/Fulden/IFN+_face_thresh_0.01/econ/png/{args.name}_cloth_front_blue.png"
+cloth_back_path_blue  = f"./results/Fulden/IFN+_face_thresh_0.01/econ/png/{args.name}_cloth_back_blue.png"
 
 tensor_front_2 = transforms.ToTensor()(Image.open(cloth_front_path_blue))[:, :, :512]
 tensor_back_2  = transforms.ToTensor()(Image.open(cloth_back_path_blue))[:, :, :512]
@@ -401,10 +409,10 @@ econ_dict = {
 
 torch.save(econ_dict, f"{cache_path}/econ.pt")
 
-print(
-    "If the dress/skirt is torn in `<file_name>/econ_da.obj`, please delete ./file_name and regenerate them with `-dress`\n"
-    "python -m apps.avatarizer -n <file_name> -dress"
-)
+# print(
+#     "If the dress/skirt is torn in `<file_name>/econ_da.obj`, please delete ./file_name and regenerate them with `-dress`\n"
+#     "python -m apps.avatarizer -n <file_name> -dress"
+# )
 
 ##########################################
 # UV Texture Generation (if enabled)
@@ -489,13 +497,13 @@ if args.uv:
     texture_defrag_exe = os.path.abspath("./texture-defrag/build/texture-defrag")
     mesh_file_red = os.path.abspath(osp.join(red_dir, "mesh_red.obj"))
     output_file_red = os.path.abspath(osp.join(defrag_path, "defrag_red.obj"))
-    cmd_red = ["xvfb-run", "-a", texture_defrag_exe, mesh_file_red, "-l", "0", "-o", output_file_red, "-m", "3", "-b", "0.3"]
+    cmd_red = ["xvfb-run", "-a", texture_defrag_exe, mesh_file_red, "-l", "0", "-o", output_file_red]
     print("Running texture-defrag for red mesh:", " ".join(cmd_red))
     subprocess.run(cmd_red, check=True)
 
     mesh_file_blue = os.path.abspath(osp.join(blue_dir, "mesh_blue.obj"))
     output_file_blue = os.path.abspath(osp.join(defrag_path, "defrag_blue.obj"))
-    cmd_blue = ["xvfb-run", "-a", texture_defrag_exe, mesh_file_blue, "-l", "0", "-o", output_file_blue, "-m", "3", "-b", "0.3"]
+    cmd_blue = ["xvfb-run", "-a", texture_defrag_exe, mesh_file_blue, "-l", "0", "-o", output_file_blue]
     print("Running texture-defrag for blue mesh:", " ".join(cmd_blue))
     subprocess.run(cmd_blue, check=True)
 
@@ -539,9 +547,9 @@ if args.uv:
             
             # Inpainting process:
             texture_8bit = red_img.astype(np.uint8)
-            small_kernel = np.ones((5, 5), np.uint8)
-            eroded_mask = cv2.erode(final_mask, small_kernel, iterations=1)
-            dilation_kernel = np.ones((50, 50), np.uint8)
+            small_kernel = np.ones((10,10), np.uint8)
+            eroded_mask = cv2.erode(final_mask, small_kernel, iterations=3)
+            dilation_kernel = np.ones((45, 45), np.uint8)
             dilated_mask = cv2.dilate(eroded_mask, dilation_kernel, iterations=2)
             
             diffmask_dilated_path = osp.join(defrag_path, f"diffmask_dilated_{img_id}.png")
@@ -563,32 +571,38 @@ if args.uv:
     texture_paths = sorted(glob.glob(texture_pattern))
     print("Found final texture files:", texture_paths)
 
-    # === 2. Read the defrag_blue OBJ's MTL file to extract material names ===
-    # Read the MTL from the defrag_assets folder since defrag_blue.obj.mtl is output there.
+    # === 2. Parse defrag_blue.obj.mtl to follow texture IDs.
+    # Read the defrag_blue MTL file from the defrag_assets folder.
     defrag_blue_mtl_path = os.path.abspath(osp.join(defrag_path, "defrag_blue.obj.mtl"))
     with open(defrag_blue_mtl_path, "r") as f:
         mtl_lines = f.readlines()
 
-    material_names = []
+    # Build a mapping from material name to its associated texture ID,
+    # by parsing the "map_Kd" line which is assumed to be in the format:
+    # map_Kd defrag_blue_texture_<id>.png
+    material_to_id = {}
+    current_mat = None
     for line in mtl_lines:
+        line = line.strip()
         if line.startswith("newmtl"):
-            parts = line.strip().split()
+            parts = line.split()
             if len(parts) >= 2:
-                material_names.append(parts[1])
-    # Remove duplicates while preserving order.
-    seen = set()
-    material_names = [x for x in material_names if x not in seen and not seen.add(x)]
-    print("Extracted material names from defrag_blue MTL:", material_names)
+                current_mat = parts[1]
+        elif line.startswith("map_Kd") and current_mat:
+            m = re.search(r"defrag_blue_texture_(.+)\.png", line)
+            if m:
+                mat_id = m.group(1)
+                material_to_id[current_mat] = mat_id
+            current_mat = None
 
-    # === 3. Create the final MTL file with a material for each texture ===
-    # Textures are assigned to materials in a round-robin manner.
+    print("Extracted material-to-ID mapping from defrag_blue MTL:", material_to_id)
+
+    # === 3. Create the final MTL file using the IDs from defrag_blue.obj.mtl.
     final_mtl_path = osp.join(final_dir, "final_material.mtl")
     with open(final_mtl_path, "w") as fp:
-        for i, mat_name in enumerate(material_names):
-            if texture_paths:
-                tex_file = os.path.basename(texture_paths[i % len(texture_paths)])
-            else:
-                tex_file = "default_texture.png"
+        for mat_name, mat_id in material_to_id.items():
+            # Use the corresponding final inpainted texture based on the ID.
+            final_texture = f"texture_map_inpainted_{mat_id}.png"
             fp.write(f"newmtl {mat_name}\n")
             fp.write("Ka 1.000000 1.000000 1.000000\n")
             fp.write("Kd 1.000000 1.000000 1.000000\n")
@@ -596,10 +610,10 @@ if args.uv:
             fp.write("Tr 1.000000\n")
             fp.write("illum 1\n")
             fp.write("Ns 0.000000\n")
-            fp.write(f"map_Kd {tex_file}\n\n")
+            fp.write(f"map_Kd {final_texture}\n\n")
     print("Final material file saved at:", final_mtl_path)
 
-    # === 4. Update the OBJ file to reference the new MTL file and save it in final_dir ===
+    # === 4. Update the OBJ file to reference the new MTL file and save it in final_dir.
     final_obj_path = osp.join(final_dir, "final_model.obj")
     new_obj_lines = []
     mtllib_updated = False

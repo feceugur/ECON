@@ -5,6 +5,7 @@ from lib.net.BasePIFuNet import BasePIFuNet
 from lib.net.FBNet import GANLoss, IDMRFLoss, VGGLoss, define_D, define_G
 from lib.net.net_util import init_net
 from PIL import Image
+import numpy as np
 
 class NormalNet_f(BasePIFuNet):
     """
@@ -101,14 +102,26 @@ class NormalNet_f(BasePIFuNet):
         # nmlB_normalized = -nmlB_normalized
         # nmlB_normalized[:, 0, :, :] = -nmlB_normalized[:, 0, :, :]  # Flip x-component (mirror)
         # @SSH END
+        abs_sum_F = in_tensor["image"].abs().sum(dim=1, keepdim=True)
+        abs_sum_B = in_tensor["image_back"].abs().sum(dim=1, keepdim=True)
 
-        # Create a mask for valid pixels (non-zero regions)
-        mask = ((in_tensor["image"].abs().sum(dim=1, keepdim=True) != 0.0).detach().float())
-        back_mask = ((in_tensor["image_back"].abs().sum(dim=1, keepdim=True) != 0.0).detach().float())
-        
-        self.save_mask_image(mask, back_mask, out_dir)
+        # Define a threshold to identify the background sum (which should be near 3.0)
+        # We want to mark pixels as background if their sum is high enough.
+        # Let's try a threshold significantly above the min foreground sum (0.0118)
+        # and below the expected background sum (3.0).
+        background_sum_threshold = 2.9 # Pixels with abs_sum > 2.9 are likely background. Adjust if needed.
+
+        is_background_F = (abs_sum_F > background_sum_threshold)
+        is_background_B = (abs_sum_B > background_sum_threshold)
+
+        # The final mask should be 1.0 where it's NOT background (foreground)
+        mask = (~is_background_F).detach().float()
+        back_mask = (~is_background_B).detach().float()
+
+        self.save_mask_image(mask, back_mask, out_dir) # Save the final mask
         self.save_nml_image(nmlF_normalized, nmlB_normalized, out_dir)
-        # Return masked and normalized normals
+
+        # Return masked normals
         return nmlF_normalized * mask, nmlB_normalized * back_mask
 
     def get_norm_error(self, prd_F, prd_B, tgt):
@@ -210,7 +223,7 @@ class NormalNet_f(BasePIFuNet):
 
         # Save images
         mask_img.save(f"{self.out_dir}/econ/png/mask_image.png")
-        back_mask_img.save(f"{out_dir}/econ/png/back_mask_image.png")
+        back_mask_img.save(f"{out_dir}/econ/png/mask_image_back.png")
 
     def save_nml_image(self, nmlF_normalized, nmlB_normalized, out_dir):
         # Normalize to [0, 1] range for image representation
