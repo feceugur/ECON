@@ -3,6 +3,7 @@ import trimesh
 import numpy as np
 from scipy.spatial import cKDTree  
 import os 
+# import traceback # No longer used
 import tempfile 
 from typing import List, Optional, Tuple
 from collections import Counter
@@ -23,9 +24,14 @@ class FaceGraftingConfig:
     stitch_method: str = "body_driven_loft"
     smplx_face_neck_loop_strategy: str = "full_face_silhouette"
     alignment_resample_count: int = 1000
+    # loft_strip_resample_count: int = 100 # Unused by the current _create_loft_stitch_mesh
     max_seam_hole_fill_vertices: int = 250
     final_polish_max_hole_edges: int = 100
     iterative_repair_s1_iters: int = 5
+    # iterative_repair_s2_iters: int = 5 # Unused placeholder
+    # iterative_repair_s2_remesh_percent: Optional[float] = None # Unused placeholder
+    spider_filter_area_factor: Optional[float] = 300.0
+    spider_filter_max_edge_len_factor: Optional[float] = 0.15
     vertex_coordinate_precision_digits: Optional[int] = 5 
     hole_boundary_smoothing_iterations: int = 10
     hole_boundary_smoothing_factor: float = 0.5
@@ -242,28 +248,16 @@ class FaceGraftingPipeline:
            len(self.simplified_body_trimesh.faces) > 0: 
             try:
                 _, d_cp, t_cp = trimesh.proximity.closest_point(self.simplified_body_trimesh, self.original_smplx_face_geom_tri.vertices)
-                if d_cp is not None and t_cp is not None and len(d_cp) == len(t_cp): # Check length consistency
-                    valid_indices_mask_cp = (d_cp < self.config.projection_footprint_threshold) & (t_cp < len(self.faces_to_remove_mask_on_body))
-                    h_cp = t_cp[valid_indices_mask_cp]
-                    if len(h_cp) > 0: self.faces_to_remove_mask_on_body[np.unique(h_cp)] = True
-                
+                if d_cp is not None and t_cp is not None:
+                    self.faces_to_remove_mask_on_body[np.unique(t_cp[d_cp < self.config.projection_footprint_threshold])] = True
                 offset = self.config.projection_footprint_threshold * 0.5
                 p_f = self.original_smplx_face_geom_tri.vertices + self.original_smplx_face_geom_tri.vertex_normals * offset
                 p_b = self.original_smplx_face_geom_tri.vertices - self.original_smplx_face_geom_tri.vertex_normals * offset
-                
                 _, _, t_f = trimesh.proximity.closest_point(self.simplified_body_trimesh, p_f)
-                if t_f is not None and len(t_f) > 0: # Check if t_f is not empty
-                    valid_indices_mask_f = t_f < len(self.faces_to_remove_mask_on_body)
-                    unique_t_f = np.unique(t_f[valid_indices_mask_f])
-                    if len(unique_t_f) > 0: self.faces_to_remove_mask_on_body[unique_t_f] = True
-                
-                _, actual_dists_behind, t_b = trimesh.proximity.closest_point(self.simplified_body_trimesh, p_b)
-                if actual_dists_behind is not None and t_b is not None and len(actual_dists_behind) == len(t_b): # Check length consistency
-                    valid_indices_mask_b = (actual_dists_behind < self.config.projection_footprint_threshold) & (t_b < len(self.faces_to_remove_mask_on_body))
-                    h_b = t_b[valid_indices_mask_b]
-                    if len(h_b) > 0: self.faces_to_remove_mask_on_body[np.unique(h_b)] = True
-            except IndexError as ie:
-                logger.warning(f"IndexError during robust hole determination (mask length vs. indices): {ie}. This might occur if projection_footprint_threshold is too large or mesh scales are extreme.")
+                if t_f is not None: self.faces_to_remove_mask_on_body[np.unique(t_f)] = True
+                _, dists_b, t_b = trimesh.proximity.closest_point(self.simplified_body_trimesh, p_b)
+                if dists_b is not None and t_b is not None:
+                    self.faces_to_remove_mask_on_body[np.unique(t_b[dists_b < self.config.projection_footprint_threshold])] = True
             except Exception as e_p: logger.warning(f"Error during robust hole determination: {e_p}")
 
             if self.config.footprint_dilation_rings > 0 and np.any(self.faces_to_remove_mask_on_body):
@@ -272,18 +266,10 @@ class FaceGraftingPipeline:
                 for _ in range(self.config.footprint_dilation_rings):
                     wave_indices = np.where(current_wavefront)[0]
                     if not wave_indices.size: break
-                    
-                    all_neighbors_this_ring = []
-                    for face_idx_in_wavefront in wave_indices:
-                        # Get rows in adjacency matrix where face_idx_in_wavefront is present
-                        rows_with_face = adj[(adj[:, 0] == face_idx_in_wavefront) | (adj[:, 1] == face_idx_in_wavefront)]
-                        # Collect the neighbors
-                        for r in rows_with_face:
-                            all_neighbors_this_ring.append(r[0] if r[1] == face_idx_in_wavefront else r[1])
-                    
-                    if not all_neighbors_this_ring: break
-                    unique_neigh = np.unique(all_neighbors_this_ring)
-                    new_to_add = unique_neigh[~self.faces_to_remove_mask_on_body[unique_neigh]] # Filter out already marked
+                    all_neigh = [p[0] if p[1] in wave_indices else p[1] for p in adj if p[0] in wave_indices or p[1] in wave_indices]
+                    if not all_neigh: break
+                    unique_neigh = np.unique(all_neigh)
+                    new_to_add = unique_neigh[~self.faces_to_remove_mask_on_body[unique_neigh]]
                     if not new_to_add.size: break
                     self.faces_to_remove_mask_on_body[new_to_add] = True
                     current_wavefront.fill(False); current_wavefront[new_to_add] = True
@@ -301,40 +287,15 @@ class FaceGraftingPipeline:
             else: logger.error("Face removal mask length mismatch. Skipping removal.")
         
         self.body_with_hole_trimesh = current_body_for_hole 
-        
         if self.body_with_hole_trimesh is not None and not self.body_with_hole_trimesh.is_empty and \
            MeshCleanProcess._is_mesh_valid_for_concat(self.body_with_hole_trimesh, "BodyWHolePreSplit"):
-            if hasattr(self.body_with_hole_trimesh, 'split') and callable(self.body_with_hole_trimesh.split):
-                components_result = self.body_with_hole_trimesh.split(only_watertight=False)
-                
-                # --- CORRECTED CHECK ---
-                # components_result could be a list of Trimesh objects or potentially a numpy array
-                # containing Trimesh objects, or even the original mesh if it couldn't be split.
-                actual_components_list = []
-                if isinstance(components_result, np.ndarray): # If it's a numpy array
-                    if components_result.ndim > 0 and components_result.size > 0 and isinstance(components_result[0], trimesh.Trimesh):
-                         actual_components_list = list(components_result) # Convert to list if array of meshes
-                    elif components_result.ndim == 0 and isinstance(components_result.item(), trimesh.Trimesh): # Single mesh in a 0-d array
-                         actual_components_list = [components_result.item()]
-                elif isinstance(components_result, list): # If it's already a list
-                    actual_components_list = components_result
-                elif isinstance(components_result, trimesh.Trimesh): # If split returns the original mesh
-                     actual_components_list = [components_result]
-
-
-                if actual_components_list and any(c is not None and not c.is_empty for c in actual_components_list):
-                    valid_components = [c for c in actual_components_list if c is not None and hasattr(c, 'faces') and c.faces is not None]
-                    if valid_components:
-                        largest_comp = max(valid_components, key=lambda c: len(c.faces))
-                        if MeshCleanProcess._is_mesh_valid_for_concat(largest_comp, "LargestCompBodyWHole"):
-                            self.body_with_hole_trimesh = largest_comp 
-                        else: logger.warning("Largest component of body-with-hole invalid. Using pre-split.")
-                    else:
-                        logger.info("Split operation on body-with-hole yielded no valid components with faces. Using pre-split version.")
-                else: 
-                    logger.info("Split operation on body-with-hole yielded no components or all were empty/None. Using pre-split version.")
-                # --- END CORRECTED CHECK ---
-
+            if hasattr(self.body_with_hole_trimesh, 'split'):
+                components = self.body_with_hole_trimesh.split(only_watertight=False)
+                if components:
+                    largest_comp = max(components, key=lambda c: len(c.faces if hasattr(c, 'faces') else []))
+                    if MeshCleanProcess._is_mesh_valid_for_concat(largest_comp, "LargestCompBodyWHole"):
+                        self.body_with_hole_trimesh = largest_comp 
+                    else: logger.warning("Largest component of body-with-hole invalid. Using pre-split.")
         elif self.body_with_hole_trimesh is None: logger.error("body_with_hole_trimesh is None. Unexpected."); return False
 
         body_state_before_final_clean = self.body_with_hole_trimesh.copy() if self.body_with_hole_trimesh is not None else None
@@ -365,9 +326,10 @@ class FaceGraftingPipeline:
              logger.critical("Final Body-with-hole mesh is invalid. Aborting.")
              return False
         
+        # Removed DEBUG save of body_with_hole_trimesh
         logger.info(f"Finished body_with_hole creation. V={len(self.body_with_hole_trimesh.vertices)}, F={len(self.body_with_hole_trimesh.faces)}")
         return True
-        
+
     def _extract_smplx_face_loop(self) -> bool:
         if not self.original_smplx_face_geom_tri: return False
         # logger.info("Extracting SMPLX face loop.") 
@@ -747,6 +709,37 @@ class FaceGraftingPipeline:
             if ms_polish is not None: del ms_polish
         return True
 
+    def _filter_spider_triangles(self) -> bool:
+        if not self.final_processed_mesh or \
+           not MeshCleanProcess._is_mesh_valid_for_concat(self.final_processed_mesh, "MeshBeforeSpiderFilter"):
+            logger.warning("Skipping spider filter: mesh invalid/missing."); return True 
+        if self.config.spider_filter_area_factor is None and self.config.spider_filter_max_edge_len_factor is None:
+            return True
+        logger.info("=== STEP 5.75: Filtering Spider-Web Triangles ===")
+        target_faces = None
+        if MeshCleanProcess._is_mesh_valid_for_concat(self.original_smplx_face_geom_tri, "SpiderRefBounds") and \
+           self.final_processed_mesh.faces.shape[0] > 0 and self.original_smplx_face_geom_tri.vertices.shape[0] > 0: 
+            centroids = self.final_processed_mesh.triangles_center
+            s_min, s_max = self.original_smplx_face_geom_tri.bounds; pad = 0.05 
+            min_b, max_b = s_min - pad, s_max + pad
+            ids = [i for i, c in enumerate(centroids) if (min_b[0] <= c[0] <= max_b[0] and min_b[1] <= c[1] <= max_b[1] and min_b[2] <= c[2] <= max_b[2])]
+            if ids: target_faces = np.array(ids, dtype=int)
+        max_edge_len = None
+        if self.config.spider_filter_max_edge_len_factor is not None and self.config.spider_filter_max_edge_len_factor > 0:
+            if self.simplified_body_trimesh and MeshCleanProcess._is_mesh_valid_for_concat(self.simplified_body_trimesh, "SpiderEdgeRef") and \
+               len(self.simplified_body_trimesh.edges_unique_length) > 0:
+                max_edge_len = np.max(self.simplified_body_trimesh.edges_unique_length) * (1.0 + self.config.spider_filter_max_edge_len_factor)
+        ref_stats = self.original_smplx_face_geom_tri if MeshCleanProcess._is_mesh_valid_for_concat(self.original_smplx_face_geom_tri, "SpiderAreaRef") else None
+        filtered = MeshCleanProcess._filter_large_triangles_from_fill(
+            self.final_processed_mesh, target_face_indices=target_faces, max_allowed_edge_length=max_edge_len,
+            max_allowed_area_factor=self.config.spider_filter_area_factor, reference_mesh_for_stats=ref_stats
+        )
+        if not MeshCleanProcess._is_mesh_valid_for_concat(filtered, "MeshAfterSpiderFilter"):
+            logger.critical("Mesh invalid after spider filter. Aborting save."); return False 
+        self.final_processed_mesh = filtered; self.final_processed_mesh.fix_normals()
+        # logger.info("Spider-web triangle filter applied.")
+        return True
+
     def _verify_seam_closure(self) -> bool:
         logger.info(f"=== STEP 6 (Verify): Verifying Seam Closure ===")
         if not MeshCleanProcess._is_mesh_valid_for_concat(self.final_processed_mesh, "FinalMeshForSeamVerify"):
@@ -775,54 +768,36 @@ class FaceGraftingPipeline:
         logger.warning(f"Seam verify: Found {len(gap_edges_found)} potential gap edges (thresh {gap_thresh:.1e})."); return False 
 
     def process(self) -> Optional[trimesh.Trimesh]:
-        """
-        Executes the full face grafting pipeline.
-        Returns the processed Trimesh object if successful, None otherwise.
-        """
         logger.info(f"--- Starting Face Grafting Pipeline (V{self.INTERNAL_VERSION_TRACKER}) ---")
         pipeline_ok = False
         try:
             if not self._load_and_simplify_meshes(): return None
             if not self._perform_iterative_body_repair(): return None
             if not self._determine_hole_faces_and_create_body_with_hole(): return None
-            
-            if not self._stitch_components(): 
-                logger.error("Component stitching failed. Aborting.")
-                return None
-            
-            self._fill_seam_holes_ear_clip() 
-            self._apply_final_polish()      
+            if not self._stitch_components(): logger.error("Component stitching failed."); return None
+            self._fill_seam_holes_ear_clip() # Updates self.final_processed_mesh
+            self._apply_final_polish()      # Updates self.final_processed_mesh
 
             # _filter_spider_triangles() is commented out by user
+            # if not self._filter_spider_triangles(): logger.error("Spider filtering failed critically."); return None
 
-            if not MeshCleanProcess._is_mesh_valid_for_concat(self.final_processed_mesh, f"MeshBeforeFinalSave_V{self.INTERNAL_VERSION_TRACKER}"):
-                logger.critical("Final_processed_mesh is invalid or empty before final save. CANNOT SAVE.")
-                return None
-
-            obj_output_path = self.output_path
-            self.final_processed_mesh.export(obj_output_path)
-            logger.info(f"--- Mesh Grafting V{self.INTERNAL_VERSION_TRACKER} Finished. OBJ Output: {obj_output_path} ---")
-            
-            base_output_name, _ = os.path.splitext(obj_output_path)
-            
+            if not MeshCleanProcess._is_mesh_valid_for_concat(self.final_processed_mesh, "MeshBeforeFinalSave"):
+                logger.critical("Final mesh is invalid or empty before save. CANNOT SAVE."); return None
+            self.final_processed_mesh.export(self.output_path)
+            logger.info(f"--- Pipeline Finished. Output: {self.output_path} ---")
             self._verify_seam_closure()
-
-            logger.info("--- Performing Final Watertightness Check on Output Mesh (from OBJ for check) ---")
+            logger.info("--- Performing Final Watertightness Check ---")
             if self.final_processed_mesh and not self.final_processed_mesh.is_empty:
-                temp_final_mesh_path_for_check = self._make_temp_path("final_check_watertight_obj", use_ply=False)
-                export_success_for_check = False
-                try: export_success_for_check = self.final_processed_mesh.export(temp_final_mesh_path_for_check)
-                except Exception as e_export_final_check: logger.error(f"Failed to export final mesh for watertightness check: {e_export_final_check}")
-                if export_success_for_check:
-                    checker_mcp = MeshCleanProcess(input_path=temp_final_mesh_path_for_check, output_path="dummy_output_for_check.obj")
-                    if checker_mcp.load_mesh(): logger.info(f"Final mesh watertightness (PyMeshLab check result): {checker_mcp.check_watertight()}")
-                    else: logger.warning("Could not load final mesh into PyMeshLab for watertightness check.")
-                    del checker_mcp 
-            else: logger.warning("Final processed mesh is None or empty, skipping final watertightness check.")
+                temp_final_check = self._make_temp_path("final_watertight_check", use_ply=True)
+                if self.final_processed_mesh.export(temp_final_check):
+                    checker = MeshCleanProcess(temp_final_check, "dummy.ply")
+                    if checker.load_mesh(): logger.info(f"Final Watertightness: {checker.check_watertight()}")
+                    else: logger.warning("Could not load final for watertight check.")
+                    del checker
             pipeline_ok = True
             return self.final_processed_mesh
-        except Exception as e_main_pipeline: 
-            logger.error(f"--- Pipeline V{self.INTERNAL_VERSION_TRACKER} Failed: {e_main_pipeline}", exc_info=True); return None
+        except Exception as e: 
+            logger.error(f"--- Pipeline V{self.INTERNAL_VERSION_TRACKER} Failed: {e}", exc_info=True); return None
         finally:
             self._cleanup_temp_files()
             if not pipeline_ok: logger.error(f"Pipeline V{self.INTERNAL_VERSION_TRACKER} did not complete successfully.")
@@ -1238,8 +1213,12 @@ class MeshCleanProcess:
         projection_footprint_threshold: float = 0.01, footprint_dilation_rings: int = 3,
         body_simplification_target_faces: int = 12000, stitch_method: str = "body_driven_loft", 
         smplx_face_neck_loop_strategy: str = "full_face_silhouette", alignment_resample_count: int = 1000,
+        # loft_strip_resample_count removed as unused by current loft
         max_seam_hole_fill_vertices: int = 250, final_polish_max_hole_edges: int = 100,
+        iterative_repair_s1_iters: int = 5, spider_filter_area_factor: Optional[float] = 300.0,
+        spider_filter_max_edge_len_factor: Optional[float] = 0.20,
         hole_boundary_smoothing_iterations=10, hole_boundary_smoothing_factor=0.5
+        # debug_dir removed
     ) -> Optional[trimesh.Trimesh]:
         config = FaceGraftingConfig(
             projection_footprint_threshold=projection_footprint_threshold,
@@ -1248,9 +1227,56 @@ class MeshCleanProcess:
             stitch_method=stitch_method,
             smplx_face_neck_loop_strategy=smplx_face_neck_loop_strategy,
             alignment_resample_count=alignment_resample_count,
+            # loft_strip_resample_count=loft_strip_resample_count, # Unused
             max_seam_hole_fill_vertices=max_seam_hole_fill_vertices,
             final_polish_max_hole_edges=final_polish_max_hole_edges,
+            iterative_repair_s1_iters=iterative_repair_s1_iters,
+            spider_filter_area_factor=spider_filter_area_factor,
+            spider_filter_max_edge_len_factor=spider_filter_max_edge_len_factor,
+            vertex_coordinate_precision_digits=6, 
+            hole_boundary_smoothing_iterations=hole_boundary_smoothing_iterations,
+            hole_boundary_smoothing_factor=hole_boundary_smoothing_factor
         )
         pipeline = FaceGraftingPipeline(full_body_mesh_path,smplx_face_mesh_path,output_path,config)
         return pipeline.process()
         
+def main():
+    base_input_dir = "/home/ubuntu/projects/induxr/econ_s/ECON/results/Fulden/IFN+_face_thresh_0.01/econ/obj"
+    body_mesh_filename = "fulden_tpose_f1_0_full_wt.obj" 
+    face_mesh_filename = "fulden_tpose_f1_0_face.obj"
+    full_body_mesh_path = os.path.join(base_input_dir, body_mesh_filename)
+    smplx_face_mesh_path = os.path.join(base_input_dir, face_mesh_filename)
+    output_dir = '/home/ubuntu/projects/induxr/econ_s/ECON/results/standalone_face_graft_test_results'
+    os.makedirs(output_dir, exist_ok=True)
+    output_filename = f"grafted_{os.path.splitext(body_mesh_filename)[0]}_with_{os.path.splitext(face_mesh_filename)[0]}.obj"
+    output_path = os.path.join(output_dir, output_filename)
+
+    script_logger = logging.getLogger("standalone_graft_test")
+    if not logging.getLogger().hasHandlers(): # Ensure basicConfig is set if no handlers exist
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+    script_logger.setLevel(logging.INFO) # Explicitly set level for this logger
+
+    script_logger.info(f"--- Standalone Face Grafting Test ---")
+    script_logger.info(f"Body Mesh: {full_body_mesh_path}")
+    script_logger.info(f"Face Mesh: {smplx_face_mesh_path}")
+    script_logger.info(f"Output: {output_path}")
+
+    if not os.path.exists(full_body_mesh_path):
+        script_logger.error(f"CRITICAL: Body mesh not found: '{full_body_mesh_path}'. Update filename/path."); return
+    if not os.path.exists(smplx_face_mesh_path):
+        script_logger.error(f"CRITICAL: Face mesh not found: '{smplx_face_mesh_path}'. Update filename/path."); return
+    script_logger.info("Input files found. Starting pipeline...")
+    try:
+        result_mesh = MeshCleanProcess.run_face_grafting_pipeline(
+            full_body_mesh_path=full_body_mesh_path, smplx_face_mesh_path=smplx_face_mesh_path, output_path=output_path,
+            hole_boundary_smoothing_iterations=10, hole_boundary_smoothing_factor=0.5    
+        )
+    except Exception as e:
+        script_logger.error(f"Unhandled pipeline exception: {e}", exc_info=True); result_mesh = None
+    if result_mesh:
+        script_logger.info(f"--- Pipeline successful. Result V={len(result_mesh.vertices)}, F={len(result_mesh.faces)}. Saved to: {output_path} ---")
+    else:
+        script_logger.error(f"--- Pipeline failed or no result. Output might not be saved to {output_path}. Check logs. ---")
+
+if __name__ == "__main__":
+    main()

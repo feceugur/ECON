@@ -19,7 +19,6 @@ from tqdm.auto import tqdm
 from apps.IFGeo import IFGeo
 from apps.Normal_f import Normal
 from apps.sapiens import ImageProcessor
-# from apps.clean_mesh import MeshWatertightifier
 from apps.clean_mesh import MeshCleanProcess
 from apps.face_rig_exporter import FaceRigExporter
 
@@ -129,6 +128,8 @@ def load_models(cfg, args, device):
         print(colored(f"Complete with {Format.start} SMPL-X (Explicit) {Format.end}", "green"))
 
     SMPLX_object = SMPLX()
+    [attr for attr in dir(SMPLX_object) if not attr.startswith('_')]
+
     return normal_net, sapiens_normal_net, ifnet, SMPLX_object
 
 
@@ -552,6 +553,7 @@ def process_sample_combined(data, data_b, args, cfg, device, normal_net, sapiens
             # Remesh laplacian (from original process_sample)
             side_mesh = remesh_laplacian(side_mesh, side_mesh_path)
         else:
+            
             side_mesh = apply_vertex_mask(
                 side_mesh,
                 (SMPLX_object.front_flame_vertex_mask + SMPLX_object.smplx_mano_vertex_mask + SMPLX_object.eyeball_vertex_mask).eq(0).float(),
@@ -613,6 +615,7 @@ def process_sample_combined(data, data_b, args, cfg, device, normal_net, sapiens
                 )
                 hand_mask.index_fill_(0, torch.tensor(mano_right_vid), 1.0)
             hand_mesh = apply_vertex_mask(hand_mesh, hand_mask)
+            
             if not hand_mesh.is_empty:
                 BNI_object.F_B_trimesh = part_removal(
                     BNI_object.F_B_trimesh,
@@ -625,8 +628,10 @@ def process_sample_combined(data, data_b, args, cfg, device, normal_net, sapiens
                 side_mesh = part_removal(
                     side_mesh, hand_mesh, cfg.bni.hand_thres, device, smplx_mesh, region="hand"
                 )
+
                 # Export hand mesh (from original process_sample)
                 hand_mesh.export(f"{args.out_dir}/{cfg.name}/obj/{sample_name}_{idx}_hand.obj")
+                
                 full_lst += [hand_mesh]
 
         full_lst += [BNI_object.F_B_trimesh]
@@ -719,15 +724,15 @@ def process_sample_combined(data, data_b, args, cfg, device, normal_net, sapiens
         result = watertightifier.process(reconstruction_method='poisson', depth=poisson_depth_wt)
 
         if result: # result from watertightifier.process (e.g., True if _full_wt.obj was created successfully)
-            print(f"Watertight base mesh for grafting (V4) saved successfully to {final_watertight_path}")
+            print(f"Watertight base mesh for grafting saved successfully to {final_watertight_path}")
 
-            # Define output path for this V4 grafting attempt
+            # Define output path for this grafting attempt
             original_smplx_face_path = f"{args.out_dir}/{cfg.name}/obj/{sample_name}_{idx}_face.obj" # Your SMPLX face mask
 
             if not osp.exists(original_smplx_face_path):
-                print(f"ERROR: SMPLX face mesh {original_smplx_face_path} not found. Cannot perform grafting_v4.")
+                print(f"ERROR: SMPLX face mesh {original_smplx_face_path} not found. Cannot perform grafting.")
             elif not osp.exists(final_watertight_path): # This is the input body mesh (_full_wt.obj)
-                print(f"ERROR: Base body mesh {final_watertight_path} not found. Cannot perform grafting_v4.")
+                print(f"ERROR: Base body mesh {final_watertight_path} not found. Cannot perform grafting.")
             else: # SMPLX face and body mesh exist
                 
                 grafted_output_path_v5 = f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_final_grafted_v5.obj"
@@ -742,8 +747,7 @@ def process_sample_combined(data, data_b, args, cfg, device, normal_net, sapiens
                     full_body_mesh_path=final_watertight_path,
                     output_path=grafted_output_path_v5,
                     smplx_face_mesh_path=original_smplx_face_path,
-                    body_simplification_target_faces=15000,
-                    debug_dir=debug_graft_dir_sample_v5
+                    body_simplification_target_faces=13000,
                 )
 
                 if final_grafted_mesh_obj_v5 and not final_grafted_mesh_obj_v5.is_empty:

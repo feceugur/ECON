@@ -37,10 +37,10 @@ bni:
   lambda1: 1e-4
   boundary_consist: 1e-6
   poisson_depth: 10
-  use_smpl: ["face", "hand"]
+  use_smpl: ["face"]
   # use_smpl: ["face"]
-  use_ifnet: True
-  # use_ifnet: False
+  # use_ifnet: True
+  use_ifnet: False
   use_poisson: False
   # hand_thres: 8e-2
   # face_thres: 6e-2

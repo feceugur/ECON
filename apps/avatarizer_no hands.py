@@ -4,7 +4,8 @@ import os.path as osp
 import cv2
 import re
 import subprocess, glob
-
+import tempfile
+import pymeshlab
 import numpy as np
 import torch
 import trimesh
@@ -22,6 +23,96 @@ from lib.dataset.mesh_util import (
     poisson,
 )
 from lib.smplx.lbs import general_lbs
+
+def repair_and_fill_holes(
+    input_mesh: trimesh.Trimesh,
+    max_hole_edges: int = 250,
+    min_component_faces_to_keep: int = 100
+) -> trimesh.Trimesh:
+    """
+    Uses PyMeshLab to repair a mesh and fill its holes, adapted from the provided code.
+    Includes a final trimesh cleaning step to ensure compatibility with downstream tools.
+
+    Args:
+        input_mesh: The trimesh.Trimesh object with holes to be repaired.
+        max_hole_edges: The maximum number of edges for a hole to be considered for filling.
+        min_component_faces_to_keep: Removes any disconnected pieces with fewer faces than this.
+
+    Returns:
+        A new, repaired trimesh.Trimesh object, or the original if repair fails.
+    """
+    if not isinstance(input_mesh, trimesh.Trimesh) or input_mesh.is_empty:
+        print("Repair function: Invalid or empty input mesh.")
+        return input_mesh
+
+    print("--- Starting mesh repair and hole filling ---")
+    
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_in_path = os.path.join(temp_dir, "input.ply")
+        temp_out_path = os.path.join(temp_dir, "output.ply")
+        
+        try:
+            input_mesh.export(temp_in_path)
+            
+            ms = pymeshlab.MeshSet()
+            ms.load_new_mesh(temp_in_path)
+
+            if ms.current_mesh_id() == -1 or ms.current_mesh().vertex_number() == 0:
+                print("Repair function: Mesh empty after loading into PyMeshLab.")
+                return input_mesh
+
+            # 1. Repair non-manifold edges to make hole-filling more reliable.
+            try:
+                ms.meshing_repair_non_manifold_edges(method='Split Vertices')
+            except pymeshlab.PyMeshLabException:
+                try:
+                    ms.meshing_repair_non_manifold_edges(method='Remove Faces')
+                except pymeshlab.PyMeshLabException as e:
+                    print(f"Warning: Non-manifold edge repair failed: {e}")
+            
+            # 2. Clean up before major operations
+            ms.meshing_remove_duplicate_faces()
+            ms.meshing_remove_unreferenced_vertices()
+
+            # 3. Remove small disconnected floating artifacts
+            if min_component_faces_to_keep > 0:
+                ms.meshing_remove_connected_component_by_face_number(
+                    mincomponentsize=min_component_faces_to_keep
+                )
+
+            # 4. Fill the holes (like those at the wrists)
+            print(f"Attempting to close holes with up to {max_hole_edges} edges.")
+            ms.meshing_close_holes(maxholesize=max_hole_edges, newfaceselected=False)
+            
+            # 5. Final clean-up after filling
+            ms.meshing_remove_unreferenced_vertices()
+
+            # 6. Save the result and load it back into trimesh
+            ms.save_current_mesh(temp_out_path)
+            # MODIFICATION: Load with process=False to do a more robust manual cleanup
+            repaired_mesh = trimesh.load_mesh(temp_out_path, process=False)
+            
+            if not isinstance(repaired_mesh, trimesh.Trimesh) or repaired_mesh.is_empty:
+                print("Repair resulted in an empty/invalid mesh. Reverting.")
+                return input_mesh
+            
+            # MODIFICATION: Add robust trimesh cleaning to prevent CUDA errors later
+            print("Performing final trimesh cleanup to merge vertices and fix geometry.")
+            repaired_mesh.merge_vertices()
+            repaired_mesh.remove_duplicate_faces()
+            repaired_mesh.remove_degenerate_faces()
+            repaired_mesh.remove_unreferenced_vertices()
+
+            if repaired_mesh.is_empty:
+                print("Mesh became empty after final cleanup. Reverting to original.")
+                return input_mesh
+            
+            print(f"--- Mesh repair finished. Vertices: {len(repaired_mesh.vertices)}, Faces: {len(repaired_mesh.faces)} ---")
+            return repaired_mesh
+
+        except Exception as e:
+            print(f"An error occurred during the repair process: {e}. Returning original mesh.")
+            return input_mesh
 
 # loading cfg file
 parser = argparse.ArgumentParser()
@@ -86,8 +177,11 @@ for pose_type in ["a-pose", "t-pose", "da-pose", "pose"]:
             betas=smplx_param["betas"],
             expression=smplx_param["expression"],
             jaw_pose=smplx_param["jaw_pose"],
-            left_hand_pose=smplx_param["left_hand_pose"],
-            right_hand_pose=smplx_param["right_hand_pose"],
+            # MODIFICATION START: Do not pass hand poses to the model.
+            # This will make the SMPL-X model use a neutral hand pose.
+            # left_hand_pose=smplx_param["left_hand_pose"],
+            # right_hand_pose=smplx_param["right_hand_pose"],
+            # MODIFICATION END
             return_verts=True,
             return_full_pose=True,
             return_joint_transformation=True,
@@ -187,14 +281,24 @@ if not osp.exists(f"{prefix}/econ_da.obj") or not osp.exists(f"{prefix}/smpl_da.
     smpl_da_body.update_faces((dist > 0.02)[smpl_da_body.faces].all(axis=1))
     smpl_da_body.remove_unreferenced_vertices()
 
-    smpl_hand = smpl_da.copy()
-    smpl_hand.update_faces(
-        smplx_container.smplx_mano_vertex_mask.numpy()[smpl_hand.faces].all(axis=1)
-    )
-    smpl_hand.remove_unreferenced_vertices()
+    # MODIFICATION START: Comment out the creation of the smpl_hand mesh
+    # and remove it from the final combination. This prevents hands from being
+    # added to the model.
+    # smpl_hand = smpl_da.copy()
+    # smpl_hand.update_faces(
+    #     smplx_container.smplx_mano_vertex_mask.numpy()[smpl_hand.faces].all(axis=1)
+    # )
+    # smpl_hand.remove_unreferenced_vertices()
 
-    # combination of ECON body, SMPL-X side parts, SMPL-X hands
-    econ_da = sum([smpl_hand, smpl_da_body, econ_da_body])
+    # combination of ECON body and SMPL-X side parts (NO hands)
+    econ_da = sum([smpl_da_body, econ_da_body])
+
+    # NEW MODIFICATION: Call the repair function to close the wrist holes
+    econ_da = repair_and_fill_holes(econ_da)
+    econ_da.export(f"{prefix}/econ_da.obj")
+    # MODIFICATION END
+
+    # The poisson remeshing is now redundant and can be commented out or removed.
     # econ_da = poisson(
     #     econ_da, f"{prefix}/econ_da.obj", depth=10, face_count=1e5, laplacian_remeshing=True
     # )
@@ -531,36 +635,55 @@ if args.uv:
             red_path = red_images[img_id]
             blue_path = blue_images[img_id]
             print(f"Processing textures for ID: {img_id}")
-            
+
+            # load as float32 for diff computation
             red_img = np.array(Image.open(red_path).convert("RGB"), dtype=np.float32)
             blue_img = np.array(Image.open(blue_path).convert("RGB"), dtype=np.float32)
-            
-            diff = np.abs(red_img - blue_img)
-            diff_sum = np.sum(diff, axis=2)
-            diff_mask = (diff_sum > 0.01).astype(np.uint8) * 255
-            missing_mask = ((red_img.sum(axis=2) == 0) | (blue_img.sum(axis=2) == 0)).astype(np.uint8) * 255
+
+            # 1) per-channel absolute difference (cast to int16 to avoid underflow)
+            diff = np.abs(red_img.astype(np.int16) - blue_img.astype(np.int16))
+
+            # 2) mask where any channel exceeds threshold=20
+            threshold = 20
+            diff_mask = (np.any(diff > threshold, axis=2)).astype(np.uint8) * 255
+
+            # also mark completely missing texels
+            missing_mask = (
+                ((red_img.sum(axis=2) == 0) | (blue_img.sum(axis=2) == 0))
+                .astype(np.uint8) * 255
+            )
+
+            # combine
             final_mask = np.maximum(diff_mask, missing_mask)
-            
+
+            # save raw difference mask
             output_mask_path = osp.join(defrag_path, f"difference_mask_{img_id}.png")
             Image.fromarray(final_mask).save(output_mask_path)
             print(f"Saved difference mask for ID {img_id} at {output_mask_path}")
-            
-            # Inpainting process:
+
+            # prepare for inpainting: erode then dilate
             texture_8bit = red_img.astype(np.uint8)
-            small_kernel = np.ones((10,10), np.uint8)
+            small_kernel = np.ones((10, 10), np.uint8)
             eroded_mask = cv2.erode(final_mask, small_kernel, iterations=3)
             dilation_kernel = np.ones((45, 45), np.uint8)
             dilated_mask = cv2.dilate(eroded_mask, dilation_kernel, iterations=2)
-            
+
             diffmask_dilated_path = osp.join(defrag_path, f"diffmask_dilated_{img_id}.png")
             cv2.imwrite(diffmask_dilated_path, dilated_mask)
             print("Saved dilated difference mask at:", diffmask_dilated_path)
-            
+
+            # ensure mask matches texture size
             if dilated_mask.shape != texture_8bit.shape[:2]:
-                dilated_mask = cv2.resize(dilated_mask, (texture_8bit.shape[1], texture_8bit.shape[0]), interpolation=cv2.INTER_NEAREST)
-                
-            # Use the dilated mask for inpainting.
-            inpainted_texture = cv2.inpaint(texture_8bit, dilated_mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+                dilated_mask = cv2.resize(
+                    dilated_mask,
+                    (texture_8bit.shape[1], texture_8bit.shape[0]),
+                    interpolation=cv2.INTER_NEAREST
+                )
+
+            # inpaint using the dilated mask
+            inpainted_texture = cv2.inpaint(
+                texture_8bit, dilated_mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA
+            )
             inpainted_texture = cv2.cvtColor(inpainted_texture, cv2.COLOR_RGB2BGR)
             final_texture_filename = f"texture_map_inpainted_{img_id}.png"
             final_texture_path = osp.join(final_dir, final_texture_filename)
@@ -634,3 +757,22 @@ if args.uv:
     with open(final_obj_path, "w") as f:
         f.write(final_obj_contents)
     print("Final OBJ file saved at:", final_obj_path)
+
+    # --- MODIFICATION START: Add GLB Export ---
+    print("\n--- Exporting to GLB format ---")
+    final_glb_path = osp.join(final_dir, "final_model.glb")
+    try:
+        # Load the final, textured OBJ file to ensure all UVs and materials are included
+        final_mesh_for_export = trimesh.load(final_obj_path, process=False, force='mesh')
+
+        # Export to GLB format. Textures will be embedded automatically.
+        export_result = final_mesh_for_export.export(file_obj=final_glb_path, file_type='glb')
+        print(f"Successfully exported final mesh to GLB: {final_glb_path}")
+
+    except (RuntimeError, ValueError) as e:
+        # Catch errors if the GLB exporter fails for some reason
+        print(f"\nWARNING: Could not export to GLB. Error: {e}")
+    except Exception as e:
+        # Catch any other unexpected errors during export
+        print(f"\nWARNING: An unexpected error occurred during GLB export: {e}")
+    # --- MODIFICATION END ---
