@@ -5,12 +5,25 @@ __author__ = "Xu Cao <xucao.42@gmail.com>"
 __copyright__ = "Copyright (C) 2022 Xu Cao"
 __version__ = "2.0"
 
+from lib.common.BNI_utils import create_boundary_matrix, remove_stretched_faces, generate_dx_dy, map_depth_map_to_point_clouds, construct_facets_from
+from lib.dataset.mesh_util import clean_floats
 from scipy.sparse import spdiags, csr_matrix, vstack
 from scipy.sparse.linalg import cg
 import numpy as np
 from tqdm.auto import tqdm
 import time
 import pyvista as pv
+import torch
+import cupy as cp
+from cupyx.scipy.sparse import (
+    coo_matrix,
+    csr_matrix,
+    diags,
+    hstack,
+    spdiags,
+    vstack,
+)
+import trimesh
 # from pyamg.aggregation import smoothed_aggregation_solver
 
 
@@ -24,7 +37,7 @@ def move_top_right(mask): return np.pad(mask,((0,1),(1,0)),'constant',constant_v
 def move_bottom_left(mask): return np.pad(mask,((1,0),(0,1)),'constant',constant_values=0)[:-1,1:]  # Shift the input mask array down and to the left by 1, filling the top and right edges with zeros.
 def move_bottom_right(mask): return np.pad(mask,((1,0),(1,0)),'constant',constant_values=0)[:-1,:-1]  # Shift the input mask array down and to the right by 1, filling the top and left edges with zeros.
 
-
+"""
 def generate_dx_dy(mask, nz_horizontal, nz_vertical, step_size=1):
     # pixel coordinates
     # ^ vertical positive
@@ -76,6 +89,56 @@ def generate_dx_dy(mask, nz_horizontal, nz_vertical, step_size=1):
 
     # Return the four sparse matrices representing the partial derivatives for each direction.
     return D_horizontal_pos, D_horizontal_neg, D_vertical_pos, D_vertical_neg
+
+def generate_dx_dy_upsample(mask, nz_horizontal, nz_vertical, step_size=1, pixel_idx=None):
+    assert pixel_idx is not None, "Global pixel_idx must be passed in."
+    num_pixel = pixel_idx.max() + 1
+
+    def build_sparse_pairs(mask_dir, shift_axis, shift_val, nz_values):
+        # Convert CuPy arrays to NumPy if needed
+        if hasattr(nz_values, 'get'):
+            nz_values = nz_values.get()
+        
+        shifted_mask = np.roll(mask_dir, shift_val, axis=shift_axis)
+        valid_pairs = mask_dir & shifted_mask
+
+        current_indices = pixel_idx[valid_pairs]
+        neighbor_indices = pixel_idx[np.roll(valid_pairs, shift_val, axis=shift_axis)]
+
+        min_len = min(len(current_indices), len(neighbor_indices), len(nz_values))
+        current_indices = current_indices[:min_len]
+        neighbor_indices = neighbor_indices[:min_len]
+        nz_values = nz_values[:min_len]
+
+        data = np.stack([-nz_values / step_size, nz_values / step_size], axis=-1).flatten()
+        indices = np.stack((neighbor_indices, current_indices), axis=-1).flatten()
+        indptr = np.arange(0, len(current_indices) * 2 + 1, 2)
+
+        return csr_matrix((data, indices, indptr), shape=(len(current_indices), num_pixel))
+
+    has_left = np.logical_and(np.roll(mask, -1, axis=1), mask)
+    has_right = np.logical_and(np.roll(mask, 1, axis=1), mask)
+    has_top = np.logical_and(np.roll(mask, 1, axis=0), mask)
+    has_bottom = np.logical_and(np.roll(mask, -1, axis=0), mask)
+
+    # Convert CuPy arrays to NumPy if needed
+    if hasattr(nz_horizontal, 'get'):
+        nz_horizontal = nz_horizontal.get()
+    if hasattr(nz_vertical, 'get'):
+        nz_vertical = nz_vertical.get()
+
+    nz_left = nz_horizontal[has_left[mask]]
+    nz_right = nz_horizontal[has_right[mask]]
+    nz_top = nz_vertical[has_top[mask]]
+    nz_bottom = nz_vertical[has_bottom[mask]]
+
+    A1 = build_sparse_pairs(has_left, shift_axis=1, shift_val=1, nz_values=nz_left)
+    A2 = build_sparse_pairs(has_right, shift_axis=1, shift_val=-1, nz_values=nz_right)
+    A3 = build_sparse_pairs(has_top, shift_axis=0, shift_val=1, nz_values=nz_top)
+    A4 = build_sparse_pairs(has_bottom, shift_axis=0, shift_val=-1, nz_values=nz_bottom)
+
+    return A1, A2, A3, A4
+
 
 
 def construct_facets_from(mask):
@@ -134,7 +197,7 @@ def map_depth_map_to_point_clouds(depth_map, mask, K=None, step_size=1):
 
     return vertices
 
-
+"""
 def sigmoid(x, k=1):
     return 1 / (1 + np.exp(-k * x))
 
@@ -326,7 +389,213 @@ def bilateral_normal_integration(normal_map,
     wv_map = np.ones_like(normal_mask) * np.nan
     wv_map[normal_mask] = wu
 
-    return depth_map, surface, wu_map, wv_map, energy_list
+    result = {
+        "F_verts": torch.as_tensor(vertices).float(), 
+        "F_faces": torch.as_tensor(facets).long(), 
+        "F_depth": torch.as_tensor(depth_map).float()
+    }
+    # return depth_map, surface, wu_map, wv_map, energy_list
+    return result
+
+
+def bilateral_normal_integration_upt(normal_map,
+        normal_mask,
+        k=2,
+        depth_map=None,
+        depth_mask=None,
+        lambda1=0,
+        K=None,
+        step_size=1,
+        max_iter=150,
+        tol=1e-4,
+        cg_max_iter=5000,
+        cg_tol=1e-3,
+        lambda_boundary_consistency=1):
+    
+    num_normals = cp.sum(normal_mask)
+    normal_map = cp.asarray(normal_map)
+    normal_mask = cp.asarray(normal_mask)
+    if depth_mask is not None:
+        depth_map = cp.asarray(depth_map)
+        depth_mask = cp.asarray(depth_mask)
+        
+    # Transform the normal map from the normal coordinates to the camera coordinates
+    nx = normal_map[normal_mask, 1]
+    ny = normal_map[normal_mask, 0]
+    nz = - normal_map[normal_mask, 2]
+    del normal_map
+
+    # get partial derivative matrices
+    # right, left, top, bottom
+    A3, A4, A1, A2 = generate_dx_dy(normal_mask, nz_horizontal=nz, nz_vertical=nz, step_size=step_size)
+    
+    has_left_mask = cp.logical_and(move_right(normal_mask), normal_mask)
+    has_right_mask = cp.logical_and(move_left(normal_mask), normal_mask)
+    has_bottom_mask = cp.logical_and(move_top(normal_mask), normal_mask)
+    has_top_mask = cp.logical_and(move_bottom(normal_mask), normal_mask)
+
+    top_boundnary_mask = cp.logical_xor(has_top_mask, normal_mask)[normal_mask]
+    bottom_boundary_mask = cp.logical_xor(has_bottom_mask, normal_mask)[normal_mask]
+    left_boundary_mask = cp.logical_xor(has_left_mask, normal_mask)[normal_mask]
+    right_boudnary_mask = cp.logical_xor(has_right_mask, normal_mask)[normal_mask]
+
+    A_data = vstack((A1, A2, A3, A4))
+    A_zero = csr_matrix(A_data.shape)
+    A = hstack([A_data, A_zero])
+
+    b = cp.concatenate((-nx, -nx, -ny, -ny))
+
+    # initialization
+    W = spdiags(
+        0.5 * cp.ones(4 * num_normals), 0, 4 * num_normals, 4 * num_normals, format="csr"
+    )
+
+    z = cp.zeros(num_normals, float)
+    B, B_full = create_boundary_matrix(normal_mask)
+    B_mat = lambda_boundary_consistency * coo_matrix(B_full.get().T @ B_full.get())    #bug
+
+    energy_list = []
+    if depth_mask is not None:
+       # depth_mask_flat = depth_mask[normal_mask].astype(bool)    # shape: (num_normals,)
+       # z_prior = depth_map[normal_mask]    # shape: (num_normals,)
+       # z_prior[~depth_mask_flat] = 0
+       # m = depth_mask[normal_mask].astype(int)
+       # M = diags(m)
+        # Reshape depth_mask to match normal_mask's shape if it's 1D
+        if depth_mask.ndim == 1:
+            # Create a new 2D mask initialized with False
+            new_depth_mask = cp.zeros(normal_mask.shape, dtype=bool)
+            # Set True values in the first row up to the length of the 1D mask
+            new_depth_mask[0, :len(depth_mask)] = depth_mask
+            depth_mask = new_depth_mask
+        depth_mask_flat = depth_mask[normal_mask].astype(bool)    # shape: (num_normals,)
+        z_prior = depth_map[normal_mask]    # shape: (num_normals,)
+        z_prior[~depth_mask_flat] = 0
+        m = depth_mask[normal_mask].astype(int)
+        M = diags(m)
+    
+    energy = (A @ z - b).T @ W @ (A @ z - b) + \
+             lambda_boundary_consistency * (z - z_prior).T @ B_mat @ (z - z_prior)
+
+    depth_map_est = cp.ones_like(normal_mask, float) * cp.nan
+    facets = construct_facets_from(normal_mask)
+
+    for i in range(max_iter):
+        A_mat = A.T @ W @ A
+        b_vec = A.T @ W @ b
+        if depth_mask is not None:
+            b_vec += M @ z_prior
+            A_mat += M
+            offset = cp.mean((z_prior - z)[depth_mask_flat])
+            z = z + offset
+
+        D = spdiags(
+            1 / cp.clip(A_mat.diagonal(), 1e-5, None), 0, 2 * num_normals, 2 * num_normals,
+            "csr"
+        )    # Jacob preconditioner
+
+        z, _ = cg(
+            A_mat, b_vec, M=D, x0=z, maxiter=cg_max_iter, tol=cg_tol
+        )
+
+        wu = sigmoid((A2 @ z) ** 2 - (A1 @ z) ** 2, k)
+        wv = sigmoid((A4 @ z) ** 2 - (A3 @ z) ** 2, k)
+        wu[top_boundnary_mask] = 0.5
+        wu[bottom_boundary_mask] = 0.5
+        wv[left_boundary_mask] = 0.5
+        wv[right_boudnary_mask] = 0.5
+        W = spdiags(
+            cp.concatenate((wu, 1 - wu, wv, 1 - wv)), 0, 4 * num_normals, 4 * num_normals, format="csr"
+        )
+
+        energy_old = energy
+        energy = (A @ z - b).T @ W @ (A @ z - b) + \
+             lambda_boundary_consistency * (z - z_prior).T @ B_mat @ (z - z_prior)
+
+        energy_list.append(energy)
+        relative_energy = cp.abs(energy - energy_old) / energy_old
+
+        if relative_energy < tol:
+            break
+
+    depth_map_est[normal_mask] = z
+
+    vertices = cp.asnumpy(
+        map_depth_map_to_point_clouds(depth_map_est, normal_mask, K=None, step_size=step_size)
+    )
+    facets = cp.asnumpy(construct_facets_from(normal_mask))
+    faces = np.concatenate((facets[:, [1, 4, 3]], facets[:, [1, 3, 2]]), axis=0)
+    vertices, faces = remove_stretched_faces(vertices, faces)
+
+    mesh = clean_floats(trimesh.Trimesh(vertices, faces))
+    # Save mesh as obj
+    mesh_path = "output_mesh.obj"
+    mesh.export(mesh_path)
+
+    result = {
+        "F_verts": torch.as_tensor(mesh.vertices).float(), 
+        "F_faces": torch.as_tensor(mesh.faces).long(), 
+        "F_depth": torch.as_tensor(depth_map_est).float()
+    }
+    return result
+
+
+            
+        
+    
+
+def extract_surface_multiview(normal_list, mask_list, depth_list, K_list, scale=1.0, k=2, lambda1=0.1, max_iter=150, tol=1e-4):
+    """
+    Extract surfaces from multiple views using bilateral normal integration.
+    
+    Args:
+        normal_list (list): List of normal maps from different views
+        mask_list (list): List of masks from different views
+        depth_list (list): List of depth maps from different views
+        K_list (list): List of camera intrinsic matrices for each view
+        scale (float): Scale factor for depth values
+        k (float): Stiffness parameter for bilateral normal integration
+        lambda1 (float): Regularization parameter for depth guidance
+        max_iter (int): Maximum number of iterations
+        tol (float): Tolerance for convergence
+        
+    Returns:
+        list: List of dictionaries containing reconstruction results for each view
+    """
+    results = []
+    
+    for i, (normals, mask, depth, K) in enumerate(zip(normal_list, mask_list, depth_list, K_list)):
+        print(f"\nProcessing view {i}")
+        
+        # Scale depth values
+        depth_scaled = depth * scale
+        
+        # Run bilateral normal integration for this view
+        depth_map, surface, wu_map, wv_map, energy_list = bilateral_normal_integration(
+            normal_map=normals,
+            normal_mask=mask,
+            k=k,
+            depth_map=depth_scaled,
+            depth_mask=mask,
+            lambda1=lambda1,
+            K=K,
+            max_iter=max_iter,
+            tol=tol
+        )
+        
+        # Store results for this view
+        view_result = {
+            "depth_map": depth_map,
+            "surface": surface,
+            "wu_map": wu_map,
+            "wv_map": wv_map,
+            "energy_list": energy_list,
+            "camera_matrix": K
+        }
+        
+        results.append(view_result)
+        
+    return results
 
 
 if __name__ == '__main__':

@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import voxelize_cuda
+#import voxelize_cuda
 from torch.autograd import Function
 
 

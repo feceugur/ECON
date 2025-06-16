@@ -16,795 +16,455 @@
 
 import logging
 import warnings
-
-from apps.transform_normals import transform_normals
+import os
+import os.path as osp
+import json
+from PIL import Image
 
 warnings.filterwarnings("ignore")
 logging.getLogger("lightning").setLevel(logging.ERROR)
 logging.getLogger("trimesh").setLevel(logging.ERROR)
 
 import argparse
-import os
-
+import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torchvision
 import trimesh
-import pymeshlab
-from pytorch3d.ops import SubdivideMeshes
+import open3d as o3d
+import smplx
+import matplotlib.pyplot as plt
 from termcolor import colored
 from tqdm.auto import tqdm
 
-from apps.IFGeo import IFGeo
-from apps.Normal_f import Normal
-from apps.sapiens import ImageProcessor
-from apps.clean_mesh import MeshCleanProcess
+from pytorch3d.loss import chamfer_distance
+from pytorch3d.structures import Meshes
 
-from lib.common.BNI import BNI
-from lib.common.BNI_utils import save_normal_tensor
+# Assuming local imports from your project structure
+from apps.IFGeo import IFGeo
+from apps.Normal import Normal
+from apps.sapiens import ImageProcessor
 from lib.common.config import cfg
-from lib.common.imutils import blend_rgb_norm, load_img, transform_to_tensor, wrap
-from lib.common.local_affine import register
+from lib.common.imutils import wrap
+from lib.common.local_affine import LocalAffine
 from lib.common.render import query_color
-from lib.common.train_util import Format, init_loss
-from lib.common.voxelize import VoxelGrid
-from lib.dataset.mesh_util import *
-from lib.dataset.TestDataset_f import TestDataset
-from lib.net.geometry import rot6d_to_rotmat, rotation_matrix_to_angle_axis
+from lib.common.train_util import init_loss, Format, update_mesh_shape_prior_losses
+from lib.dataset.mesh_util import remesh
+from lib.dataset.TestDataset import TestDataset
+from lib.net.geometry import rot6d_to_rotmat, rotation_matrix_to_angle_axis, rotmat_to_rot6d
+from apps.CameraTransformManager import CameraTransformManager
 
 torch.backends.cudnn.benchmark = True
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
 
+# --- New or Improved Helper Functions ---
+
+def get_intrinsics_matrix(camera_info, image_size):
+    """Creates a 3x3 intrinsics matrix from camera parameters."""
+    fx = fy = camera_info["focal_length_px"]
+    width, height = image_size
+    # Use the provided image size, as cx/cy might differ from camera_info if cropped
+    cx = width / 2.0
+    cy = height / 2.0
+    return np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
+
+def unproject_pixels_to_camera_space(depth, mask, K, device='cuda'):
+    """
+    Unprojects pixels to a 3D point cloud in camera space.
+    depth: (H, W) tensor, depth in meters
+    mask: (H, W) boolean tensor, True for valid pixels
+    K: 3x3 numpy array, intrinsic matrix
+    """
+    H, W = depth.shape
+    K_inv = torch.from_numpy(np.linalg.inv(K)).float().to(device)
+    
+    # Create grid of pixel coordinates
+    j, i = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
+    
+    # Select coordinates and depth values for valid pixels
+    i_valid = i[mask]
+    j_valid = j[mask]
+    d_valid = depth[mask]
+
+    # Create homogeneous pixel coordinates [u, v, 1]
+    pixels_homo = torch.stack([
+        i_valid.float() * d_valid,
+        j_valid.float() * d_valid,
+        d_valid
+    ], dim=0)
+
+    # Unproject: (K_inv @ pixels_homo).T gives [X, Y, Z]
+    points_cam = torch.matmul(K_inv, pixels_homo).T
+    
+    return points_cam
+
+def sample_normals_at_pixels(normal_map, mask):
+    """
+    Samples normal vectors from a normal map at valid pixel locations.
+    normal_map: (3, H, W) tensor in [-1, 1]
+    mask: (H, W) boolean tensor
+    """
+    # normal_map is (C, H, W), we need to select based on mask (H, W)
+    # Permute to (H, W, C) for easier indexing
+    normals_permuted = normal_map.permute(1, 2, 0)
+    # Get normals for valid pixels
+    sampled_normals = normals_permuted[mask] # (N_valid, 3)
+    
+    # IMPORTANT: View-space normals are typically Y-down. Convert to standard 3D Y-up.
+    sampled_normals[:, 1] *= -1.0
+    
+    return F.normalize(sampled_normals, dim=1)
+
+
+def apply_homogeneous_transform(points, T):
+    """
+    Applies a 4x4 homogeneous transformation matrix `T` to a [N, 3] tensor `points`.
+    """
+    if points.dim() != 2 or points.shape[1] != 3:
+        raise ValueError("Input points must be of shape [N, 3]")
+    
+    N, _ = points.shape
+    # Add homogeneous coordinate
+    points_homo = torch.cat([points, torch.ones(N, 1, device=points.device)], dim=-1) # [N, 4]
+    
+    # Apply transformation: (T @ points_homo.T).T
+    transformed_points = torch.matmul(points_homo, T.T)
+    
+    return transformed_points[:, :3] # Return non-homogeneous [N, 3]
+
+def convert_rot_matrix_to_angle_axis(rot_matrix):
+    """ Helper to convert rotation matrices (B, J, 3, 3) or (B, 3, 3) to angle-axis. """
+    shape = rot_matrix.shape
+    is_batched_joints = len(shape) == 4
+
+    # Flatten for pytorch3d function
+    rot_flat = rot_matrix.reshape(-1, 3, 3)
+    
+    # pytorch3d expects a 4x4 matrix, but only uses the top-left 3x3 for rotation
+    angle_axis = rotation_matrix_to_angle_axis(rot_flat)
+
+    # Reshape back to original format (without the 3x3 dimensions)
+    if is_batched_joints:
+        return angle_axis.reshape(shape[0], shape[1], 3)
+    else:
+        return angle_axis.reshape(shape[0], 3)
+        
 if __name__ == "__main__":
-
-    # loading cfg file
+    # --- Argument Parsing and Config Loading ---
     parser = argparse.ArgumentParser()
-
     parser.add_argument("-gpu", "--gpu_device", type=int, default=0)
-    parser.add_argument("-loop_smpl", "--loop_smpl", type=int, default=50)
-    parser.add_argument("-patience", "--patience", type=int, default=5)
+    parser.add_argument("-loop_smpl", "--loop_smpl", type=int, default=50) # Increased for better convergence
+    parser.add_argument("-patience", "--patience", type=int, default=7)
     parser.add_argument("-in_dir", "--in_dir", type=str, default="./examples")
-    parser.add_argument("-in_b_dir", "--in_b_dir", type=str, default="./examples")
     parser.add_argument("-out_dir", "--out_dir", type=str, default="./results")
-    parser.add_argument("-seg_dir", "--seg_dir", type=str, default=None)
     parser.add_argument("-cfg", "--config", type=str, default="./configs/econ.yaml")
+    parser.add_argument("-seg_dir", "--seg_dir", type=str, default=None)
     parser.add_argument("-multi", action="store_false")
     parser.add_argument("-novis", action="store_true")
-
     args = parser.parse_args()
 
-    # cfg read and merge
     cfg.merge_from_file(args.config)
     cfg.merge_from_file("./lib/pymafx/configs/pymafx_config.yaml")
     device = torch.device(f"cuda:{args.gpu_device}")
-
-    # setting for testing on in-the-wild images
-    cfg_show_list = [
-        "test_gpus", [args.gpu_device], "mcube_res", 512, "clean_mesh", True, "test_mode", True,
-        "batch_size", 1
-    ]
- 
-    cfg.merge_from_list(cfg_show_list)
+    cfg.merge_from_list(["test_gpus", [args.gpu_device], "mcube_res", 512, "clean_mesh", True, "test_mode", True, "batch_size", 1])
     cfg.freeze()
-    normal_path = "/home/ubuntu/Data/Fulden/ckpt/normal.ckpt"
-    # load normal model
-    normal_net = Normal.load_from_checkpoint(
-        cfg=cfg, checkpoint_path=normal_path, map_location=device, strict=False
-    )
-    normal_net = normal_net.to(device)
-    normal_net.netG.eval()
-    print(
-        colored(
-            f"Resume Normal Estimator from {Format.start} {cfg.normal_path} {Format.end}", "green"
-        )
-    )
 
-    if cfg.sapiens.use:
-        sapiens_normal_net = ImageProcessor(device=device)
+    out_obj_dir = osp.join(args.out_dir, cfg.name, "obj")
+    out_png_dir = osp.join(args.out_dir, cfg.name, "png")
+    os.makedirs(out_obj_dir, exist_ok=True)
+    os.makedirs(out_png_dir, exist_ok=True)
 
-    # SMPLX object
-    SMPLX_object = SMPLX()
+    # --- Model Loading ---
+    normal_net = Normal.load_from_checkpoint(cfg=cfg, checkpoint_path=cfg.normal_path, map_location=device, strict=False).to(device).eval()
+    sapiens_normal_net = ImageProcessor(device=device)
+    ifnet = IFGeo.load_from_checkpoint(cfg=cfg, checkpoint_path=cfg.ifnet_path, map_location=device, strict=False).to(device).eval()
+    
+    print(colored("✅ Models loaded successfully.", "green"))
 
+    # --- Dataset Loading ---
     dataset_param = {
         "image_dir": args.in_dir,
-        "image_b_dir": args.in_b_dir,
         "seg_dir": args.seg_dir,
         "use_seg": True,    # w/ or w/o segmentation
         "hps_type": cfg.bni.hps_type,    # pymafx/pixie
         "vol_res": cfg.vol_res,
         "single": args.multi,
     }
-
-    if cfg.bni.use_ifnet:
-        # load IFGeo model
-        ifnet = IFGeo.load_from_checkpoint(
-            cfg=cfg, checkpoint_path=cfg.ifnet_path, map_location=device, strict=False
-        )
-        ifnet = ifnet.to(device)
-        ifnet.netG.eval()
-
-        print(colored(f"Resume IF-Net+ from {Format.start} {cfg.ifnet_path} {Format.end}", "green"))
-        print(colored(f"Complete with {Format.start} IF-Nets+ (Implicit) {Format.end}", "green"))
-    else:
-        print(colored(f"Complete with {Format.start} SMPL-X (Explicit) {Format.end}", "green"))
-
     dataset = TestDataset(dataset_param, device)
-    front_arr_dict, back_arr_dict = dataset[0]
+    
+    multi_view_data = [data for data in dataset]
+    if not multi_view_data:
+        raise ValueError("Dataset is empty. Check your -in_dir path.")
+    print(colored(f"✅ Loaded {len(multi_view_data)} views from dataset.", "green"))
 
-    print(colored(f"Dataset Size: {len(dataset)}", "green"))
+    # --- Multi-View Canonical SMPL Optimization ---
+    print(colored("🚀 Starting Multi-View Canonical SMPL Optimization...", "cyan"))
+    
+    # Setup Camera Transformation Manager
+    cam_param_path = os.path.join(args.in_dir, "cam_params", "camera_parameters.json")
+    canonical_frame_id = int(multi_view_data[0]["name"].split("_")[1])
+    transform_manager = CameraTransformManager(cam_param_path, target_frame=canonical_frame_id, device=device)
 
-    pbar = tqdm(dataset)
+    # Collect initial parameters and align to canonical frame
+    pose_list, trans_list, betas_list, exp_list, jaw_list, rotated_global_orients = [], [], [], [], [], []
+    T_first_inv = torch.inverse(transform_manager.get_transform_to_target(canonical_frame_id))
 
-    for data, data_b in pbar:
+    for data in multi_view_data:
+        frame_id = int(data["name"].split("_")[1])
+        T_view_to_world = transform_manager.get_transform_to_target(frame_id)
+        
+        # This aligns each view's orientation to the canonical world frame
+        R_relative = T_view_to_world[:3, :3] @ T_first_inv[:3, :3].T
+        global_orient_mat = rot6d_to_rotmat(data["global_orient"].view(-1, 6)).squeeze(0)
+        corrected_orient_mat = R_relative @ global_orient_mat
+        rotated_global_orients.append(rotmat_to_rot6d(corrected_orient_mat.unsqueeze(0)))
+        
+        pose_list.append(data["body_pose"])
+        trans_list.append(data["trans"]) # We will average translations later in world space
+        betas_list.append(data["betas"])
+        exp_list.append(data["exp"])
+        jaw_list.append(data["jaw_pose"])
 
-        losses = init_loss()
+    # Initialize optimizable parameters with the mean
+    optimed_pose = torch.stack(pose_list, dim=0).mean(dim=0).requires_grad_(True)
+    optimed_pose_mat = rot6d_to_rotmat(optimed_pose.view(-1, 6)).view(1, 1, 3, 3)
+    optimed_betas = torch.stack(betas_list).mean(dim=0).requires_grad_(True)
+    optimed_orient = torch.cat(rotated_global_orients).mean(dim=0).requires_grad_(True)
+    optimed_orient_mat = rot6d_to_rotmat(optimed_orient.view(-1, 6)).view(1, 1, 3, 3)
+    optimed_trans = torch.stack(trans_list).mean(dim=0).requires_grad_(True) # Initial guess
+    
+    # Use expression/jaw from the most frontal view (simple heuristic)
+    front_view_idx = 0 # Assume first view is frontal, can be improved
+    optimed_exp = exp_list[front_view_idx].detach()
+    optimed_jaw_pose = jaw_list[front_view_idx].detach()
 
-        pbar.set_description(f"{data['name']}")
+    optimizer_smpl = torch.optim.Adam([optimed_pose, optimed_betas, optimed_orient, optimed_trans], lr=1e-2, amsgrad=True)
+    scheduler_smpl = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer_smpl, 'min', factor=0.5, patience=args.patience)
 
-        # final results rendered as image (PNG)
-        # 1. Render the final fitted SMPL (xxx_smpl.png)
-        # 2. Render the final reconstructed clothed human (xxx_cloth.png)
-        # 3. Blend the original image with predicted cloth normal (xxx_overlap.png)
-        # 4. Blend the cropped image with predicted cloth normal (xxx_crop.png)
-
-        os.makedirs(osp.join(args.out_dir, cfg.name, "png"), exist_ok=True)
-
-        # final reconstruction meshes (OBJ)
-        # 1. SMPL mesh (xxx_smpl_xx.obj)
-        # 2. SMPL params (xxx_smpl.npy)
-        # 3. d-BiNI surfaces (xxx_BNI.obj)
-        # 4. seperate face/hand mesh (xxx_hand/face.obj)
-        # 5. full shape impainted by IF-Nets+ after remeshing (xxx_IF.obj)
-        # 6. sideded or occluded parts (xxx_side.obj)
-        # 7. final reconstructed clothed human (xxx_full.obj)
-
-        os.makedirs(osp.join(args.out_dir, cfg.name, "obj"), exist_ok=True)
-
-        in_tensor = {
-            "smpl_faces": data["smpl_faces"],
-            "image": data["img_icon"].to(device), 
-            "image_back": data_b["img_icon"].to(device),
-            "mask": data["img_mask"].to(device),
-            "mask_back": data_b["img_mask"].to(device)
-        }
-
-        # The optimizer and variables
-        optimed_pose = data["body_pose"].requires_grad_(True)
-        optimed_trans = data["trans"].requires_grad_(True)
-        optimed_betas = data["betas"].requires_grad_(True)
-        optimed_orient = data["global_orient"].requires_grad_(True)
-
-        optimizer_smpl = torch.optim.Adam([
-            optimed_pose, optimed_trans, optimed_betas, optimed_orient
-        ],
-                                          lr=1e-2,
-                                          amsgrad=True)
-        scheduler_smpl = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer_smpl,
-            mode="min",
-            factor=0.5,
-            verbose=0,
-            min_lr=1e-5,
-            patience=args.patience,
+    loop_smpl = tqdm(range(args.loop_smpl), desc="Optimizing SMPL")
+    for i in loop_smpl:
+        optimizer_smpl.zero_grad()
+        
+        total_loss = torch.tensor(0.0, device=device)
+        
+        # Get canonical SMPL mesh
+        smpl_verts, _, smpl_joints = dataset.smpl_model(
+            shape_params=optimed_betas, 
+            expression_params=optimed_exp,
+            body_pose=optimed_pose_mat, 
+            global_pose=optimed_orient_mat,
+            jaw_pose=optimed_jaw_pose.unsqueeze(1)
         )
+        smpl_verts = (smpl_verts + optimed_trans) * multi_view_data[0]["scale"]
 
-        # [result_loop_1, result_loop_2, ...]
-        per_data_lst = []
+        # Loop through each view to compute loss
+        for data in multi_view_data:
+            frame_id = int(data["name"].split("_")[1])
+            T_world_to_view = torch.inverse(transform_manager.get_transform_to_target(frame_id))
 
-        N_body, N_pose = optimed_pose.shape[:2]
-
-        smpl_path = f"{args.out_dir}/{cfg.name}/obj/{data['name']}_smpl_00.obj"
-
-        # sapiens inference for current batch data
-
-        if cfg.sapiens.use:
+            # Project canonical SMPL into current view
+            verts_in_view = apply_homogeneous_transform(smpl_verts.squeeze(0), T_world_to_view).unsqueeze(0)
             
-            sapiens_normal = sapiens_normal_net.process_image(
-                Image.fromarray(
-                    data["img_raw"].squeeze(0).permute(1, 2, 0).numpy().astype(np.uint8)
-                ), "1b", cfg.sapiens.seg_model
-            )
-            print(colored("Estimating normal maps from input image, using Sapiens-normal", "green"))
+            # Render silhouette
+            T_normal_F, _ = dataset.render_normal(verts_in_view * torch.tensor([1.0, -1.0, -1.0], device=device), data["smpl_faces"])
+            T_mask_F, _ = dataset.render.get_image(type="mask")
 
-            sapiens_normal_square_lst = []
-            for idx in range(len(data["img_icon"])):
-                sapiens_normal_square_lst.append(wrap(sapiens_normal, data["uncrop_param"], idx))
-            sapiens_normal_square = torch.cat(sapiens_normal_square_lst)
-
-        # remove this line if you change the loop_smpl and obtain different SMPL-X fits
+            # Silhouette Loss
+            sil_loss = F.l1_loss(T_mask_F, data["img_mask"].to(device))
+            
+            total_loss += sil_loss
         
-        if osp.exists(smpl_path) and (not cfg.force_smpl_optim):
-            smpl_verts_lst = []
-            smpl_faces_lst = []
+        total_loss /= len(multi_view_data)
+        total_loss.backward()
+        optimizer_smpl.step()
+        scheduler_smpl.step(total_loss)
+        loop_smpl.set_description(f"Optimizing SMPL (Loss: {total_loss.item():.4f})")
 
-            for idx in range(N_body):
+    print(colored("✅ Canonical SMPL optimization complete.", "green"))
 
-                smpl_obj = f"{args.out_dir}/{cfg.name}/obj/{data['name']}_smpl_{idx:02d}.obj"
-                smpl_mesh = trimesh.load(smpl_obj)
-                smpl_verts = torch.tensor(smpl_mesh.vertices).to(device).float()
-                smpl_faces = torch.tensor(smpl_mesh.faces).to(device).long()
-                smpl_verts_lst.append(smpl_verts)
-                smpl_faces_lst.append(smpl_faces)
-
-            batch_smpl_verts = torch.stack(smpl_verts_lst)
-            batch_smpl_faces = torch.stack(smpl_faces_lst)
-
-            # render optimized mesh as normal [-1,1]
-            in_tensor["T_normal_F"], in_tensor["T_normal_B"] = dataset.render_normal(
-                batch_smpl_verts, batch_smpl_faces
-            )
-
-            with torch.no_grad():
-                in_tensor["normal_F"], in_tensor["normal_B"] = normal_net.netG(in_tensor)
-
-            in_tensor["smpl_verts"] = batch_smpl_verts * torch.tensor([1., -1., 1.]).to(device)
-            in_tensor["smpl_faces"] = batch_smpl_faces[:, :, [0, 2, 1]]
-        
-        else:
-            # smpl optimization
-            loop_smpl = tqdm(range(args.loop_smpl))
-
-            for i in loop_smpl:
-
-                per_loop_lst = []
-
-                optimizer_smpl.zero_grad()
-
-                N_body, N_pose = optimed_pose.shape[:2]
-
-                # 6d_rot to rot_mat
-                optimed_orient_mat = rot6d_to_rotmat(optimed_orient.view(-1,
-                                                                         6)).view(N_body, 1, 3, 3)
-                optimed_pose_mat = rot6d_to_rotmat(optimed_pose.view(-1,
-                                                                     6)).view(N_body, N_pose, 3, 3)
-
-                smpl_verts, smpl_landmarks, smpl_joints = dataset.smpl_model(
-                    shape_params=optimed_betas,
-                    expression_params=tensor2variable(data["exp"], device),
-                    body_pose=optimed_pose_mat,
-                    global_pose=optimed_orient_mat,
-                    jaw_pose=tensor2variable(data["jaw_pose"], device),
-                    left_hand_pose=tensor2variable(data["left_hand_pose"], device),
-                    right_hand_pose=tensor2variable(data["right_hand_pose"], device),
-                )
-
-                smpl_verts = (smpl_verts + optimed_trans) * data["scale"]
-                smpl_joints = (smpl_joints + optimed_trans) * data["scale"] * torch.tensor([
-                    1.0, 1.0, -1.0
-                ]).to(device)
-
-                # landmark errors
-                smpl_joints_3d = (
-                    smpl_joints[:, dataset.smpl_data.smpl_joint_ids_45_pixie, :] + 1.0
-                ) * 0.5
-                in_tensor["smpl_joint"] = smpl_joints[:,
-                                                      dataset.smpl_data.smpl_joint_ids_24_pixie, :]
-
-                ghum_lmks = data["landmark"][:, SMPLX_object.ghum_smpl_pairs[:, 0], :2].to(device)
-                ghum_conf = data["landmark"][:, SMPLX_object.ghum_smpl_pairs[:, 0], -1].to(device)
-                smpl_lmks = smpl_joints_3d[:, SMPLX_object.ghum_smpl_pairs[:, 1], :2]
-
-                # render optimized mesh as normal [-1,1]
-                in_tensor["T_normal_F"], in_tensor["T_normal_B"] = dataset.render_normal(
-                    smpl_verts * torch.tensor([1.0, -1.0, -1.0]).to(device),
-                    in_tensor["smpl_faces"],
-                )
-
-                img_norm_path_f = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_smpl_front_normal.png")
-                torchvision.utils.save_image((in_tensor['T_normal_F'].detach().cpu()),img_norm_path_f)
-                img_norm_path_b = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_smpl_back_normal.png")
-                torchvision.utils.save_image((in_tensor['T_normal_B'].detach().cpu()),img_norm_path_b)
-
-                T_mask_F, T_mask_B = dataset.render.get_image(type="mask")
-
-                with torch.no_grad():
-                    # [1, 3, 512, 512], (-1.0, 1.0)
-                    in_tensor["normal_F"], in_tensor["normal_B"] = normal_net.netG(in_tensor)
-
-                img_crop_path = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_normal_and_mask.png")
-                row1 = torch.cat([data["img_crop"][:, :3], data_b["img_crop"][:, :3]], dim=3)  # Concatenate front and back images
-                row2 = torch.cat([(in_tensor['normal_F'].detach().cpu() + 1.0) * 0.5, 
-                                (in_tensor['normal_B'].detach().cpu() + 1.0) * 0.5], dim=3)  # Concatenate normal front and back
-                row3 = torch.cat([in_tensor["mask"].unsqueeze(1).repeat(1, 3, 1, 1).detach().cpu(),
-                                in_tensor["mask_back"].unsqueeze(1).repeat(1, 3, 1, 1).detach().cpu()], dim=3)  # Concatenate mask and mask_back
-                # Now stack the rows vertically (along dim=2)
-                final_tensor = torch.cat([row1, row2, row3], dim=2)
-
-                # Save the final vertically stacked image
-                torchvision.utils.save_image(final_tensor, img_crop_path)
-                
-                # Convert T_back to a tensor and extract rotation matrix
-                T_back_tensor = torch.tensor([
-                    [-1.00000000e+00, -3.22578062e-08,  1.23496643e-07, -6.84291201e-08],
-                    [ 3.22577886e-08, -1.00000000e+00, -1.42392824e-07,  6.84291228e-08],
-                    [ 1.23496647e-07, -1.42392820e-07,  1.00000000e+00, -4.00848333e-08],
-                    [ 0.00000000e+00,  0.00000000e+00,  0.00000000e+00,  1.00000000e+00]
-                ], dtype=torch.float32)
-
-                R_back_tensor = T_back_tensor[:3, :3]  # Extract 3x3 rotation matrix
-
-                # Apply the transformation
-                in_tensor["normal_B"] = transform_normals(in_tensor["normal_B"], R_back_tensor)
-                
-                img_crop_path = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_after_transform.png")
-                row1 = torch.cat([data["img_crop"][:, :3], data_b["img_crop"][:, :3]], dim=3)  # Concatenate front and back images
-                row2 = torch.cat([(in_tensor['normal_F'].detach().cpu() + 1.0) * 0.5, 
-                                (in_tensor['normal_B'].detach().cpu() + 1.0) * 0.5], dim=3)  # Concatenate normal front and back
-                row3 = torch.cat([in_tensor["mask"].unsqueeze(1).repeat(1, 3, 1, 1).detach().cpu(),
-                                in_tensor["mask_back"].unsqueeze(1).repeat(1, 3, 1, 1).detach().cpu()], dim=3)  # Concatenate mask and mask_back
-
-                # Now stack the rows vertically (along dim=2)
-                final_tensor = torch.cat([row1, row2, row3], dim=2)
-
-                # Save the final vertically stacked image
-                torchvision.utils.save_image(final_tensor, img_crop_path)
-                
-
-                # only replace the front cloth normals, and the back cloth normals will get improved accordingly
-                # as the back cloth normals are conditioned on the body cloth normals
-
-                if cfg.sapiens.use:
-                    in_tensor["normal_F"] = sapiens_normal_square
-
-                diff_F_smpl = torch.abs(in_tensor["T_normal_F"] - in_tensor["normal_F"])
-                diff_B_smpl = torch.abs(in_tensor["T_normal_B"] - in_tensor["normal_B"])
-
-                # silhouette loss
-                smpl_arr = torch.cat([T_mask_F, T_mask_B], dim=-1)
-                gt_arr = in_tensor["mask"].repeat(1, 1, 2)
-                diff_S = torch.abs(smpl_arr - gt_arr)
-                losses["silhouette"]["value"] = diff_S.mean()
-
-                # large cloth_overlap --> big difference between body and cloth mask
-                # for loose clothing, reply more on landmarks instead of silhouette+normal loss
-                cloth_overlap = diff_S.sum(dim=[1, 2]) / gt_arr.sum(dim=[1, 2])
-                cloth_overlap_flag = cloth_overlap > cfg.cloth_overlap_thres
-                losses["joint"]["weight"] = [10.0 if flag else 1.0 for flag in cloth_overlap_flag]
-
-                # small body_overlap --> large occlusion or out-of-frame
-                # for highly occluded body, reply only on high-confidence landmarks, no silhouette+normal loss
-
-                # BUG: PyTorch3D silhouette renderer generates dilated mask
-                bg_value = in_tensor["T_normal_F"][0, 0, 0, 0]
-                smpl_arr_fake = torch.cat([
-                    in_tensor["T_normal_F"][:, 0].ne(bg_value).float(),
-                    in_tensor["T_normal_B"][:, 0].ne(bg_value).float()
-                ],
-                                          dim=-1)
-
-                body_overlap = (gt_arr * smpl_arr_fake.gt(0.0)
-                               ).sum(dim=[1, 2]) / smpl_arr_fake.gt(0.0).sum(dim=[1, 2])
-                body_overlap_mask = (gt_arr * smpl_arr_fake).unsqueeze(1)
-                body_overlap_flag = body_overlap < cfg.body_overlap_thres
-
-                if not cfg.sapiens.use:
-                    losses["normal"]["value"] = (
-                        diff_F_smpl * body_overlap_mask[..., :512] +
-                        diff_B_smpl * body_overlap_mask[..., 512:]
-                    ).mean() / 2.0
-                else:
-                    losses["normal"]["value"] = diff_F_smpl * body_overlap_mask[..., :512]
-
-                losses["silhouette"]["weight"] = [0 if flag else 1.0 for flag in body_overlap_flag]
-                occluded_idx = torch.where(body_overlap_flag)[0]
-                ghum_conf[occluded_idx] *= ghum_conf[occluded_idx] > 0.95
-                losses["joint"]["value"] = (torch.norm(ghum_lmks - smpl_lmks, dim=2) *
-                                            ghum_conf).mean(dim=1)
-
-                # Weighted sum of the losses
-                smpl_loss = 0.0
-                pbar_desc = "Body Fitting -- "
-                for k in ["normal", "silhouette", "joint"]:
-                    per_loop_loss = (
-                        losses[k]["value"] * torch.tensor(losses[k]["weight"]).to(device)
-                    ).mean()
-                    pbar_desc += f"{k}: {per_loop_loss:.3f} | "
-                    smpl_loss += per_loop_loss
-                pbar_desc += f"Total: {smpl_loss:.3f}"
-                loose_str = ''.join([str(j) for j in cloth_overlap_flag.int().tolist()])
-                occlude_str = ''.join([str(j) for j in body_overlap_flag.int().tolist()])
-                pbar_desc += colored(f"| loose:{loose_str}, occluded:{occlude_str}", "yellow")
-                loop_smpl.set_description(pbar_desc)
-
-                # save intermediate results
-                if (i == args.loop_smpl - 1) and (not args.novis):
-
-                    per_loop_lst.extend([
-                        in_tensor["image"],
-                        in_tensor["T_normal_F"],
-                        in_tensor["normal_F"],
-                        diff_S[:, :, :512].unsqueeze(1).repeat(1, 3, 1, 1),
-                    ])
-                    per_loop_lst.extend([
-                        in_tensor["image"],
-                        in_tensor["T_normal_B"],
-                        in_tensor["normal_B"],
-                        diff_S[:, :, 512:].unsqueeze(1).repeat(1, 3, 1, 1),
-                    ])
-                    per_data_lst.append(
-                        get_optim_grid_image(per_loop_lst, None, nrow=N_body * 2, type="smpl")
-                    )
-
-                smpl_loss.backward()
-                optimizer_smpl.step()
-                scheduler_smpl.step(smpl_loss)
-
-            in_tensor["smpl_verts"] = smpl_verts * torch.tensor([1.0, 1.0, -1.0]).to(device)
-            in_tensor["smpl_faces"] = in_tensor["smpl_faces"][:, :, [0, 2, 1]]
-
-            if not args.novis:
-                per_data_lst[-1].save(
-                    osp.join(args.out_dir, cfg.name, f"png/{data['name']}_smpl.png")
-                )
-
-        if not args.novis:
-            img_crop_path = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_crop.png")
-            torchvision.utils.save_image(
-                torch.cat([
-                    data["img_crop"][:, :3], (in_tensor['normal_F'].detach().cpu() + 1.0) * 0.5,
-                    (in_tensor['normal_B'].detach().cpu() + 1.0) * 0.5
-                ],
-                          dim=3), img_crop_path
-            )
-
-            rgb_norm_F = blend_rgb_norm(in_tensor["normal_F"], data)
-            rgb_norm_B = blend_rgb_norm(in_tensor["normal_B"], data)
-
-            img_overlap_path = osp.join(args.out_dir, cfg.name, f"png/{data['name']}_overlap.png")
-            torchvision.utils.save_image(
-                torch.cat([data["img_raw"], rgb_norm_F, rgb_norm_B], dim=-1) / 255.,
-                img_overlap_path
-            )
-
-        smpl_obj_lst = []
-
-        for idx in range(N_body):
-
-            smpl_obj = trimesh.Trimesh(
-                in_tensor["smpl_verts"].detach().cpu()[idx] * torch.tensor([1.0, -1.0, 1.0]),
-                in_tensor["smpl_faces"].detach().cpu()[0][:, [0, 2, 1]],
-                process=False,
-                maintains_order=True,
-            )
-
-            smpl_obj_path = f"{args.out_dir}/{cfg.name}/obj/{data['name']}_smpl_{idx:02d}.obj"
-
-            if not osp.exists(smpl_obj_path) or cfg.force_smpl_optim:
-                smpl_obj.export(smpl_obj_path)
-                smpl_info = {
-                    "betas":
-                    optimed_betas[idx].detach().cpu().unsqueeze(0),
-                    "body_pose":
-                    rotation_matrix_to_angle_axis(optimed_pose_mat[idx].detach()
-                                                 ).cpu().unsqueeze(0),
-                    "global_orient":
-                    rotation_matrix_to_angle_axis(optimed_orient_mat[idx].detach()
-                                                 ).cpu().unsqueeze(0),
-                    "transl":
-                    optimed_trans[idx].detach().cpu(),
-                    "expression":
-                    data["exp"][idx].cpu().unsqueeze(0),
-                    "jaw_pose":
-                    rotation_matrix_to_angle_axis(data["jaw_pose"][idx]).cpu().unsqueeze(0),
-                    "left_hand_pose":
-                    rotation_matrix_to_angle_axis(data["left_hand_pose"][idx]).cpu().unsqueeze(0),
-                    "right_hand_pose":
-                    rotation_matrix_to_angle_axis(data["right_hand_pose"][idx]).cpu().unsqueeze(0),
-                    "scale":
-                    data["scale"][idx].cpu(),
-                }
-                np.save(
-                    smpl_obj_path.replace(".obj", ".npy"),
-                    smpl_info,
-                    allow_pickle=True,
-                )
-            smpl_obj_lst.append(smpl_obj)
-
-        del optimizer_smpl
-        del optimed_betas
-        del optimed_orient
-        del optimed_pose
-        del optimed_trans
-
-        torch.cuda.empty_cache()
-
-        # ------------------------------------------------------------------------------------------------------------------
-        # clothing refinement
-
-        per_data_lst = []
-
-        batch_smpl_verts = in_tensor["smpl_verts"].detach() * torch.tensor([1.0, -1.0, 1.0],
-                                                                           device=device)
-        batch_smpl_faces = in_tensor["smpl_faces"].detach()[:, :, [0, 2, 1]]
-
-        in_tensor["depth_F"], in_tensor["depth_B"] = dataset.render_depth(
-            batch_smpl_verts, batch_smpl_faces
+    # --- Generate Final Canonical SMPL and Per-View Data ---
+    with torch.no_grad():
+        smpl_verts, _, _ = dataset.smpl_model(
+            shape_params=optimed_betas, 
+            expression_params=optimed_exp,
+            body_pose=rot6d_to_rotmat(optimed_pose), 
+            global_pose=rot6d_to_rotmat(optimed_orient.unsqueeze(0)).unsqueeze(1),
+            jaw_pose=optimed_jaw_pose.unsqueeze(1)
         )
+        canonical_smpl_verts = ((smpl_verts + optimed_trans) * multi_view_data[0]["scale"]).squeeze(0)
+        canonical_smpl_faces = multi_view_data[0]["smpl_faces"].squeeze(0).cpu().numpy()
 
-        per_loop_lst = []
+        canonical_smpl_mesh = trimesh.Trimesh(canonical_smpl_verts.cpu().numpy(), canonical_smpl_faces, process=False)
+        canonical_smpl_mesh.export(osp.join(out_obj_dir, "canonical_smpl.obj"))
+        print(colored("✅ Saved canonical SMPL mesh.", "green"))
 
-        in_tensor["BNI_verts"] = []
-        in_tensor["BNI_faces"] = []
-        in_tensor["body_verts"] = []
-        in_tensor["body_faces"] = []
+    # --- Multi-View Point Cloud Fusion (NEW PIPELINE) ---
+    print(colored("🚀 Starting Multi-View Point Cloud Fusion...", "cyan"))
+    all_points_world, all_normals_world = [], []
+    with open(cam_param_path, "r") as f:
+        cam_params_json = json.load(f)
 
-        for idx in range(N_body):
-
-            final_path = f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_full.obj"
-
-            side_mesh = smpl_obj_lst[idx].copy()
-            face_mesh = smpl_obj_lst[idx].copy()
-            hand_mesh = smpl_obj_lst[idx].copy()
-            smplx_mesh = smpl_obj_lst[idx].copy()
-
-            # save normals, depths and masks
-            BNI_dict = save_normal_tensor(
-                in_tensor,
-                idx,
-                osp.join(args.out_dir, cfg.name, f"BNI/{data['name']}_{idx}"),
-                cfg.bni.thickness,
-            )
-
-            # BNI process
-            BNI_object = BNI(
-                dir_path=osp.join(args.out_dir, cfg.name, "BNI"),
-                name=data["name"],
-                BNI_dict=BNI_dict,
-                cfg=cfg.bni,
-                device=device
-            )
-
-            BNI_object.extract_surface(False)
-
-            in_tensor["body_verts"].append(torch.tensor(smpl_obj_lst[idx].vertices).float())
-            in_tensor["body_faces"].append(torch.tensor(smpl_obj_lst[idx].faces).long())
-
-            # requires shape completion when low overlap
-            # replace SMPL by completed mesh as side_mesh
-
-            if cfg.bni.use_ifnet:
-
-                side_mesh_path = f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_IF.obj"
-
-                side_mesh = apply_face_mask(side_mesh, ~SMPLX_object.smplx_eyeball_fid_mask)
-
-                # mesh completion via IF-net
-                in_tensor.update(
-                    dataset.depth_to_voxel({
-                        "depth_F": BNI_object.F_depth.unsqueeze(0), "depth_B":
-                        BNI_object.B_depth.unsqueeze(0)
-                    })
-                )
-
-                occupancies = VoxelGrid.from_mesh(side_mesh, cfg.vol_res, loc=[
-                    0,
-                ] * 3, scale=2.0).data.transpose(2, 1, 0)
-                occupancies = np.flip(occupancies, axis=1)
-
-                in_tensor["body_voxels"] = torch.tensor(occupancies.copy()
-                                                       ).float().unsqueeze(0).to(device)
-
-                with torch.no_grad():
-                    sdf = ifnet.reconEngine(netG=ifnet.netG, batch=in_tensor)
-                    verts_IF, faces_IF = ifnet.reconEngine.export_mesh(sdf)
-
-                if ifnet.clean_mesh_flag:
-                    verts_IF, faces_IF = clean_mesh(verts_IF, faces_IF)
-
-                side_mesh = trimesh.Trimesh(verts_IF, faces_IF)
-                side_mesh = remesh_laplacian(side_mesh, side_mesh_path)
-
-            else:
-                side_mesh = apply_vertex_mask(
-                    side_mesh,
-                    (
-                        SMPLX_object.front_flame_vertex_mask + SMPLX_object.smplx_mano_vertex_mask +
-                        SMPLX_object.eyeball_vertex_mask
-                    ).eq(0).float(),
-                )
-
-                #register side_mesh to BNI surfaces
-                side_mesh = Meshes(
-                    verts=[torch.tensor(side_mesh.vertices).float()],
-                    faces=[torch.tensor(side_mesh.faces).long()],
-                ).to(device)
-                sm = SubdivideMeshes(side_mesh)
-                side_mesh = register(BNI_object.F_B_trimesh, sm(side_mesh), device)
-
-            side_verts = torch.tensor(side_mesh.vertices).float().to(device)
-            side_faces = torch.tensor(side_mesh.faces).long().to(device)
-
-            # Possion Fusion between SMPLX and BNI
-            # 1. keep the faces invisible to front+back cameras
-            # 2. keep the front-FLAME+MANO faces
-            # 3. remove eyeball faces
-
-            # export intermediate meshes
-            BNI_object.F_B_trimesh.export(
-                f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_BNI.obj"
-            )
-            full_lst = []
-
-            if "face" in cfg.bni.use_smpl:
-
-                # only face
-                face_mesh = apply_vertex_mask(face_mesh, SMPLX_object.front_flame_vertex_mask)
-
-                if not face_mesh.is_empty:
-                    face_mesh.vertices = face_mesh.vertices - np.array([0, 0, cfg.bni.thickness])
-
-                    # remove face neighbor triangles
-                    BNI_object.F_B_trimesh = part_removal(
-                        BNI_object.F_B_trimesh,
-                        face_mesh,
-                        cfg.bni.face_thres,
-                        device,
-                        smplx_mesh,
-                        region="face"
-                    )
-                    side_mesh = part_removal(
-                        side_mesh, face_mesh, cfg.bni.face_thres, device, smplx_mesh, region="face"
-                    )
-                    face_mesh.export(f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_face.obj")
-                    full_lst += [face_mesh]
-
-            if "hand" in cfg.bni.use_smpl:
-                hand_mask = torch.zeros(SMPLX_object.smplx_verts.shape[0], )
-
-                if data['hands_visibility'][idx][0]:
-
-                    mano_left_vid = np.unique(
-                        np.concatenate([
-                            SMPLX_object.smplx_vert_seg["leftHand"],
-                            SMPLX_object.smplx_vert_seg["leftHandIndex1"],
-                        ])
-                    )
-
-                    hand_mask.index_fill_(0, torch.tensor(mano_left_vid), 1.0)
-
-                if data['hands_visibility'][idx][1]:
-
-                    mano_right_vid = np.unique(
-                        np.concatenate([
-                            SMPLX_object.smplx_vert_seg["rightHand"],
-                            SMPLX_object.smplx_vert_seg["rightHandIndex1"],
-                        ])
-                    )
-
-                    hand_mask.index_fill_(0, torch.tensor(mano_right_vid), 1.0)
-
-                # only hands
-                hand_mesh = apply_vertex_mask(hand_mesh, hand_mask)
-
-                if not hand_mesh.is_empty:
-                    # remove hand neighbor triangles
-                    BNI_object.F_B_trimesh = part_removal(
-                        BNI_object.F_B_trimesh,
-                        hand_mesh,
-                        cfg.bni.hand_thres,
-                        device,
-                        smplx_mesh,
-                        region="hand"
-                    )
-                    side_mesh = part_removal(
-                        side_mesh, hand_mesh, cfg.bni.hand_thres, device, smplx_mesh, region="hand"
-                    )
-                    hand_mesh.export(f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_hand.obj")
-                    full_lst += [hand_mesh]
-
-            full_lst += [BNI_object.F_B_trimesh]
-
-            # initial side_mesh could be SMPLX or IF-net
-            side_mesh = part_removal(
-                side_mesh, sum(full_lst), 2e-2, device, smplx_mesh, region="", clean=False
-            )
-
-            full_lst += [side_mesh]
-
-            # # export intermediate meshes
-            BNI_object.F_B_trimesh.export(
-                f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_BNI.obj"
-            )
-            side_mesh.export(f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_side.obj")
-
-            if cfg.bni.use_poisson:
-                final_mesh = poisson(
-                    sum(full_lst),
-                    final_path,
-                    cfg.bni.poisson_depth,
-                )
-                print(
-                    colored(
-                        f"\n Poisson completion to {Format.start} {final_path} {Format.end}",
-                        "yellow"
-                    )
-                )
-            else:
-                final_mesh = sum(full_lst)
-                final_mesh.export(final_path)
-
-            # Load the final mesh
-            final_trimesh = trimesh.load(final_path)
-
-            # Convert face vertex indices to NumPy array
-            face_vids = np.array(SMPLX_object.front_flame_vertex_mask, dtype=np.int32)
-
-            # Get all vertices and faces
-            vertices = final_trimesh.vertices
-            faces = final_trimesh.faces
-
-            # Find faces that contain at least one face vertex (to exclude from simplification)
-            face_mask = np.isin(faces, face_vids).any(axis=1)
-
-            # Separate face and body meshes
-            face_mesh = trimesh.Trimesh(vertices=vertices, faces=faces[face_mask])  # Face remains unchanged
-            body_mesh = trimesh.Trimesh(vertices=vertices, faces=faces[~face_mask])  # Body will be simplified
-
-            # Compute the target reduction ratio (must be between 0 and 1)
-            target_faces = 25000  # Adjust polygon count
-            current_body_faces = len(body_mesh.faces)
-            target_reduction = max(0.0, min(1.0, 1 - (target_faces / current_body_faces)))
-
-            # Apply decimation **only to the body**
-            simplified_body = body_mesh.simplify_quadric_decimation(target_reduction)
-
-            # Merge the unchanged face with the simplified body
-            final_mesh = trimesh.util.concatenate([face_mesh, simplified_body])
-
-            # Export the final mesh
-            final_mesh.export(final_path)
-            final_mesh.export(f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_test.obj")
-            if not args.novis:
-                dataset.render.load_meshes(final_mesh.vertices, final_mesh.faces)
-                rotate_recon_lst = dataset.render.get_image(cam_type="four")
-                per_loop_lst.extend([in_tensor['image'][idx:idx + 1]] + rotate_recon_lst)
-
-            if cfg.bni.texture_src == 'image':
-
-                # coloring the final mesh (front: RGB pixels, back: normal colors)
-                final_colors = query_color(
-                    torch.tensor(final_mesh.vertices).float(),
-                    torch.tensor(final_mesh.faces).long(),
-                    in_tensor["image"][idx:idx + 1],
-                    device=device,
-                )
-                final_mesh.visual.vertex_colors = final_colors
-                final_mesh.export(final_path)
-
-            elif cfg.bni.texture_src == 'SD':
-
-                # !TODO: add texture from Stable Diffusion
-                pass
-
-        if len(per_loop_lst) > 0 and (not args.novis):
-
-            per_data_lst.append(get_optim_grid_image(per_loop_lst, None, nrow=5, type="cloth"))
-            per_data_lst[-1].save(osp.join(args.out_dir, cfg.name, f"png/{data['name']}_cloth.png"))
-
-            # for video rendering
-            in_tensor["BNI_verts"].append(torch.tensor(final_mesh.vertices).float())
-            in_tensor["BNI_faces"].append(torch.tensor(final_mesh.faces).long())
-
-            os.makedirs(osp.join(args.out_dir, cfg.name, "vid"), exist_ok=True)
-            in_tensor["uncrop_param"] = data["uncrop_param"]
-            in_tensor["img_raw"] = data["img_raw"]
-            torch.save(
-                in_tensor, osp.join(args.out_dir, cfg.name, f"vid/{data['name']}_in_tensor.pt")
-            )
-
-        final_watertight_path = f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_full_wt.obj"
-        watertightifier = MeshCleanProcess(final_path, final_watertight_path)
-        result = watertightifier.process(reconstruction_method='poisson', depth=10)
-
-        if result:
-            print("The mesh is watertight and has been saved successfully!")
-        else:
-            print("The mesh is not watertight. Further inspection may be needed.")
+    for data in tqdm(multi_view_data, desc="Generating & Fusing Point Clouds"):
+        frame_id = int(data["name"].split("_")[1])
         
-        final_mesh = MeshCleanProcess.process_watertight_mesh(
-            final_watertight_path=f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_full_wt.obj",
-            output_path=f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_final.obj",
-            face_vertex_mask=SMPLX_object.front_flame_vertex_mask,
-            target_faces=25000
+        # 1. Get per-view data
+        mask = (data["img_mask"] > 0.5).squeeze(0).squeeze(0) # (H, W) boolean
+        _, _, H, W = data["img_icon"].shape
+        
+        # Use SAPIENS for high-quality normals
+        normal_map = sapiens_normal_net.process_image(
+            Image.fromarray((data["img_raw"][0].permute(1,2,0).numpy() * 255).astype(np.uint8)), "1b", "u2net"
         )
+        normal_map = wrap(normal_map, data["uncrop_param"], 0).squeeze(0) # (3, H, W)
+
+        # Get proxy depth from canonical SMPL rendered in this view
+        T_world_to_view = torch.inverse(transform_manager.get_transform_to_target(frame_id))
+        verts_in_view = apply_homogeneous_transform(canonical_smpl_verts, T_world_to_view).unsqueeze(0)
+        depth_map, _ = dataset.render_depth(verts_in_view * torch.tensor([1.0, -1.0, -1.0], device=device))
+        depth_map = depth_map.squeeze(0).squeeze(0) # (H, W)
+
+        # 2. Unproject to get camera-space point cloud
+        K = get_intrinsics_matrix(cam_params_json[f'frame_{frame_id}'], (W, H))
+        points_cam = unproject_pixels_to_camera_space(depth_map, mask, K, device=device)
+        normals_cam = sample_normals_at_pixels(normal_map, mask)
+
+        # 3. Transform to canonical world space
+        T_view_to_world = transform_manager.get_transform_to_target(frame_id)
+        points_world = apply_homogeneous_transform(points_cam, T_view_to_world)
+        normals_world = torch.matmul(normals_cam, T_view_to_world[:3, :3].T)
+        
+        all_points_world.append(points_world)
+        all_normals_world.append(normals_world)
+
+    # 4. Combine, filter, and reconstruct
+    fused_points = torch.cat(all_points_world, dim=0).cpu().numpy()
+    fused_normals = torch.cat(all_normals_world, dim=0).cpu().numpy()
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(fused_points)
+    pcd.normals = o3d.utility.Vector3dVector(fused_normals)
+    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+
+    print(colored(f"Generated fused point cloud with {len(pcd.points)} points. Running Poisson reconstruction...", "blue"))
+    base_recon_mesh, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=9)
+    base_recon_mesh.remove_degenerate_triangles()
+    base_recon_mesh.remove_duplicated_triangles()
+    base_recon_mesh.remove_unreferenced_vertices()
+
+    base_recon_path = osp.join(out_obj_dir, "base_fused_recon.obj")
+    o3d.io.write_triangle_mesh(base_recon_path, base_recon_mesh)
+    print(colored(f"✅ Saved base fused mesh to {base_recon_path}", "green"))
+    
+    # --- Intelligent Refinement Loop (NEW PIPELINE) ---
+    print(colored("🚀 Starting Intelligent Refinement...", "cyan"))
+    
+    # 1. Prepare mesh for refinement
+    verts_base = torch.tensor(np.asarray(base_recon_mesh.vertices), dtype=torch.float32).to(device)
+    faces_base = torch.tensor(np.asarray(base_recon_mesh.triangles), dtype=torch.int64).to(device)
+    
+    # Remesh for better topology
+    verts_remesh, faces_remesh = remesh(
+        trimesh.Trimesh(verts_base.cpu().numpy(), faces_base.cpu().numpy()),
+        osp.join(out_obj_dir, "remeshed_base.obj"),
+        device
+    )
+    base_mesh = Meshes(verts=verts_remesh, faces=faces_remesh).to(device)
+    
+    # 2. Setup optimization
+    local_affine_model = LocalAffine(base_mesh.verts_padded().shape[1], 1, base_mesh.edges_packed()).to(device)
+    optimizer_cloth = torch.optim.Adam(local_affine_model.parameters(), lr=1e-4)
+    scheduler_cloth = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer_cloth, 'min', factor=0.5, patience=20, verbose=False)
+
+    # 3. Refinement loop with annealing weights
+    num_iters = 300
+    loop_cloth = tqdm(range(num_iters), desc="Refining Mesh")
+    initial_lapla_w, final_lapla_w = 5.0, 0.5
+    initial_normal_w, final_normal_w = 0.5, 2.0
+
+    for i in loop_cloth:
+        optimizer_cloth.zero_grad()
+        
+        progress = i / num_iters
+        w_lapla = initial_lapla_w * (1 - progress) + final_lapla_w * progress
+        w_normal = initial_normal_w * (1 - progress) + final_normal_w * progress
+
+        deformed_verts, stiffness, rigid = local_affine_model(base_mesh.verts_padded())
+        deformed_mesh = Meshes(verts=deformed_verts, faces=base_mesh.faces_padded())
+        
+        # --- Regularization Losses ---
+        loss_lapla = laplacian_smoothing(deformed_mesh, method="uniform")
+        loss_stiff = torch.mean(stiffness)
+        loss_rigid = torch.mean(rigid)
+        loss_chamfer, _ = chamfer_distance(deformed_verts, base_mesh.verts_padded())
+
+        # --- Multi-View Data Losses ---
+        total_normal_loss = torch.tensor(0.0, device=device)
+        total_mask_loss = torch.tensor(0.0, device=device)
+
+        for data in multi_view_data:
+            frame_id = int(data["name"].split("_")[1])
+            gt_mask = data["img_mask"].to(device)
+            
+            # Use pre-computed high-quality normals
+            normal_map_raw = Image.fromarray((data["img_raw"][0].permute(1,2,0).numpy() * 255).astype(np.uint8))
+            gt_normal_map = wrap(sapiens_normal_net.process_image(normal_map_raw, "1b", "u2net"), data["uncrop_param"], 0)
+
+            # Project deforming mesh into view
+            T_world_to_view = torch.inverse(transform_manager.get_transform_to_target(frame_id))
+            verts_view = apply_homogeneous_transform(deformed_verts.squeeze(0), T_world_to_view).unsqueeze(0)
+            
+            # Render normals and mask
+            pred_normal_map, _ = dataset.render_normal(verts_view * torch.tensor([1.0, -1.0, -1.0], device=device), deformed_mesh.faces_padded())
+            pred_mask, _ = dataset.render.get_image(type="mask")
+
+            # Calculate weighted losses for this view
+            valid_mask = (gt_mask > 0.5)
+            normal_diff = 1.0 - F.cosine_similarity(pred_normal_map, gt_normal_map, dim=1, eps=1e-6)
+            total_normal_loss += (normal_diff.unsqueeze(1)[valid_mask]).mean()
+            total_mask_loss += F.l1_loss(pred_mask, gt_mask)
+
+        avg_normal_loss = total_normal_loss / len(multi_view_data)
+        avg_mask_loss = total_mask_loss / len(multi_view_data)
+        
+        # --- Total Loss Combination ---
+        total_loss = (
+            avg_normal_loss * w_normal +
+            avg_mask_loss * 1.0 +
+            loss_lapla * w_lapla +
+            loss_stiff * 0.5 +
+            loss_rigid * 0.5 +
+            loss_chamfer * 0.1
+        )
+        
+        total_loss.backward()
+        optimizer_cloth.step()
+        scheduler_cloth.step(total_loss)
+        
+        loop_cloth.set_description(f"Refining (Total: {total_loss.item():.4f} | Normal: {avg_normal_loss.item():.4f})")
+        
+        # Update base mesh for next iteration's deformation
+        base_mesh = deformed_mesh.detach()
+
+    print(colored("✅ Intelligent refinement complete.", "green"))
+
+    # --- Final Export ---
+    final_verts_ts = base_mesh.verts_packed()
+    final_faces_ts = base_mesh.faces_packed()
+
+    # Query vertex colors from the first view's image
+    final_colors = query_color(
+        final_verts_ts, final_faces_ts,
+        multi_view_data[0]["img_icon"].to(device),
+        device=device
+    )
+    
+    final_obj = trimesh.Trimesh(
+        final_verts_ts.cpu().numpy(),
+        final_faces_ts.cpu().numpy(),
+        vertex_colors=final_colors,
+        process=False
+    )
+    
+    final_path = osp.join(out_obj_dir, f"{multi_view_data[0]['name']}_final_refined.obj")
+    final_obj.export(final_path)
+    print(colored(f"🎉🎉🎉 Final avatar saved to: {final_path} 🎉🎉🎉", "magenta"))

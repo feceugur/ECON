@@ -2,13 +2,28 @@ import torch
 import trimesh
 import cv2
 import os
+import os.path as osp
+import numpy as np
+from tqdm import tqdm
+import cupy as cp
+from cupyx.scipy.sparse import (
+    coo_matrix,
+    csr_matrix,
+    diags,
+    hstack,
+    spdiags,
+    vstack,
+)
+from cupyx.scipy.sparse.linalg import cg
 
-from lib.common.bni_numpy import bilateral_normal_integration
+from lib.common.bni_numpy import bilateral_normal_integration, bilateral_normal_integration_upt, construct_facets_from, map_depth_map_to_point_clouds
 from lib.common.BNI_utils import (
     depth_inverse_transform,
     double_side_bilateral_normal_integration,
+    remove_stretched_faces,
     verts_inverse_transform,
 )
+
 
 
 class BNI:
@@ -47,7 +62,7 @@ class BNI:
     # paper: Bilateral Normal Integration
 
     def extract_surface(self, verbose=True):
-        
+
         bni_result = double_side_bilateral_normal_integration(
             normal_front=self.normal_front,
             normal_back=self.normal_back,
@@ -62,62 +77,6 @@ class BNI:
             lambda_boundary_consistency=self.boundary_consist,
             cut_intersection=self.cut_intersection,
         )
-        
-
-        """
-        # Front estimation
-        depth_front_est, front_surface, wu_map_front, wv_map_front, energy_list_front = bilateral_normal_integration(
-            normal_map=self.normal_front,
-            normal_mask=self.mask,
-            k=2,  # or other value you prefer
-            depth_map=self.depth_front,  # optional, if you have it
-            depth_mask=self.depth_mask,  # optional, if you have it
-            lambda1=1e-4,  # or other value depending on your need
-            K=None,
-            step_size=1,
-            max_iter=150
-        )
-
-        # Back estimation
-        depth_back_est, back_surface, wu_map_back, wv_map_back, energy_list_back = bilateral_normal_integration(
-            normal_map=self.normal_back,
-            normal_mask=self.mask,
-            k=2,
-            depth_map=self.depth_back,  # optional
-            depth_mask=self.depth_mask,  # optional
-            lambda1=1e-4,  # typically stronger if you have a good prior for back
-            K=None,
-            step_size=1,
-            max_iter=150
-        )
-
-        bni_result = {
-            "F_verts": torch.as_tensor(front_surface.points).float(), 
-            "F_faces": torch.as_tensor(front_surface.faces.reshape(-1, 5)[:, 1:]).long(), 
-            "B_verts": torch.as_tensor(back_surface.points).float(), 
-            "B_faces": torch.as_tensor(back_surface.faces.reshape(-1, 5)[:, 1:]).long(), 
-            "F_depth": torch.as_tensor(depth_front_est).float(), 
-            "B_depth": torch.as_tensor(depth_back_est).float()
-        }
-
-        def save_mesh_as_obj(vertices, faces, save_path):
-            mesh = trimesh.Trimesh(vertices, faces)
-            mesh.export(save_path)
-            print(f"Saved mesh to {save_path}")
-
-        # Get numpy arrays from result tensors
-        F_verts_np = bni_result["F_verts"].cpu().numpy()
-        F_faces_np = bni_result["F_faces"].cpu().numpy()
-        B_verts_np = bni_result["B_verts"].cpu().numpy()
-        B_faces_np = bni_result["B_faces"].cpu().numpy()
-
-        # Save paths
-        save_dir = "./results_thuman/infer_two/carla/obj"
-        os.makedirs(save_dir, exist_ok=True)
-
-        save_mesh_as_obj(F_verts_np, F_faces_np, os.path.join(save_dir, "front_mesh.obj"))
-        save_mesh_as_obj(B_verts_np, B_faces_np, os.path.join(save_dir, "back_mesh.obj"))
-        """
 
         F_verts = verts_inverse_transform(bni_result["F_verts"], self.scale)
         B_verts = verts_inverse_transform(bni_result["B_verts"], self.scale)
@@ -138,22 +97,80 @@ class BNI:
             F_verts.float(), bni_result["F_faces"].long(), process=False, maintain_order=True
         )
 
-        self.B_trimesh = trimesh.Trimesh(
-            B_verts.float(), bni_result["B_faces"].long(), process=False, maintain_order=True
-        )
+        #self.B_trimesh = trimesh.Trimesh(
+        #     B_verts.float(), bni_result["B_faces"].long(), process=False, maintain_order=True
+        # )
 
-        # Save front mesh
-        self.F_trimesh.export("front_mesh.obj")
 
-        # Save back mesh
-        self.B_trimesh.export("back_mesh.obj")
+    
+    def extract_surface_multiview(self, normal_list, mask_list, depth_list):
+        H, W, _ = normal_list[0].shape
+        N_pix = H * W
+        scale = self.scale
+
+        # Step 1: Canonical pixel index map
+        canonical_mask = np.any(np.stack(mask_list), axis=0)
+        num_pixels = np.sum(canonical_mask)
+        pixel_idx = np.zeros_like(canonical_mask, dtype=int)
+        pixel_idx[canonical_mask] = np.arange(num_pixels)
+
+        z_prior = np.zeros(N_pix)
+        M_diag = np.zeros(N_pix)
+        A_all = []
+        b_all = []
+
+        for normals, mask, depth in zip(normal_list, mask_list, depth_list):
+            nx = normals[:, :, 1][mask]
+            ny = normals[:, :, 0][mask]
+            nz = -normals[:, :, 2][mask]
+
+            A1, A2, A3, A4 = generate_dx_dy_upsample(mask, nz_horizontal=nz, nz_vertical=nz, step_size=1, pixel_idx=pixel_idx)
+            A = vstack([A1, A2, A3, A4])
+            b = np.concatenate([-nx, -nx, -ny, -ny])
+
+            A_all.append(A)
+            b_all.append(b)
+
+            flat_mask = mask.flatten()
+            z_prior[flat_mask] += depth.flatten()[flat_mask]
+            M_diag[flat_mask] += 1
+
+        A_total = vstack(A_all)
+        b_total = np.concatenate(b_all)
+
+        valid_depth = M_diag > 0
+        M_diag[valid_depth] = 1.0 / M_diag[valid_depth]
+        M = diags(self.cfg['lambda1'] * M_diag)
+        z_prior = z_prior * M_diag
+
+        ATA = A_total.T @ A_total + M
+        ATb = A_total.T @ b_total + M @ z_prior
+
+        z0 = np.zeros(N_pix)
+        z, _ = cg(ATA, ATb, x0=z0, maxiter=5000, tol=1e-3)
+        depth_map = z.reshape(H, W)
+
+        # Combine all masks into one for final mesh creation
+        mask_total = np.any(np.stack(mask_list), axis=0)
+        verts = map_depth_map_to_point_clouds(depth_map, mask_total, K=None, step_size=1)
+        faces = construct_facets_from(mask_total)
+        faces = np.concatenate((faces[:, [1, 2, 3]], faces[:, [1, 3, 4]]), axis=0)
+        verts, faces = remove_stretched_faces(verts, faces)
+
+        mesh = trimesh.Trimesh(vertices=verts, faces=faces)
+        self.F_B_trimesh = mesh
+        self.F_B_surface = verts
+        self.F_depth = depth_map
+
+        return {
+            "verts": torch.as_tensor(verts).float(),
+            "faces": torch.as_tensor(faces).long(),
+            "depth": torch.as_tensor(depth_map).float(),
+            "mesh": mesh
+        }
+
 
 if __name__ == "__main__":
-
-    import os.path as osp
-
-    import numpy as np
-    from tqdm import tqdm
 
     root = "/home/yxiu/Code/ECON/results/examples/BNI"
     npy_file = f"{root}/304e9c4798a8c3967de7c74c24ef2e38.npy"
@@ -174,6 +191,6 @@ if __name__ == "__main__":
     )
 
     bni_object.extract_surface()
-    bni_object.F_trimesh.export(osp.join(osp.dirname(npy_file), "F.obj"))
+    bni_object.F_trimesh_list[0].export(osp.join(osp.dirname(npy_file), "F.obj"))
     bni_object.B_trimesh.export(osp.join(osp.dirname(npy_file), "B.obj"))
     bni_object.F_B_trimesh.export(osp.join(osp.dirname(npy_file), "BNI.obj"))

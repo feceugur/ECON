@@ -847,3 +847,28 @@ def export_obj(v_np, f_np, vt, ft, path):
     new_file_data = new_line + v_lines + vt_lines + f_lines
     with open(path, 'w') as file:
         file.write(new_file_data)
+
+def remesh(mesh, obj_path, device):
+
+    mesh = mesh.simplify_quadratic_decimation(50000)
+    mesh = trimesh.smoothing.filter_humphrey(
+        mesh, alpha=0.1, beta=0.5, iterations=10, laplacian_operator=None
+    )
+    mesh.export(obj_path)
+    verts_pr = torch.tensor(mesh.vertices).float().unsqueeze(0).to(device)
+    faces_pr = torch.tensor(mesh.faces).long().unsqueeze(0).to(device)
+
+    return verts_pr, faces_pr
+
+def feat_select(feat, select):
+
+    # feat [B, featx2, N]
+    # select [B, 1, N]
+    # return [B, feat, N]
+
+    dim = feat.shape[1] // 2
+    idx = torch.tile((1-select), (1, dim, 1))*dim + \
+        torch.arange(0, dim).unsqueeze(0).unsqueeze(2).type_as(select)
+    feat_select = torch.gather(feat, 1, idx.long())
+
+    return feat_select

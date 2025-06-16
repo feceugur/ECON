@@ -291,6 +291,9 @@ def process_image(img_file, hps_type, single, input_res, detector):
         "uncrop_param": uncrop_param,
         "landmark": torch.stack(landmark_lst),    #[N, 33, 4]
         "hands_visibility": hands_visibility_lst,
+        "M_crop": M_crop,
+        "M_square": M_square,
+        "ori_shape": [in_height, in_width],
     }
 
     img_pymafx = {}

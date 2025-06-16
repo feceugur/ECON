@@ -95,7 +95,10 @@ class NormalNet(BasePIFuNet):
         nmlB_normalized = nmlB / torch.norm(nmlB, dim=1, keepdim=True)
 
         # output: float_arr [-1,1] with [B, C, H, W]
-        mask = ((in_tensor["image"].abs().sum(dim=1, keepdim=True) != 0.0).detach().float())
+        if "image" in in_tensor:
+            mask = ((in_tensor["image"].abs().sum(dim=1, keepdim=True) != 0.0).detach().float())
+        else:
+            mask = ((in_tensor["img_icon"].abs().sum(dim=1, keepdim=True) != 0.0).detach().float())
 
         return nmlF_normalized * mask, nmlB_normalized * mask
 

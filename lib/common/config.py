@@ -95,12 +95,12 @@ _C.net.hg_down = "ave_pool"
 _C.net.num_views = 1
 
 _C.bni = CN()
-_C.bni.k = 4
-_C.bni.lambda1 = 1e-4
-_C.bni.boundary_consist = 1e-6
+_C.bni.k = 6  # 4
+_C.bni.lambda1 = 1e-2  # 1e-6
+_C.bni.boundary_consist = 1e-4
 _C.bni.poisson_depth = 10
-_C.bni.use_poisson = True
-_C.bni.use_smpl = ["face", "hand"]
+_C.bni.use_poisson = False
+_C.bni.use_smpl = []
 _C.bni.use_ifnet = False
 _C.bni.finish = False
 _C.bni.thickness = 0.00
@@ -108,7 +108,7 @@ _C.bni.hand_thres = 4e-2
 _C.bni.face_thres = 6e-2
 _C.bni.hps_type = "pixie"
 _C.bni.texture_src = "image"
-_C.bni.cut_intersection = True
+_C.bni.cut_intersection = False
 
 # kernel_size, stride, dilation, padding
 

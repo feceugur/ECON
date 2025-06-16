@@ -1,7 +1,6 @@
 import os
 import os.path as osp
 
-from apps.transform_normals import transform_normals
 import cupy as cp
 import cv2
 import numpy as np
@@ -441,14 +440,10 @@ def create_boundary_matrix(mask):
     return B, B_full
 
 
-
 def double_side_bilateral_normal_integration(
-    normal_front,
-    normal_back,
-    normal_mask,
-    depth_front=None,
-    depth_back=None,
-    depth_mask=None,
+    normal_list,
+    mask_list,
+    depth_list,
     k=2,
     lambda_normal_back=1,
     lambda_depth_front=1e-4,
@@ -461,270 +456,154 @@ def double_side_bilateral_normal_integration(
     cg_tol=1e-3,
     cut_intersection=True,
 ):
-
-    # To avoid confusion, we list the coordinate systems in this code as follows
-    #
-    # pixel coordinates         camera coordinates     normal coordinates (the main paper's Fig. 1 (a))
-    # u                          x                              y
-    # |                          |  z                           |
-    # |                          | /                            o -- x
-    # |                          |/                            /
-    # o --- v                    o --- y                      z
-    # (bottom left)
-    #                       (o is the optical center;
-    #                        xy-plane is parallel to the image plane;
-    #                        +z is the viewing direction.)
-    #
-    # The input normal map should be defined in the normal coordinates.
-    # The camera matrix K should be defined in the camera coordinates.
-    # K = [[fx, 0,  cx],
-    #      [0,  fy, cy],
-    #      [0,  0,  1]]
-
-    num_normals = cp.sum(normal_mask)
-    normal_map_front = cp.asarray(normal_front)
-    normal_map_back = cp.asarray(normal_back)
-    normal_mask = cp.asarray(normal_mask)
-    if depth_mask is not None:
-        depth_map_front = cp.asarray(depth_front)
-        depth_map_back = cp.asarray(depth_back)
-        depth_mask = cp.asarray(depth_mask)
-
-    # transfer the normal map from the normal coordinates to the camera coordinates
-    nx_front = normal_map_front[normal_mask, 1]
-    ny_front = normal_map_front[normal_mask, 0]
-    nz_front = -normal_map_front[normal_mask, 2]
-    del normal_map_front
-
-    nx_back = normal_map_back[normal_mask, 1]
-    ny_back = normal_map_back[normal_mask, 0]
-    nz_back = -normal_map_back[normal_mask, 2]
-    del normal_map_back
-
-    # right, left, top, bottom
-    A3_f, A4_f, A1_f, A2_f = generate_dx_dy(
-        normal_mask, nz_horizontal=nz_front, nz_vertical=nz_front, step_size=step_size
-    )
-    A3_b, A4_b, A1_b, A2_b = generate_dx_dy(
-        normal_mask, nz_horizontal=nz_back, nz_vertical=nz_back, step_size=step_size
-    )
-
-    has_left_mask = cp.logical_and(move_right(normal_mask), normal_mask)
-    has_right_mask = cp.logical_and(move_left(normal_mask), normal_mask)
-    has_bottom_mask = cp.logical_and(move_top(normal_mask), normal_mask)
-    has_top_mask = cp.logical_and(move_bottom(normal_mask), normal_mask)
-
-    top_boundnary_mask = cp.logical_xor(has_top_mask, normal_mask)[normal_mask]
-    bottom_boundary_mask = cp.logical_xor(has_bottom_mask, normal_mask)[normal_mask]
-    left_boundary_mask = cp.logical_xor(has_left_mask, normal_mask)[normal_mask]
-    right_boudnary_mask = cp.logical_xor(has_right_mask, normal_mask)[normal_mask]
-
-    A_front_data = vstack((A1_f, A2_f, A3_f, A4_f))
-    A_front_zero = csr_matrix(A_front_data.shape)
-    A_front = hstack([A_front_data, A_front_zero])
-
-    A_back_data = vstack((A1_b, A2_b, A3_b, A4_b))
-    A_back_zero = csr_matrix(A_back_data.shape)
-    A_back = hstack([A_back_zero, A_back_data])
-
-    b_front = cp.concatenate((-nx_front, -nx_front, -ny_front, -ny_front))
-    b_back = cp.concatenate((-nx_back, -nx_back, -ny_back, -ny_back))
-
-    # initialization
-    W_front = spdiags(
-        0.5 * cp.ones(4 * num_normals), 0, 4 * num_normals, 4 * num_normals, format="csr"
-    )
-    W_back = spdiags(
-        0.5 * cp.ones(4 * num_normals), 0, 4 * num_normals, 4 * num_normals, format="csr"
-    )
-
-    z_front = cp.zeros(num_normals, float)
-    z_back = cp.zeros(num_normals, float)
-    z_combined = cp.concatenate((z_front, z_back))
-
-    B, B_full = create_boundary_matrix(normal_mask)
-    B_mat = lambda_boundary_consistency * coo_matrix(B_full.get().T @ B_full.get())    #bug
-
+    """
+    Extract surface from multiple views using bilateral normal integration.
+    
+    Args:
+        normal_list (list): List of normal maps from different views
+        mask_list (list): List of masks from different views
+        depth_list (list): List of depth maps from different views
+        k (int): Sigmoid parameter
+        lambda_normal_back (float): Weight for normal consistency between views
+        lambda_depth_front (float): Weight for depth consistency with front view
+        lambda_depth_back (float): Weight for depth consistency with back view
+        lambda_boundary_consistency (float): Weight for boundary consistency
+        step_size (int): Step size for generating derivative matrices
+        max_iter (int): Maximum number of iterations for solving the linear system
+        tol (float): Tolerance for convergence
+        cg_max_iter (int): Maximum number of iterations for conjugate gradient solver
+        cg_tol (float): Tolerance for conjugate gradient solver
+        cut_intersection (bool): Whether to cut the intersection between views
+    """
+    # Convert all inputs to GPU arrays
+    normal_maps = [cp.asarray(normal) for normal in normal_list]
+    masks = [cp.asarray(mask) for mask in mask_list]
+    depth_maps = [cp.asarray(depth) for depth in depth_list]
+    
+    # Count total number of valid normals across all views
+    num_normals = int(cp.sum(cp.stack([cp.sum(mask) for mask in masks])))
+    
+    # Initialize lists to store view-specific data
+    A_all = []
+    b_all = []
+    z_prior = cp.zeros(num_normals)
+    M_diag = cp.zeros(num_normals)
+    
+    # Process each view
+    for normals, mask, depth in zip(normal_maps, masks, depth_maps):
+        # Extract normal components
+        nx = normals[:, :, 1][mask]
+        ny = normals[:, :, 0][mask]
+        nz = -normals[:, :, 2][mask]
+        
+        # Generate derivative matrices
+        A1, A2, A3, A4 = generate_dx_dy(mask, nz_horizontal=nz, nz_vertical=nz, step_size=step_size)
+        A = vstack([A1, A2, A3, A4])
+        b = cp.concatenate([-nx, -nx, -ny, -ny])
+        
+        A_all.append(A)
+        b_all.append(b)
+        
+        # Update depth prior
+        flat_mask = mask.flatten()
+        z_prior[flat_mask] += depth.flatten()[flat_mask]
+        M_diag[flat_mask] += 1
+    
+    # Combine all views
+    A_total = vstack(A_all)
+    b_total = cp.concatenate(b_all)
+    
+    # Normalize depth prior
+    valid_depth = M_diag > 0
+    M_diag[valid_depth] = 1.0 / M_diag[valid_depth]
+    M = diags(lambda_normal_back * M_diag)
+    z_prior = z_prior * M_diag
+    
+    # Initialize energy minimization
+    z = cp.zeros(num_normals)
     energy_list = []
-
-    if depth_mask is not None:
-        depth_mask_flat = depth_mask[normal_mask].astype(bool)    # shape: (num_normals,)
-        z_prior_front = depth_map_front[normal_mask]    # shape: (num_normals,)
-        z_prior_front[~depth_mask_flat] = 0
-        z_prior_back = depth_map_back[normal_mask]
-        z_prior_back[~depth_mask_flat] = 0
-        m = depth_mask[normal_mask].astype(int)
-        M = diags(m)
-
-    energy = (A_front @ z_combined - b_front).T @ W_front @ (A_front @ z_combined - b_front) + \
-             lambda_normal_back * (A_back @ z_combined - b_back).T @ W_back @ (A_back @ z_combined - b_back) + \
-             lambda_depth_front * (z_front - z_prior_front).T @ M @ (z_front - z_prior_front) + \
-             lambda_depth_back * (z_back - z_prior_back).T @ M @ (z_back - z_prior_back) + \
-             lambda_boundary_consistency * (z_back - z_front).T @ B @ (z_back - z_front)
-
-    depth_map_front_est = cp.ones_like(normal_mask, float) * cp.nan
-    depth_map_back_est = cp.ones_like(normal_mask, float) * cp.nan
-
-    facets_back = cp.asnumpy(construct_facets_from(normal_mask))
-    faces_back = np.concatenate((facets_back[:, [1, 4, 3]], facets_back[:, [1, 3, 2]]), axis=0)
-    faces_front = np.concatenate((facets_back[:, [1, 2, 3]], facets_back[:, [1, 3, 4]]), axis=0)
-
+    
+    # Create boundary matrices for each view
+    B_mats = []
+    for mask in masks:
+        B, B_full = create_boundary_matrix(mask)
+        B_mats.append(lambda_boundary_consistency * coo_matrix(B_full.get().T @ B_full.get()))
+    
+    # Combine boundary matrices
+    B_total = vstack([hstack([B_mat, csr_matrix((B_mat.shape[0], B_mat.shape[1]))]) for B_mat in B_mats])
+    
+    # Energy minimization loop
     for i in range(max_iter):
-        A_mat_front = A_front_data.T @ W_front @ A_front_data
-        b_vec_front = A_front_data.T @ W_front @ b_front
-
-        A_mat_back = A_back_data.T @ W_back @ A_back_data
-        b_vec_back = A_back_data.T @ W_back @ b_back
-        if depth_mask is not None:
-            b_vec_front += lambda_depth_front * M @ z_prior_front
-            b_vec_back += lambda_depth_back * M @ z_prior_back
-            A_mat_front += lambda_depth_front * M
-            A_mat_back += lambda_depth_back * M
-            offset_front = cp.mean((z_prior_front - z_combined[:num_normals])[depth_mask_flat])
-            offset_back = cp.mean((z_prior_back - z_combined[num_normals:])[depth_mask_flat])
-            z_combined[:num_normals] = z_combined[:num_normals] + offset_front
-            z_combined[num_normals:] = z_combined[num_normals:] + offset_back
-
-
-        A_mat_combined = hstack([vstack((A_mat_front, csr_matrix((num_normals, num_normals)))), \
-                                 vstack((csr_matrix((num_normals, num_normals)), A_mat_back))]) + B_mat
-        b_vec_combined = cp.concatenate((b_vec_front, b_vec_back))
-
-        D = spdiags(
-            1 / cp.clip(A_mat_combined.diagonal(), 1e-5, None), 0, 2 * num_normals, 2 * num_normals,
-            "csr"
-        )    # Jacob preconditioner
-
-        z_combined, _ = cg(
-            A_mat_combined, b_vec_combined, M=D, x0=z_combined, maxiter=cg_max_iter, tol=cg_tol
-        )
-        z_front = z_combined[:num_normals]
-        z_back = z_combined[num_normals:]
-        wu_f = sigmoid((A2_f.dot(z_front))**2 - (A1_f.dot(z_front))**2, k)    # top
-        wv_f = sigmoid((A4_f.dot(z_front))**2 - (A3_f.dot(z_front))**2, k)    # right
-        wu_f[top_boundnary_mask] = 0.5
-        wu_f[bottom_boundary_mask] = 0.5
-        wv_f[left_boundary_mask] = 0.5
-        wv_f[right_boudnary_mask] = 0.5
-        W_front = spdiags(
-            cp.concatenate((wu_f, 1 - wu_f, wv_f, 1 - wv_f)),
-            0,
-            4 * num_normals,
-            4 * num_normals,
-            format="csr"
-        )
-
-        wu_b = sigmoid((A2_b.dot(z_back))**2 - (A1_b.dot(z_back))**2, k)    # top
-        wv_b = sigmoid((A4_b.dot(z_back))**2 - (A3_b.dot(z_back))**2, k)    # right
-        wu_b[top_boundnary_mask] = 0.5
-        wu_b[bottom_boundary_mask] = 0.5
-        wv_b[left_boundary_mask] = 0.5
-        wv_b[right_boudnary_mask] = 0.5
-        W_back = spdiags(
-            cp.concatenate((wu_b, 1 - wu_b, wv_b, 1 - wv_b)),
-            0,
-            4 * num_normals,
-            4 * num_normals,
-            format="csr"
-        )
-
-        energy_old = energy
-        energy = (A_front_data @ z_front - b_front).T @ W_front @ (A_front_data @ z_front - b_front) + \
-             lambda_normal_back * (A_back_data @ z_back - b_back).T @ W_back @ (A_back_data @ z_back - b_back) + \
-             lambda_depth_front * (z_front - z_prior_front).T @ M @ (z_front - z_prior_front) + \
-             lambda_depth_back * (z_back - z_prior_back).T @ M @ (z_back - z_prior_back) +\
-             lambda_boundary_consistency * (z_back - z_front).T @ B @ (z_back - z_front)
-
+        # Compute energy terms
+        normal_energy = (A_total @ z - b_total).T @ (A_total @ z - b_total)
+        depth_energy = (z - z_prior).T @ M @ (z - z_prior)
+        boundary_energy = z.T @ B_total @ z
+        
+        # Total energy
+        energy = normal_energy + lambda_depth_front * depth_energy + boundary_energy
         energy_list.append(energy)
-        relative_energy = cp.abs(energy - energy_old) / energy_old
-
-        # print(f"step {i + 1}/{max_iter} energy: {energy:.3e}"
-        #       f" relative energy: {relative_energy:.3e}")
-
-        if False:
-            # intermediate results
-            depth_map_front_est[normal_mask] = z_front
-            depth_map_back_est[normal_mask] = z_back
-            vertices_front = cp.asnumpy(
-                map_depth_map_to_point_clouds(
-                    depth_map_front_est, normal_mask, K=None, step_size=step_size
-                )
-            )
-            vertices_back = cp.asnumpy(
-                map_depth_map_to_point_clouds(
-                    depth_map_back_est, normal_mask, K=None, step_size=step_size
-                )
-            )
-
-            vertices_front, faces_front_ = remove_stretched_faces(vertices_front, faces_front)
-            vertices_back, faces_back_ = remove_stretched_faces(vertices_back, faces_back)
-
-            F_verts = verts_inverse_transform(torch.as_tensor(vertices_front).float(), 256.0)
-            B_verts = verts_inverse_transform(torch.as_tensor(vertices_back).float(), 256.0)
-
-            F_B_verts = torch.cat((F_verts, B_verts), dim=0)
-            F_B_faces = torch.cat((
-                torch.as_tensor(faces_front_).long(),
-                torch.as_tensor(faces_back_).long() + faces_front_.max() + 1
-            ),
-                                  dim=0)
-
-            front_surf = trimesh.Trimesh(F_verts, faces_front_)
-            back_surf = trimesh.Trimesh(B_verts, faces_back_)
-            double_surf = trimesh.Trimesh(F_B_verts, F_B_faces)
-
-            bini_dir = "/home/yxiu/Code/ECON/log/bini/OBJ"
-            front_surf.export(osp.join(bini_dir, f"{i:04d}_F.obj"))
-            back_surf.export(osp.join(bini_dir, f"{i:04d}_B.obj"))
-            double_surf.export(osp.join(bini_dir, f"{i:04d}_FB.obj"))
-
-        if relative_energy < tol:
-            break
-    # del A1, A2, A3, A4, nx, ny
-
-    depth_map_front_est[normal_mask] = z_front
-    depth_map_back_est[normal_mask] = z_back
-
+        
+        # Compute system matrices
+        ATA = A_total.T @ A_total + lambda_depth_front * M + B_total
+        ATb = A_total.T @ b_total + lambda_depth_front * M @ z_prior
+        
+        # Solve linear system with preconditioner
+        D = spdiags(1 / cp.clip(ATA.diagonal(), 1e-5, None), 0, num_normals, num_normals, "csr")
+        z_new, _ = cg(ATA, ATb, M=D, x0=z, maxiter=cg_max_iter, tol=cg_tol)
+        
+        # Check convergence
+        if i > 0:
+            relative_energy = cp.abs(energy - energy_list[-2]) / energy_list[-2]
+            if relative_energy < tol:
+                break
+        
+        z = z_new
+    
+    # Reshape depth map to original dimensions
+    H, W = masks[0].shape
+    depth_map = z.reshape(H, W)
+    
+    # Combine all masks for final mesh creation
+    mask_total = cp.any(cp.stack(masks), axis=0)
+    
+    # Handle intersection cutting if enabled
     if cut_intersection:
-        # manually cut the intersection
-        normal_mask[depth_map_front_est >= depth_map_back_est] = False
-        depth_map_front_est[~normal_mask] = cp.nan
-        depth_map_back_est[~normal_mask] = cp.nan
-
-    vertices_front = cp.asnumpy(
-        map_depth_map_to_point_clouds(
-            depth_map_front_est, normal_mask, K=None, step_size=step_size
-        )
-    )
-    vertices_back = cp.asnumpy(
-        map_depth_map_to_point_clouds(depth_map_back_est, normal_mask, K=None, step_size=step_size)
-    )
-
-    facets_back = cp.asnumpy(construct_facets_from(normal_mask))
-    faces_back = np.concatenate((facets_back[:, [1, 4, 3]], facets_back[:, [1, 3, 2]]), axis=0)
-    faces_front = np.concatenate((facets_back[:, [1, 2, 3]], facets_back[:, [1, 3, 4]]), axis=0)
-
-    vertices_front, faces_front = remove_stretched_faces(vertices_front, faces_front)
-    vertices_back, faces_back = remove_stretched_faces(vertices_back, faces_back)
-
-    front_mesh = clean_floats(trimesh.Trimesh(vertices_front, faces_front))
-    back_mesh = clean_floats(trimesh.Trimesh(vertices_back, faces_back))
-
-    result = {
-        "F_verts": torch.as_tensor(front_mesh.vertices).float(), "F_faces": torch.as_tensor(
-            front_mesh.faces
-        ).long(), "B_verts": torch.as_tensor(back_mesh.vertices).float(), "B_faces":
-        torch.as_tensor(back_mesh.faces).long(), "F_depth":
-        torch.as_tensor(depth_map_front_est).float(), "B_depth":
-        torch.as_tensor(depth_map_back_est).float()
+        # For multi-view case, we need to handle intersections between all views
+        for i in range(len(depth_maps)):
+            for j in range(i + 1, len(depth_maps)):
+                # Compare depth maps and cut intersections
+                intersection_mask = depth_maps[i] >= depth_maps[j]
+                mask_total[intersection_mask] = False
+                depth_map[~mask_total] = cp.nan
+    
+    # Create point clouds from depth maps
+    vertices = cp.asnumpy(map_depth_map_to_point_clouds(depth_map, mask_total, K=None, step_size=step_size))
+    
+    # Construct facets and faces
+    facets = cp.asnumpy(construct_facets_from(mask_total))
+    faces = np.concatenate((facets[:, [1, 2, 3]], facets[:, [1, 3, 4]]), axis=0)
+    
+    # Remove stretched faces
+    vertices, faces = remove_stretched_faces(vertices, faces)
+    
+    # Create and clean mesh
+    mesh = clean_floats(trimesh.Trimesh(vertices, faces))
+    mesh.export("mesh.obj")
+    
+    return {
+        "depth_map": depth_map,
+        "vertices": vertices,
+        "faces": faces,
+        "mask": mask_total,
+        "energy_list": energy_list,
+        "mesh": mesh
     }
 
-    return result
 
+def save_normal_tensor_upt(in_tensor_f, in_tensor_b, idx, png_path, thickness=0.0):
 
-
-def save_normal_tensor_upt(in_tensor_f, in_tensor_b, idx, png_path, thickness=0.0, back_view_idx=0, transform_manager=None):
     os.makedirs(os.path.dirname(png_path), exist_ok=True)
+
     normal_F_arr = tensor2arr(in_tensor_f["normal_F"][idx:idx + 1])
     normal_B_arr = tensor2arr(in_tensor_b["normal_F"][idx:idx + 1])
     mask_normal_arr = tensor2arr(in_tensor_f["image"][idx:idx + 1], True)
@@ -738,8 +617,8 @@ def save_normal_tensor_upt(in_tensor_f, in_tensor_b, idx, png_path, thickness=0.
     BNI_dict["normal_F"] = normal_F_arr
     BNI_dict["normal_B"] = normal_B_arr
     BNI_dict["mask"] = mask_normal_arr > 0.
-    BNI_dict["depth_F"] = depth_F_arr - 100.
-    BNI_dict["depth_B"] = 100. - depth_B_arr
+    BNI_dict["depth_F"] = depth_F_arr - 100. - thickness
+    BNI_dict["depth_B"] = 100. - depth_B_arr + thickness
     # BNI_dict["depth_B"] = depth_B_arr - 100. - thickness
     BNI_dict["depth_mask"] = depth_F_arr != -1.0
 
@@ -776,7 +655,7 @@ def save_normal_tensor(in_tensor, idx, png_path, thickness=0.0):
 
 def save_normal_tensor_multi(in_tensor, idx, png_path, thickness=0.0):
     """
-    Save normal tensors and depth maps for multi-view data and prepare inputs for bilateral normal integration.
+    Save normal tensors and depth maps for multi-view data.
     
     Args:
         in_tensor (dict): Dictionary containing all input data including view-specific data
@@ -786,64 +665,46 @@ def save_normal_tensor_multi(in_tensor, idx, png_path, thickness=0.0):
     """
     os.makedirs(os.path.dirname(png_path), exist_ok=True)
 
-    # Initialize lists for multi-view integration
-    normal_list = []
-    mask_list = []
-    depth_list = []
+    # Get view-specific data
+    view_key = f"view_{idx}"
+    view_data = in_tensor[view_key]
 
-    # Process all views
-    for view_idx in range(len([k for k in in_tensor.keys() if k.startswith('view_')])):
-        view_key = f"view_{view_idx}"
-        view_data = in_tensor[view_key]
+    # Get normal maps from view-specific data
+    normal_F_arr = tensor2arr(view_data["normal_F"])
+    normal_B_arr = tensor2arr(view_data["T_normal_B"])
+    mask_normal_arr = tensor2arr(view_data["image"], True)
 
-        # Get normal maps from view-specific data
-        normal_F_arr = tensor2arr(view_data["normal_F"])
-        normal_B_arr = tensor2arr(view_data["T_normal_B"])
-        mask_normal_arr = tensor2arr(view_data["image"], True)
-        mask = mask_normal_arr > 0.
+    # Get depth maps from view-specific data
+    depth_F_arr = depth2arr(view_data["depth_map"])  # Use depth_map from view data
+    depth_B_arr = depth2arr(view_data["depth_map"])  # Use same depth map for back
 
-        # Get depth maps from view-specific data
-        depth_F_arr = depth2arr(view_data["depth_map"])
-        depth_B_arr = depth2arr(view_data["depth_map"])
+    BNI_dict = {}
 
-        # Store data for integration
-        normal_list.append(normal_F_arr)  # Use front normal map
-        mask_list.append(mask)
-        depth_list.append(depth_F_arr - 100. - thickness)  # Adjust depth as in original code
+    # clothed human
+    BNI_dict["normal_F"] = normal_F_arr
+    BNI_dict["normal_B"] = normal_B_arr
+    BNI_dict["mask"] = mask_normal_arr > 0.
+    BNI_dict["depth_F"] = depth_F_arr - 100. - thickness
+    BNI_dict["depth_B"] = 100. - depth_B_arr + thickness
+    BNI_dict["depth_mask"] = depth_F_arr != -1.0
 
-        # For current view, prepare BNI dictionary
-        if view_idx == idx:
-            BNI_dict = {}
-            # clothed human
-            BNI_dict["normal_F"] = normal_F_arr
-            BNI_dict["normal_B"] = normal_B_arr
-            BNI_dict["mask"] = mask
-            BNI_dict["depth_F"] = depth_F_arr - 100. - thickness
-            BNI_dict["depth_B"] = 100. - depth_B_arr + thickness
-            BNI_dict["depth_mask"] = depth_F_arr != -1.0
+    # Add view-specific information
+    BNI_dict["view_id"] = idx
+    BNI_dict["view_name"] = view_data["name"]
+    BNI_dict["T_frame_to_target"] = view_data["T_frame_to_target"].cpu().numpy()
+    BNI_dict["smpl_verts_view"] = view_data["smpl_verts_view"].cpu().numpy()
 
-            # Add view-specific information
-            BNI_dict["view_id"] = view_idx
-            BNI_dict["view_name"] = view_data["name"]
-            BNI_dict["T_frame_to_target"] = view_data["T_frame_to_target"].cpu().numpy()
-            BNI_dict["smpl_verts"] = view_data["smpl_verts"].cpu().numpy()
+    # Add global information
+    BNI_dict["smpl_verts"] = in_tensor["smpl_verts"].cpu().numpy()
+    BNI_dict["smpl_joints"] = in_tensor["smpl_joints"].cpu().numpy()
+    BNI_dict["smpl_landmarks"] = in_tensor["smpl_landmarks"].cpu().numpy()
+    BNI_dict["optimed_betas"] = in_tensor["optimed_betas"].cpu().numpy()
+    BNI_dict["optimed_pose_mat"] = in_tensor["optimed_pose_mat"].cpu().numpy()
+    BNI_dict["optimed_orient_mat"] = in_tensor["optimed_orient_mat"].cpu().numpy()
+    BNI_dict["optimed_trans"] = in_tensor["optimed_trans"].cpu().numpy()
 
-            # Add global information
-            BNI_dict["smpl_verts"] = in_tensor["smpl_verts"].cpu().numpy()
-            BNI_dict["smpl_joints"] = in_tensor["smpl_joints"].cpu().numpy()
-            BNI_dict["smpl_landmarks"] = in_tensor["smpl_landmarks"].cpu().numpy()
-            BNI_dict["optimed_betas"] = in_tensor["optimed_betas"].cpu().numpy()
-            BNI_dict["optimed_pose_mat"] = in_tensor["optimed_pose_mat"].cpu().numpy()
-            BNI_dict["optimed_orient_mat"] = in_tensor["optimed_orient_mat"].cpu().numpy()
-            BNI_dict["optimed_trans"] = in_tensor["optimed_trans"].cpu().numpy()
-
-            # Add multi-view integration data
-            BNI_dict["normal_list"] = normal_list
-            BNI_dict["mask_list"] = mask_list
-            BNI_dict["depth_list"] = depth_list
-
-            # Save the dictionary
-            np.save(png_path + ".npy", BNI_dict, allow_pickle=True)
+    # Save the dictionary
+    np.save(png_path + ".npy", BNI_dict, allow_pickle=True)
 
     return BNI_dict
 

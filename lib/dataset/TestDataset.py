@@ -216,3 +216,15 @@ class TestDataset:
         # render optimized mesh (normal, T_normal, image [-1,1])
         self.render.load_meshes(verts, faces)
         return self.render.get_image(type="depth")
+    
+    def compute_vis_cmap(self, smpl_verts, smpl_faces):
+
+        (xy, z) = torch.as_tensor(smpl_verts).split([2, 1], dim=1)
+        smpl_vis = get_visibility(xy, -z, torch.as_tensor(smpl_faces).long())
+        smpl_cmap = self.smpl_data.cmap_smpl_vids(self.smpl_type)
+
+        return {
+            'smpl_vis': smpl_vis.unsqueeze(0).to(self.device),
+            'smpl_cmap': smpl_cmap.unsqueeze(0).to(self.device),
+            'smpl_verts': smpl_verts.unsqueeze(0)
+        }

@@ -35,12 +35,13 @@ from pytorch3d.renderer import (
     TexturesVertex,
     blending,
     look_at_view_transform,
+    PerspectiveCameras,
 )
 from pytorch3d.renderer.mesh import TexturesVertex
 from pytorch3d.structures import Meshes
 from termcolor import colored
 from tqdm import tqdm
-
+import torch.nn.functional as F
 import lib.common.render_utils as util
 from lib.common.imutils import blend_rgb_norm
 from lib.dataset.mesh_util import get_visibility
@@ -249,6 +250,51 @@ class Render:
                 compositor=AlphaCompositor(background_color=(0, 0, 0)),
             )
 
+    
+
+    def get_image_from_external_camera(self, R, T, K, type="mask", bg="gray"):
+        """
+        R: (3, 3) torch.Tensor – rotation matrix
+        T: (3,)   torch.Tensor – translation vector
+        K: (3, 3) torch.Tensor – intrinsic matrix
+        type: "mask", "rgb", etc.
+        """
+
+        # Convert intrinsics to normalized values
+        fx = K[0, 0].item()
+        fy = K[1, 1].item()
+        cx = K[0, 2].item()
+        cy = K[1, 2].item()
+
+        image_size = torch.tensor([[self.size, self.size]], dtype=torch.float32, device=self.device)
+        px = fx / (self.size / 2.0)
+        py = fy / (self.size / 2.0)
+        p0 = (cx - self.size / 2.0) / (self.size / 2.0)
+        p1 = (cy - self.size / 2.0) / (self.size / 2.0)
+
+        cameras = PerspectiveCameras(
+            device=self.device,
+            R=R.unsqueeze(0),
+            T=T.unsqueeze(0),
+            focal_length=torch.tensor([[px, py]], device=self.device),
+            principal_point=torch.tensor([[p0, p1]], device=self.device),
+            image_size=image_size,
+            in_ndc=True
+        )
+
+        self.init_renderer(cameras, type=type, bg=bg)
+
+        current_mesh = self.meshes[0]  # Assume single mesh
+        if type == "mask":
+            output = self.renderer(current_mesh)[..., 3]  # Alpha channel as mask
+        elif type == "rgb":
+            output = self.renderer(current_mesh)[..., :3]
+        else:
+            raise ValueError(f"Unsupported type: {type}")
+
+        return output.squeeze(0)
+
+
     def load_meshes(self, verts, faces):
         """load mesh into the pytorch3d renderer
 
@@ -379,3 +425,25 @@ class Render:
             video.write(final_img[:, :, ::-1])
 
         video.release()
+
+        
+    def compute_normal_batch(self, vertices, faces):
+
+        bs, nv = vertices.shape[:2]
+        bs, nf = faces.shape[:2]
+
+        vert_norm = torch.zeros(bs * nv, 3).type_as(vertices)
+        tris = util.face_vertices(vertices, faces)
+        face_norm = F.normalize(
+            torch.cross(tris[:, :, 1] - tris[:, :, 0], tris[:, :, 2] - tris[:, :, 0]), dim=-1
+        )
+
+        faces = (faces + (torch.arange(bs).type_as(faces) * nv)[:, None, None]).view(-1, 3)
+
+        vert_norm[faces[:, 0]] += face_norm.view(-1, 3)
+        vert_norm[faces[:, 1]] += face_norm.view(-1, 3)
+        vert_norm[faces[:, 2]] += face_norm.view(-1, 3)
+
+        vert_norm = F.normalize(vert_norm, dim=-1).view(bs, nv, 3)
+
+        return vert_norm

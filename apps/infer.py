@@ -285,15 +285,18 @@ if __name__ == "__main__":
                     smpl_verts * torch.tensor([1.0, -1.0, -1.0]).to(device),
                     in_tensor["smpl_faces"],
                 )
+                img_norm_path_f = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_front_normalsmpl.png")
+                torchvision.utils.save_image((in_tensor['T_normal_F'].detach().cpu()),img_norm_path_f)
 
                 T_mask_F, T_mask_B = dataset.render.get_image(type="mask")
 
                 with torch.no_grad():
                     # [1, 3, 512, 512], (-1.0, 1.0)
                     in_tensor["normal_F"], in_tensor["normal_B"] = normal_net.netG(in_tensor)
-                """
+                
                 img_norm_path_f = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_front_normal.png")
                 torchvision.utils.save_image((in_tensor['normal_F'].detach().cpu()),img_norm_path_f)
+                """
                 img_norm_path_b = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_back_normal.png")
                 torchvision.utils.save_image((in_tensor['normal_B'].detach().cpu()),img_norm_path_b)
                 """
