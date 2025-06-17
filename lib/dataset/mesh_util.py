@@ -434,6 +434,17 @@ def remesh_laplacian(mesh, obj_path, face_count=50000):
 
     return mesh
 
+def remesh(mesh, obj_path, device):
+
+    mesh = mesh.simplify_quadratic_decimation(50000)
+    mesh = trimesh.smoothing.filter_humphrey(
+        mesh, alpha=0.1, beta=0.5, iterations=10, laplacian_operator=None
+    )
+    mesh.export(obj_path)
+    verts_pr = torch.tensor(mesh.vertices).float().unsqueeze(0).to(device)
+    faces_pr = torch.tensor(mesh.faces).long().unsqueeze(0).to(device)
+
+    return verts_pr, faces_pr
 
 def poisson(mesh, obj_path, depth=10, face_count=50000, laplacian_remeshing=False):
 
@@ -462,7 +473,6 @@ def poisson(mesh, obj_path, depth=10, face_count=50000, laplacian_remeshing=Fals
 
 # Losses to smooth / regularize the mesh shape
 def update_mesh_shape_prior_losses(mesh, losses):
-
     # and (b) the edge length of the predicted mesh
     losses["edge"]["value"] = mesh_edge_loss(mesh)
     # mesh normal consistency
