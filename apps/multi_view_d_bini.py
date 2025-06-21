@@ -342,7 +342,7 @@ def build_per_view_blocks(
         'W_f', 'W_b',  # **initial** bilateral weights     (csr, diagonal)
         'state'        # any extra per‑view state you need later
     """
-    # ---------- (copy & lightly adapt the original code here) --------------
+    # ------------------------
     normal_mask = np.squeeze(normal_mask)
     assert normal_mask.ndim == 2, f"normal_mask shape is {normal_mask.shape}, expected 2D"
     num_normals = cp.sum(normal_mask).item()
@@ -667,7 +667,7 @@ def multi_view_d_bini(
     z_prior = cp.concatenate(z_prior_blocks)
 
     # ------------------------------------------------------------------
-    # 3. cross‑view coupling (optional) --------------------------------
+    # 3. cross‑view coupling 
     # ------------------------------------------------------------------
     
     if lambda_cross_view > 0.0:
@@ -690,6 +690,13 @@ def multi_view_d_bini(
     # ------------------------------------------------------------------
     z = cp.zeros(2 * int(offsets[-1]), dtype=cp.float32)
     for it in range(irls_max_iter):
+        energy = (A @ z - b).T @ W @ (A @ z - b) + \
+                 lambda_depth_front * (z - z_prior).T @ M_big @ (z - z_prior) + \
+                 lambda_boundary_consistency * (z - z_prior).T @ S_big @ (z - z_prior)
+        if C_full is not None:
+            energy = energy + lambda_cross_view * (C_full @ z - rhs_C_front).T @ (C_full @ z - rhs_C_front)
+        #print(f"IRLS iteration {it}, energy: {energy}")
+
         lhs = A.T @ W @ A
         lhs = lhs + lambda_depth_front * M_big
         lhs = lhs + lambda_boundary_consistency * S_big
@@ -703,7 +710,7 @@ def multi_view_d_bini(
         z, _ = cg(lhs, rhs, x0=z, M=D_inv,
                   maxiter=cg_max_iter, tol=cg_tol)
 
-        # TODO: update bilateral weights per view (omitted for brevity)
+        # TODO: update bilateral weights per view 
 
     # ------------------------------------------------------------------
     # 5. unpack + build meshes -----------------------------------------

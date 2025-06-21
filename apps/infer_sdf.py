@@ -14,17 +14,12 @@
 #
 # Contact: ps-license@tuebingen.mpg.de
 from apps.SDFNetwork import Camera, extract_mesh_from_sdf, load_cameras_from_json, optimize_sdf, quaternion_to_rotation_matrix
-from apps.prepare_supernormal_inputs import convert_camera_json_to_npz, rotate_normals_to_world, save_normal_map_exr_camera_to_world
 import pyexr
 import logging
 import warnings
 import os
 import os.path as osp
-from apps.BNIPipeline import BNIPipeline
 from apps.FaceRigExporter import FaceRigExporter
-from apps.mv_bini import extract_surface_multiview
-from lib.common.ifnet_input_generator import IFNetsInputGenerator
-from lib.common import BNI, BNI_multi
 from pytorch3d.loss.chamfer import chamfer_distance
 
 warnings.filterwarnings("ignore")
@@ -52,8 +47,7 @@ from apps.clean_mesh import MeshCleanProcess
 from apps.SMPLXJointAligner import SMPLXJointAligner
 from apps.CameraTransformManager import CameraTransformManager
 
-
-from lib.common.BNI_utils_m import save_normal_tensor_multi, BNI
+from lib.common.BNI import BNI
 from lib.common.config import cfg
 from lib.common.imutils import blend_rgb_norm, load_img, transform_to_tensor, wrap
 from lib.common.local_affine import LocalAffine, register, trimesh2meshes
@@ -738,10 +732,6 @@ if __name__ == "__main__":
                 smpl_arr = torch.cat([view_data["T_mask_F"], view_data["T_mask_B"]], dim=-1)
                 gt_arr = view_data["img_mask"].to(device).repeat(1, 1, 2)
                 diff_S = torch.abs(smpl_arr - gt_arr)
-                
-                #view_data["normal_FW"] = rotate_normals_to_world(view_data["normal_F"], T_frame_to_target[:3, :3])
-                #img_norm_path_f = osp.join(args.out_dir, cfg.name, "png", f"{view_data['name']}_normal_FW_{frame_id}.png")
-                #torchvision.utils.save_image((view_data["normal_FW"].detach().cpu()), img_norm_path_f)
 
                 sil_loss = diff_S.mean()
                 normal_loss = (torch.abs(view_data["T_normal_F"]) - torch.abs(view_data["normal_F"])).mean()
@@ -1169,7 +1159,7 @@ if __name__ == "__main__":
             print("="*50)
             print("PRE-FLIGHT CHECKS COMPLETE. ALL SYSTEMS GO.")
             print("="*50 + "\n")
-        """
+    
         # STEP 1: Apply the Blender-to-CV coordinate system flip.
         # This matrix swaps and flips the Y and Z axes.
         R_smpl_to_cv = torch.tensor([
@@ -1186,16 +1176,16 @@ if __name__ == "__main__":
         ], dtype=torch.float32, device=device)
         # Combine rotations: first R_smpl_to_cv, then R_z_180
         R_combined = R_z_90 @ R_smpl_to_cv
-        smpl_vertices_transformed = (R_combined @ in_tensor["smpl_verts"].squeeze().T).T
-        translation_to_view = torch.tensor([0.0, 0.0, 3.0], device=device)
-        smpl_vertices_aligned = smpl_vertices_transformed + translation_to_view
+        smpl_vertices_transformed = (R_combined @ in_tensor["view_0"]["smpl_verts"].squeeze().T).T
+        #translation_to_view = torch.tensor([0.0, 0.0, 3.0], device=device)
+        #smpl_vertices_aligned = smpl_vertices_transformed + translation_to_view
         R_z_90 = torch.tensor([
             [-1, 0, 0],
             [0, -1, 0],
             [0, 0, 1]
         ], dtype=torch.float32, device=device)
-        smpl_vertices_aligned = (R_z_90 @ smpl_vertices_aligned.T).T
-        """
+        smpl_vertices_aligned = (R_z_90 @ smpl_vertices_transformed.T).T
+    
         print("\n" + "="*50)
         print("SMPL MODEL BOUNDING VOLUME DIAGNOSTICS")
         print("="*50)
@@ -1246,41 +1236,8 @@ if __name__ == "__main__":
         transform_manager.debug_visualize_cameras_and_smpl(in_tensor["view_0"]["smpl_verts"].detach().cpu(), save_path="camera_smpl_3d_debug.png")
         # Visualize SMPL projections on masks (calls BNIPipeline debug)
 
-        """
-        # ------------------------------------------------------------------------------------------------------------------
-        #run_preflight_checks(in_tensor, cameras, in_tensor["view_0"]["smpl_verts"]*torch.tensor([-1.0, -1.0, 1.0]).to(device))
-        pipeline = BNIPipeline(cameras=cameras, lambda_c=1e-4, lambda_s=1e-3)
-        smpl_verts = in_tensor["view_0"]["smpl_verts"]
-        scale = torch.tensor([-1.0, 1.0, 1.0], device=smpl_verts.device)
-        smpl_verts_np = (smpl_verts * scale).detach().cpu().numpy()
-        pipeline.run(in_tensor, smpl_verts_np)
-        mesh = pipeline.run(in_tensor, smpl_verts_np)
-        mesh.export(os.path.join(args.out_dir, cfg.name, "obj", f"{data['name']}_fused_BNI.obj"))
-        """
+        run_preflight_checks(in_tensor, cameras, smpl_vertices_aligned.to(device))
 
-        # ------------------------------------------------------------------------------------------------------------------
-        # BNI
-        idx = 0
-        BNI_dict = save_normal_tensor_multi(
-            in_tensor,
-            idx,
-            osp.join(args.out_dir, cfg.name, f"BNI/{data['name']}_{idx}"),
-            cfg.bni.thickness,
-        )
-
-        BNI_object = BNI(
-            dir_path=osp.join(args.out_dir, cfg.name, "BNI"),
-            name=data["name"],
-            BNI_dict=BNI_dict,
-            cfg=cfg.bni,
-            device=device,
-            cameras=cameras,
-            correspondences=None,
-            pairs_list=[[2,6],[0,4],[1,5],[3,7]],
-            transform_manager=transform_manager,
-            in_tensor=in_tensor,
-            use_tensor_correspondences=True,
-        )
-
-        BNI_object.extract_surface_multi(lambda_cross_view=1.0, depth_threshold=0.1, debug_output_dir=os.path.join(args.out_dir, cfg.name, "debug_correspondences"))
-        
+        # Run optimization with your in_tensor and optional smpl_vertices
+        sdf_net, optimized_cameras = optimize_sdf(in_tensor, cameras, smpl_vertices=in_tensor["view_0"]["smpl_verts"], num_iterations=10000)
+        extract_mesh_from_sdf(sdf_net, smpl_vertices=in_tensor["view_0"]["smpl_verts"], grid_size=256, filename="reconstructed_mesh.obj")

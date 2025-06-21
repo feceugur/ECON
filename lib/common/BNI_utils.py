@@ -773,17 +773,17 @@ def save_normal_tensor(in_tensor, idx, png_path, thickness=0.0):
 
     return BNI_dict
 
-
+"""
 def save_normal_tensor_multi(in_tensor, idx, png_path, thickness=0.0):
-    """
-    Save normal tensors and depth maps for multi-view data and prepare inputs for bilateral normal integration.
     
-    Args:
-        in_tensor (dict): Dictionary containing all input data including view-specific data
-        idx (int): Index of the view to process
-        png_path (str): Path to save the output files
-        thickness (float): Thickness parameter for depth maps
-    """
+    # Save normal tensors and depth maps for multi-view data and prepare inputs for bilateral normal integration.
+    
+    #Args:
+    #    in_tensor (dict): Dictionary containing all input data including view-specific data
+    #    idx (int): Index of the view to process
+    #    png_path (str): Path to save the output files
+    #    thickness (float): Thickness parameter for depth maps
+
     os.makedirs(os.path.dirname(png_path), exist_ok=True)
 
     # Initialize lists for multi-view integration
@@ -846,5 +846,6 @@ def save_normal_tensor_multi(in_tensor, idx, png_path, thickness=0.0):
             np.save(png_path + ".npy", BNI_dict, allow_pickle=True)
 
     return BNI_dict
+"""
 
 

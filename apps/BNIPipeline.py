@@ -525,6 +525,7 @@ class BNIPipeline:
             depth_back.append(dB)
             depth_masks.append((dF != -1).astype(np.uint8))
             #M_crop_list.append(blob["M_crop"])
+            
         # --------------------------------------------------------------
         # Generate correspondences from SMPL
         # --------------------------------------------------------------
