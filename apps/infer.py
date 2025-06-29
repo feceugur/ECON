@@ -35,7 +35,6 @@ from tqdm.auto import tqdm
 from apps.IFGeo import IFGeo
 from apps.Normal import Normal
 from apps.sapiens import ImageProcessor
-from apps.clean_mesh import MeshCleanProcess
 
 from lib.common.BNI import BNI
 from lib.common.BNI_utils import save_normal_tensor
@@ -80,13 +79,13 @@ if __name__ == "__main__":
         "test_gpus", [args.gpu_device], "mcube_res", 512, "clean_mesh", True, "test_mode", True,
         "batch_size", 1
     ]
- 
+
     cfg.merge_from_list(cfg_show_list)
     cfg.freeze()
-    normal_path = "/home/ubuntu/Data/Fulden/ckpt/normal.ckpt"
+
     # load normal model
     normal_net = Normal.load_from_checkpoint(
-        cfg=cfg, checkpoint_path=normal_path, map_location=device, strict=False
+        cfg=cfg, checkpoint_path=cfg.normal_path, map_location=device, strict=False
     )
     normal_net = normal_net.to(device)
     normal_net.netG.eval()
@@ -124,9 +123,6 @@ if __name__ == "__main__":
     else:
         print(colored(f"Complete with {Format.start} SMPL-X (Explicit) {Format.end}", "green"))
 
-    rgb_masks = []
-    smpl_masks = []
-    
     dataset = TestDataset(dataset_param, device)
 
     print(colored(f"Dataset Size: {len(dataset)}", "green"))
@@ -134,7 +130,6 @@ if __name__ == "__main__":
     pbar = tqdm(dataset)
 
     for data in pbar:
-
 
         losses = init_loss()
 
@@ -160,9 +155,8 @@ if __name__ == "__main__":
         os.makedirs(osp.join(args.out_dir, cfg.name, "obj"), exist_ok=True)
 
         in_tensor = {
-            "smpl_faces": data["smpl_faces"], 
-            "image": data["img_icon"].to(device), 
-            "mask": data["img_mask"].to(device)
+            "smpl_faces": data["smpl_faces"], "image": data["img_icon"].to(device), "mask":
+            data["img_mask"].to(device)
         }
 
         # The optimizer and variables
@@ -199,7 +193,7 @@ if __name__ == "__main__":
             sapiens_normal = sapiens_normal_net.process_image(
                 Image.fromarray(
                     data["img_raw"].squeeze(0).permute(1, 2, 0).numpy().astype(np.uint8)
-                ), "1b", cfg.sapiens.seg_model
+                ), cfg.sapiens.normal_model, cfg.sapiens.seg_model
             )
             print(colored("Estimating normal maps from input image, using Sapiens-normal", "green"))
 
@@ -210,6 +204,7 @@ if __name__ == "__main__":
 
         # remove this line if you change the loop_smpl and obtain different SMPL-X fits
         if osp.exists(smpl_path) and (not cfg.force_smpl_optim):
+
             smpl_verts_lst = []
             smpl_faces_lst = []
 
@@ -291,25 +286,6 @@ if __name__ == "__main__":
                 with torch.no_grad():
                     # [1, 3, 512, 512], (-1.0, 1.0)
                     in_tensor["normal_F"], in_tensor["normal_B"] = normal_net.netG(in_tensor)
-                """
-                img_norm_path_f = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_front_normal.png")
-                torchvision.utils.save_image((in_tensor['normal_F'].detach().cpu()),img_norm_path_f)
-                img_norm_path_b = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_back_normal.png")
-                torchvision.utils.save_image((in_tensor['normal_B'].detach().cpu()),img_norm_path_b)
-                """
-
-                img_crop_path = osp.join(args.out_dir, cfg.name, "png", f"{data['name']}_normal_and_mask_default.png")
-                row1 = torch.cat([data["img_crop"][:, :3], data["img_crop"][:, :3]], dim=3)  # Concatenate front and back images
-                row2 = torch.cat([(in_tensor['normal_F'].detach().cpu() + 1.0) * 0.5, 
-                                (in_tensor['normal_B'].detach().cpu() + 1.0) * 0.5], dim=3)  # Concatenate normal front and back
-                row3 = torch.cat([in_tensor["mask"].unsqueeze(1).repeat(1, 3, 1, 1).detach().cpu(),
-                                in_tensor["mask"].unsqueeze(1).repeat(1, 3, 1, 1).detach().cpu()], dim=3)  # Concatenate mask and mask_back
-
-                # Now stack the rows vertically (along dim=2)
-                final_tensor = torch.cat([row1, row2, row3], dim=2)
-
-                # Save the final vertically stacked image
-                torchvision.utils.save_image(final_tensor, img_crop_path)
 
                 # only replace the front cloth normals, and the back cloth normals will get improved accordingly
                 # as the back cloth normals are conditioned on the body cloth normals
@@ -695,7 +671,6 @@ if __name__ == "__main__":
                 final_mesh = sum(full_lst)
                 final_mesh.export(final_path)
 
-            
             if not args.novis:
                 dataset.render.load_meshes(final_mesh.vertices, final_mesh.faces)
                 rotate_recon_lst = dataset.render.get_image(cam_type="four")
@@ -733,19 +708,3 @@ if __name__ == "__main__":
             torch.save(
                 in_tensor, osp.join(args.out_dir, cfg.name, f"vid/{data['name']}_in_tensor.pt")
             )
-            
-        final_watertight_path = f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_full_wt.obj"
-        watertightifier = MeshCleanProcess(final_path, final_watertight_path)
-        result = watertightifier.process(reconstruction_method='poisson', depth=10)
-
-        if result:
-            print("The mesh is watertight and has been saved successfully!")
-        else:
-            print("The mesh is not watertight. Further inspection may be needed.")
-
-        final_mesh = MeshCleanProcess.process_watertight_mesh(
-            final_watertight_path=f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_full_wt.obj",
-            output_path=f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_final.obj",
-            face_vertex_mask=SMPLX_object.front_flame_vertex_mask,
-            target_faces=15000
-        )

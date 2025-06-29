@@ -13,7 +13,9 @@
 # for Intelligent Systems. All rights reserved.
 #
 # Contact: ps-license@tuebingen.mpg.de
+from collections import defaultdict
 from apps.SDFNetwork import Camera, extract_mesh_from_sdf, load_cameras_from_json, optimize_sdf, quaternion_to_rotation_matrix
+from lib.common.smpl_eval import SMPLMetricsCalculator
 import pyexr
 import logging
 import warnings
@@ -30,6 +32,7 @@ import argparse
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torchvision
 import trimesh
 from pytorch3d.ops import SubdivideMeshes
@@ -39,6 +42,7 @@ import numpy as np
 import smplx
 import matplotlib.pyplot as plt
 import open3d as o3d
+import pandas as pd
 
 from apps.IFGeo import IFGeo
 from apps.Normal import Normal
@@ -46,13 +50,14 @@ from apps.sapiens import ImageProcessor
 from apps.clean_mesh import MeshCleanProcess
 from apps.SMPLXJointAligner import SMPLXJointAligner
 from apps.CameraTransformManager import CameraTransformManager
+from apps.texture_utils import TextureGenerator, generate_texture_map
 
 from lib.common.BNI import BNI
 from lib.common.BNI_utils import save_normal_tensor
 from lib.common.config import cfg
 from lib.common.imutils import blend_rgb_norm, load_img, transform_to_tensor, wrap
 from lib.common.local_affine import LocalAffine, register, trimesh2meshes
-from lib.common.render import Render, query_color
+from lib.common.render import Render, query_color, query_normal_color
 from lib.common.train_util import Format, init_loss
 from lib.common.voxelize import VoxelGrid
 from lib.dataset.mesh_util import *
@@ -62,6 +67,203 @@ from lib.net.geometry import rot6d_to_rotmat, rotation_matrix_to_angle_axis, rot
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
+def get_fixed_vertex_mask(initial_mesh, front_view_id, back_view_id, transform_manager, device, visibility_threshold=0.1):
+    """
+    Identifies vertices visible from the front or back views to be anchored.
+    (Robust version)
+    """
+    print("Identifying vertices to anchor...")
+    
+    # --- Robustly get vertices and normals, removing any batch dimension of 1 ---
+    initial_verts = initial_mesh.verts_packed().squeeze(0)      # Squeeze potential batch dim
+    initial_normals = initial_mesh.verts_normals_packed().squeeze(0) # Squeeze potential batch dim
+
+    total_verts = initial_verts.shape[0]
+    if total_verts <= 1:
+        raise ValueError(f"Error in get_fixed_vertex_mask: Found only {total_verts} vertices. Check initial_mesh.")
+
+    # Get camera transformations from canonical space to view space
+    T_front = transform_manager.get_transform_to_target(front_view_id).to(device)
+    T_back = transform_manager.get_transform_to_target(back_view_id).to(device)
+
+    # Transform vertices and normals into the front view's camera space
+    verts_in_front_view = apply_homogeneous_transform(initial_verts, T_front.T)
+    normals_in_front_view = torch.matmul(initial_normals, T_front[:3, :3].T)
+    
+    # A vertex is visible if its normal points towards the camera
+    front_visibility = torch.sum(F.normalize(normals_in_front_view, dim=-1) * F.normalize(-verts_in_front_view, dim=-1), dim=-1)
+    front_mask = front_visibility > visibility_threshold
+
+    # Repeat for the back view
+    verts_in_back_view = apply_homogeneous_transform(initial_verts, T_back.T)
+    normals_in_back_view = torch.matmul(initial_normals, T_back[:3, :3].T)
+    back_visibility = torch.sum(F.normalize(normals_in_back_view, dim=-1) * F.normalize(-verts_in_back_view, dim=-1), dim=-1)
+    back_mask = back_visibility > visibility_threshold
+
+    # The final mask includes vertices visible from either the front OR the back
+    fixed_mask = torch.logical_or(front_mask, back_mask)
+    
+    num_fixed = fixed_mask.sum().item()
+    
+    print(colored(f"Anchoring {num_fixed} / {total_verts} vertices ({num_fixed / total_verts:.2%}).", "yellow"))
+    
+    return fixed_mask.to(device)
+
+
+def semantic_texture_from_multi_view(
+    final_mesh, 
+    multi_view_data, 
+    transform_manager, 
+    view_indices, 
+    device, 
+    visibility_threshold=0.05,
+    blend_iterations=3
+):
+    """
+    Computes per-vertex colors using a semantic hierarchy (front, back, sides).
+
+    Args:
+        final_mesh (trimesh.Trimesh): The final, refined 3D mesh.
+        multi_view_data (list): List of data dictionaries for each view.
+        transform_manager (CameraTransformManager): Your camera manager.
+        view_indices (dict): Dict mapping 'front', 'back', 'left', 'right' to frame indices.
+        device (torch.device): The GPU device.
+        visibility_threshold (float): Dot product threshold for a surface to be considered visible.
+        blend_iterations (int): Number of iterations for seam blending.
+
+    Returns:
+        np.ndarray: An array of vertex colors of shape (num_vertices, 4) in uint8 format.
+    """
+    print("Performing SEMANTIC multi-view texturing...")
+    
+    verts = torch.tensor(final_mesh.vertices, dtype=torch.float32, device=device)
+    vert_normals = torch.tensor(final_mesh.vertex_normals, dtype=torch.float32, device=device)
+    num_verts = verts.shape[0]
+
+    # --- 1. Pre-calculate Projection Data for All Views ---
+    projection_data = {}
+    semantic_order = ['front', 'back', 'left', 'right']
+
+    for view_name in semantic_order:
+        view_idx = view_indices.get(view_name)
+        if view_idx is None:
+            continue
+        
+        view_data = multi_view_data[view_idx]
+        frame_id = int(view_data['name'].split("_")[1])
+        T_canon_to_view = transform_manager.get_transform_to_target(frame_id).to(device)
+        
+        verts_in_view = apply_homogeneous_transform(verts, T_canon_to_view.T).squeeze(0)  # Remove batch dimension
+        normals_in_view = torch.matmul(vert_normals, T_canon_to_view[:3, :3].T)
+        
+        quality_scores = torch.sum(F.normalize(normals_in_view, dim=1) * F.normalize(-verts_in_view, dim=1), dim=1)
+        uv_coords = verts_in_view[:, :2] # Y-flip may be needed here
+
+        # Mask for valid vertices in this view
+        visible_mask = quality_scores > visibility_threshold
+        in_frame_mask = (uv_coords[:, 0].abs() < 1.0) & (uv_coords[:, 1].abs() < 1.0)
+        valid_mask = visible_mask & in_frame_mask
+        
+        img_tensor = view_data["img_icon"].to(device) * 0.5 + 0.5
+        
+        projection_data[view_name] = {
+            'uvs': uv_coords,
+            'scores': quality_scores,
+            'valid_mask': valid_mask,
+            'image': img_tensor
+        }
+
+    # --- 2. Hierarchical Coloring ---
+    vertex_colors = torch.zeros(num_verts, 3, device=device)
+    # -1: uncolored, 0: front, 1: back, 2: left, 3: right
+    ownership = torch.full((num_verts,), -1, dtype=torch.long, device=device) 
+    
+    # Layer 1 & 2: Front and Back
+    for i, view_name in enumerate(['front', 'back']):
+        if view_name not in projection_data: continue
+        data = projection_data[view_name]
+        
+        # Vertices that are valid in this view AND are not yet colored
+        mask = data['valid_mask'] & (ownership == -1)
+        if mask.sum() == 0: continue
+        
+        uvs_to_sample = data['uvs'][mask].unsqueeze(0).unsqueeze(2)
+        colors = F.grid_sample(data['image'], uvs_to_sample, mode='bilinear', align_corners=False)
+        vertex_colors[mask] = colors.squeeze(3).squeeze(0).T
+        ownership[mask] = i
+
+    # Layer 3: Left vs Right for remaining vertices
+    if 'left' in projection_data and 'right' in projection_data:
+        left_data = projection_data['left']
+        right_data = projection_data['right']
+        
+        # Vertices that are still uncolored
+        uncolored_mask = (ownership == -1)
+        # Vertices valid in left view AND uncolored
+        left_candidate_mask = left_data['valid_mask'] & uncolored_mask
+        # Vertices valid in right view AND uncolored
+        right_candidate_mask = right_data['valid_mask'] & uncolored_mask
+
+        # Decide between left and right based on score
+        left_scores = torch.where(left_candidate_mask, left_data['scores'], -1.0)
+        right_scores = torch.where(right_candidate_mask, right_data['scores'], -1.0)
+        
+        assign_left_mask = (left_scores >= right_scores) & left_candidate_mask
+        assign_right_mask = (right_scores > left_scores) & right_candidate_mask
+        
+        # Apply left colors
+        if assign_left_mask.sum() > 0:
+            uvs_to_sample = left_data['uvs'][assign_left_mask].unsqueeze(0).unsqueeze(2)
+            colors = F.grid_sample(left_data['image'], uvs_to_sample, mode='bilinear', align_corners=False)
+            vertex_colors[assign_left_mask] = colors.squeeze(3).squeeze(0).T
+            ownership[assign_left_mask] = 2
+            
+        # Apply right colors
+        if assign_right_mask.sum() > 0:
+            uvs_to_sample = right_data['uvs'][assign_right_mask].unsqueeze(0).unsqueeze(2)
+            colors = F.grid_sample(right_data['image'], uvs_to_sample, mode='bilinear', align_corners=False)
+            vertex_colors[assign_right_mask] = colors.squeeze(3).squeeze(0).T
+            ownership[assign_right_mask] = 3
+
+    # --- 4. Fill any remaining uncolored vertices (e.g., bottom of feet) by nearest neighbor ---
+    uncolored_final_mask = (ownership == -1)
+    if uncolored_final_mask.sum() > 0:
+        print(f"Filling {uncolored_final_mask.sum()} uncolored vertices by nearest neighbor...")
+        colored_verts = verts[~uncolored_final_mask]
+        uncolored_verts = verts[uncolored_final_mask]
+        
+        # Simple KNN with k=1
+        distances = torch.cdist(uncolored_verts, colored_verts)
+        nearest_indices = torch.argmin(distances, dim=1)
+        
+        vertex_colors[uncolored_final_mask] = vertex_colors[~uncolored_final_mask][nearest_indices]
+
+    # --- 5. Seam Blending ---
+    print(f"Blending seams over {blend_iterations} iterations...")
+    edges_np = final_mesh.edges
+    edges = torch.tensor(edges_np.T, dtype=torch.long, device=device) # Shape: [2, num_edges]
+
+    for _ in tqdm(range(blend_iterations), desc="Blending"):
+        # Find vertices at the seams
+        neighbor_ownership = ownership[edges[1]].view(edges.shape[1])
+        is_seam = (ownership[edges[0]] != neighbor_ownership).any()
+        seam_vertex_indices = torch.unique(edges[0][is_seam])
+        
+        # Average their colors with neighbors
+        new_colors = vertex_colors.clone()
+        for v_idx in seam_vertex_indices:
+            neighbor_indices = final_mesh.vertex_neighbors[v_idx]
+            neighbor_indices_tensor = torch.tensor(neighbor_indices, dtype=torch.long, device=device)
+            # Include the vertex itself in the average
+            all_indices = torch.cat([torch.tensor([v_idx], device=device), neighbor_indices_tensor])
+            new_colors[v_idx] = torch.mean(vertex_colors[all_indices], dim=0)
+        vertex_colors = new_colors
+
+    # Convert to numpy and return
+    final_colors_np = (vertex_colors.cpu().numpy() * 255).astype(np.uint8)
+    return np.hstack([final_colors_np, np.full((num_verts, 1), 255, dtype=np.uint8)])
+
 
 def save_normal_comparison(pred_norm, gt_norm, path):
     """
@@ -592,6 +794,50 @@ if __name__ == "__main__":
             exp_list.append(data["exp"])
             jaw_list.append(data["jaw_pose"])
 
+        # compute losses for each view before mean computation
+        before_mean_losses = defaultdict(list)
+        for view_data in multi_view_data:
+            frame_id = int(view_data["name"].split("_")[1])
+            view_data["T_normal_F"], view_data["T_normal_B"] = dataset.render_normal(
+                view_data["smpl_verts"] * torch.tensor([-1.0, -1.0, 1.0]).to(device),
+                view_data["smpl_faces"],
+            )
+            view_data["T_mask_F"], view_data["T_mask_B"] = dataset.render.get_image(type="mask")
+            view_data["normal_F"], view_data["normal_B"] = normal_net.netG(view_data)
+            smpl_arr = torch.cat([view_data["T_mask_F"], view_data["T_mask_B"]], dim=-1)
+            gt_arr = view_data["img_mask"].to(device).repeat(1, 1, 2)
+            diff_S = torch.abs(smpl_arr - gt_arr)
+            sil_loss = diff_S.mean()
+            normal_loss = (torch.abs(view_data["normal_F"]) - torch.abs(view_data["T_normal_F"])).mean()
+            
+            # Extract head rotation matrix from pose parameters
+            view_pose_mat = rot6d_to_rotmat(view_data["body_pose"].view(-1, 6)).view(1, 21, 3, 3)
+            head_rotmat = view_pose_mat[:, 14]  # Head joint is at index 14
+            head_roll_loss = compute_head_roll_loss(head_rotmat, up_direction="view_y")
+            
+            # Ensure all tensors are on the same device
+            ghum_smpl_pairs = SMPLX_object.ghum_smpl_pairs.to(device)
+            landmark_data = view_data["landmark"].to(device)
+            
+            ghum_lmks = landmark_data[:, ghum_smpl_pairs[:, 0], :2]
+            smpl_lmks = view_data["smpl_verts"][:, ghum_smpl_pairs[:, 1], :2]
+            ghum_conf = landmark_data[:, ghum_smpl_pairs[:, 0], -1]
+            
+            valid_landmarks = ghum_conf > 0.5
+            if valid_landmarks.any():
+                landmark_loss = (torch.norm(ghum_lmks - smpl_lmks, dim=2) * ghum_conf * valid_landmarks.float()).sum() / valid_landmarks.float().sum()
+            else:
+                landmark_loss = torch.tensor(0.0, device=device)
+
+            view_total_loss = sil_loss + 0.2 * normal_loss + 0.1 * landmark_loss + 0.3 * head_roll_loss
+            view_data["total_loss"] = view_total_loss
+            before_mean_losses[f'{view_data["name"]}_silhouette_iou'].append(sil_loss.item())
+            before_mean_losses[f'{view_data["name"]}_landmark_error_px'].append(landmark_loss.item())
+            before_mean_losses[f'{view_data["name"]}_sil_l1_loss'].append(sil_loss.item())
+            before_mean_losses[f'{view_data["name"]}_normal_loss'].append(normal_loss.item())
+            before_mean_losses[f'{view_data["name"]}_head_roll_loss'].append(head_roll_loss.item())
+            before_mean_losses[f'{view_data["name"]}_total_loss'].append(view_total_loss.item())
+
 
         # === Compute mean of all corrected values ===
         mean_pose = torch.stack(pose_list, dim=0).mean(dim=0)
@@ -646,6 +892,8 @@ if __name__ == "__main__":
         save_vis_dir = os.path.join(args.out_dir, cfg.name, "png", "canonical_smpl_iters")
         os.makedirs(save_vis_dir, exist_ok=True)
         loss_values = []
+        first_iter_losses = defaultdict(list)
+        last_iter_losses = defaultdict(list)
 
         # Optimization loop
         for i in loop_smpl:
@@ -681,8 +929,8 @@ if __name__ == "__main__":
                 T_frame_to_target = transform_manager.get_transform_to_target(frame_id)
                 T_frame_to_target[:3, 3] = 0.0
 
-                view_data["smpl_verts"] = apply_homogeneous_transform(smpl_verts, (T_frame_to_target))
-                view_data["smpl_joints"] = apply_homogeneous_transform(smpl_joints, (T_frame_to_target))
+                view_data["smpl_verts"] = apply_homogeneous_transform(smpl_verts, (T_frame_to_target).T)
+                view_data["smpl_joints"] = apply_homogeneous_transform(smpl_joints, (T_frame_to_target).T)
 
                 # From SMPL-X rotmat output: [B, J, 3, 3]
                 head_rotmat = optimed_pose_mat[:, 14] 
@@ -702,11 +950,12 @@ if __name__ == "__main__":
 
                 # Save landmark visualization
                 """
-                if i % 10 == 0:  # Save every 10 iterations
-                    save_path = os.path.join(save_vis_dir, f"landmarks_view_{frame_id}_iter_{i:03d}.png")
+                if frame_id == 0 or frame_id == 1 or frame_id == 6 or frame_id ==7:
+                    os.makedirs(os.path.join(save_vis_dir, f"landmarks_{frame_id}"), exist_ok=True)
+                    save_path = os.path.join(save_vis_dir, f"landmarks_{frame_id}/landmarks_view_{frame_id}_iter_{i:03d}.png")
                     visualize_landmarks_detailed(
                         view_data["img_icon"].to(device),
-                        verts_in_view,  # or smpl_verts if already in view space
+                        view_data["smpl_verts"],  # or smpl_verts if already in view space
                         None,           # faces (optional, not used in this scatter version)
                         smpl_lmks,
                         ghum_lmks,
@@ -714,6 +963,7 @@ if __name__ == "__main__":
                         save_path
                     )
                 """
+                
                 # Compute landmark loss with confidence weighting
                 valid_landmarks = ghum_conf > 0.5
                 if valid_landmarks.any():
@@ -735,8 +985,37 @@ if __name__ == "__main__":
                 diff_S = torch.abs(smpl_arr - gt_arr)
 
                 sil_loss = diff_S.mean()
-                normal_loss = (torch.abs(view_data["T_normal_F"]) - torch.abs(view_data["normal_F"])).mean()
+                normal_loss = (torch.abs(view_data["normal_F"]) - torch.abs(view_data["T_normal_F"])).mean()
                 #normal_loss = torch.abs(view_data["T_normal_F"]).mean()
+
+                ### METRICS: Capture individual loss components for this view
+                if i == 0:
+                    # For Silhouette IoU (a better metric than L1 for tables)
+                    rendered_mask = (view_data["T_mask_F"] > 0).bool()
+                    gt_mask = (view_data["img_mask"].to(device) > 0.5).bool()
+                    intersection = torch.sum(rendered_mask & gt_mask).float()
+                    union = torch.sum(rendered_mask | gt_mask).float()
+                    iou = intersection / (union + 1e-8)
+                    first_iter_losses[f'{view_data["name"]}_silhouette_iou'].append(iou.item())
+                    first_iter_losses[f'{view_data["name"]}_landmark_error_px'].append(landmark_loss.item())
+                    first_iter_losses[f'{view_data["name"]}_sil_l1_loss'].append(sil_loss.item())
+                    first_iter_losses[f'{view_data["name"]}_normal_loss'].append(normal_loss.item())
+                    first_iter_losses[f'{view_data["name"]}_head_roll_loss'].append(head_roll_loss.item())
+                    first_iter_losses[f'{view_data["name"]}_total_loss'].append(view_total_loss.item())
+
+                if i == args.loop_smpl - 1:
+                    # For Silhouette IoU (a better metric than L1 for tables)
+                    rendered_mask = (view_data["T_mask_F"] > 0).bool()
+                    gt_mask = (view_data["img_mask"].to(device) > 0.5).bool()
+                    intersection = torch.sum(rendered_mask & gt_mask).float()
+                    union = torch.sum(rendered_mask | gt_mask).float()
+                    iou = intersection / (union + 1e-8)
+                    last_iter_losses[f'{view_data["name"]}_silhouette_iou'].append(iou.item())
+                    last_iter_losses[f'{view_data["name"]}_landmark_error_px'].append(landmark_loss.item())
+                    last_iter_losses[f'{view_data["name"]}_sil_l1_loss'].append(sil_loss.item())
+                    last_iter_losses[f'{view_data["name"]}_normal_loss'].append(normal_loss.item())
+                    last_iter_losses[f'{view_data["name"]}_head_roll_loss'].append(head_roll_loss.item())
+                    last_iter_losses[f'{view_data["name"]}_total_loss'].append(view_total_loss.item())
 
                 # Combine all losses with appropriate weights
                 view_total_loss = sil_loss + 0.2 * normal_loss + 0.1 * landmark_loss + 0.3 * head_roll_loss
@@ -790,6 +1069,79 @@ if __name__ == "__main__":
 
         print(colored(f"📉 Saved loss curve to {loss_curve_path}", "cyan"))
         
+
+        # ==============================================================================
+        # FINAL STEP: PROCESS COLLECTED LOSSES AND GENERATE THE COMPARISON TABLE
+        # ==============================================================================
+        print(colored("\n[3/3] Generating final quantitative comparison table...", "cyan"))
+
+        # This list will hold the structured data for our DataFrame
+        data_for_df = []
+
+        # Helper function to parse the dictionaries and populate our list
+        def process_metrics_dict(stage_name, metrics_dict, multi_view_data):
+            """
+            Parses a loss dictionary and adds structured rows to the data_for_df list.
+            """
+            for view_data in multi_view_data:
+                view_name = view_data["name"]
+                frame_id = int(view_name.split("_")[1])
+
+                # Safely get values from the dictionary, defaulting to 0 if a key is missing
+                # The [0] is because your values are stored in a list
+                iou = metrics_dict.get(f'{view_name}_silhouette_iou', [0])[0]
+                lmk_px = metrics_dict.get(f'{view_name}_landmark_error_px', [0])[0]
+                normal_loss = metrics_dict.get(f'{view_name}_normal_loss', [0])[0]
+                total_loss = metrics_dict.get(f'{view_name}_total_loss', [0])[0]
+
+                data_for_df.append({
+                    'Stage': stage_name,
+                    'View': frame_id,
+                    'Silhouette IoU ↑': iou,
+                    'Landmark Error (px) ↓': lmk_px,
+                    'Normal Loss ↓': normal_loss,
+                    'Total Loss ↓': total_loss,
+                })
+
+        # Process each of the three stages
+        process_metrics_dict('1. Initial Per-View', before_mean_losses, multi_view_data)
+        process_metrics_dict('2. After Mean (Iter 0)', first_iter_losses, multi_view_data)
+        process_metrics_dict('3. Final Optimized', last_iter_losses, multi_view_data)
+
+        # Create a pandas DataFrame from our list of structured data
+        df = pd.DataFrame(data_for_df)
+
+        # Create a pivot table for a clean, multi-level indexed presentation
+        # This is the format you wanted
+        df_pivot = df.pivot_table(
+            index=['Stage', 'View'],
+            values=['Silhouette IoU ↑', 'Landmark Error (px) ↓', 'Normal Loss ↓', 'Total Loss ↓']
+        )
+
+        # Ensure the columns are in a logical order
+        df_pivot = df_pivot[['Silhouette IoU ↑', 'Landmark Error (px) ↓', 'Normal Loss ↓', 'Total Loss ↓']]
+
+        # Sort the table by Stage (as a categorical type to maintain order) and then by View
+        df_pivot.index = df_pivot.index.set_levels(
+            pd.Categorical(df_pivot.index.levels[0], categories=['1. Initial Per-View', '2. After Mean (Iter 0)', '3. Final Optimized'], ordered=True),
+            level=0
+        )
+        df_pivot.sort_index(inplace=True)
+
+
+        # Print the final, formatted table to the console
+        print("\n" + "="*80)
+        print(f" SMPL Optimization Quantitative Analysis: {multi_view_data[0]['name'].split('_')[0]}")
+        print("="*80)
+        print(df_pivot.to_string(float_format="%.5f"))
+        print("="*80)
+
+        # Save the table to a CSV file for easy use in your thesis
+        csv_path = os.path.join(args.out_dir, cfg.name, "obj", f"{multi_view_data[0]['name'].split('_')[0]}_smpl_optimization_metrics.csv")
+        df_pivot.to_csv(csv_path)
+        print(colored(f"✅ Saved detailed metrics table to {csv_path}", "green"))
+
+
         save_obj_path = os.path.join(args.out_dir, cfg.name, "obj", "final_smpl.obj")
         final_smpl_obj = trimesh.Trimesh(
             smpl_verts[0].detach().cpu() * torch.tensor([1.0, -1.0, 1.0]),
@@ -942,6 +1294,7 @@ if __name__ == "__main__":
         })
 
         print(colored(f"✅ Saved clothed image maps and SMPL proxy depth for all {len(multi_view_data)} views", "green"))
+
         
         # Clean up
         del optimizer_smpl
@@ -964,8 +1317,8 @@ if __name__ == "__main__":
         final_path = f"{args.out_dir}/{cfg.name}/obj/{data['name']}_full.obj"
 
         side_mesh = smpl_obj_lst[back_view].copy()
-        face_mesh = smpl_obj_lst[back_view].copy()
-        hand_mesh = smpl_obj_lst[back_view].copy()
+        face_mesh = smpl_obj_lst[front_view].copy()
+        hand_mesh = smpl_obj_lst[front_view].copy()
         smplx_mesh = smpl_obj_lst[back_view].copy()
 
         bni_mesh_list = []
@@ -1190,98 +1543,390 @@ if __name__ == "__main__":
         
         mesh_pr = trimesh2meshes(recon_obj).to(device)
 
-        current_verts = mesh_pr.verts_padded().clone().detach().requires_grad_(True)
-        current_mesh = Meshes(verts=current_verts, faces=mesh_pr.faces_padded())
-
+        initial_verts = mesh_pr.verts_padded().clone().detach()
         local_affine_model = LocalAffine(
-            mesh_pr.verts_padded().shape[1],
-            mesh_pr.verts_padded().shape[0],
+            initial_verts.shape[1],
+            initial_verts.shape[0],
             mesh_pr.edges_packed()
         ).to(device)
 
+        # Setup optimizer and scheduler
         optimizer_cloth = torch.optim.Adam(local_affine_model.parameters(), lr=1e-4)
-        scheduler_cloth = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer_cloth, mode="min", factor=0.5, patience=20)
+        scheduler_cloth = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer_cloth, mode="min", factor=0.5, patience=10, verbose=True)
 
-        losses = init_loss() 
-        losses["stiff"]["weight"] = 0.5
-        losses["rigid"]["weight"] = 0.5
-        losses["cloth"]["weight"] = 0.1
+        fixed_vertex_mask = get_fixed_vertex_mask(mesh_pr, front_view, back_view, transform_manager, device).squeeze()
+        #print(f"Shape of fixed_vertex_mask after squeeze: {fixed_vertex_mask.shape}")
+
+
+        # Base weights for our loss terms
+        loss_weights = {
+            "normal": 15.0,
+            "sil": 7.5,
+            "stiff": 15.0,
+            "rigid": 15.0,
+            "anchor": 1000.0,  # High weight to strongly enforce the anchor
+            "laplacian": 750.0
+        }
+
+        batch_size, num_points, _, _ = local_affine_model.A.shape
+        identity_matrix = torch.eye(3, device=device).unsqueeze(0).unsqueeze(0).repeat(batch_size, num_points, 1, 1)
+
+        # --- 2. Improved Loss Setup: Define weights and annealing parameters ---
+        num_cloth_iter = 1 # Total number of iterations
+
+        # Annealing: We will start with a lower data-term weight and increase it over time.
+        # This helps the mesh settle into a good general shape before fitting fine details.
+        annealing_start_factor = 0.1 # Start with 10% of the data term weights
 
         # Optimization loop
-        for i in tqdm(range(200), desc="Cloth Refinement"):
+        pbar = tqdm(range(num_cloth_iter), desc="Cloth Refinement (Anchored)")
+        for i in pbar:
             optimizer_cloth.zero_grad()
 
-            # Forward pass through the model
-            deformed_verts, stiffness, rigid = local_affine_model(current_verts)
-            deformed_mesh = Meshes(verts=deformed_verts, faces=current_mesh.faces_padded())
-            update_mesh_shape_prior_losses(deformed_mesh, losses)
+            anneal_factor = min(1.0, annealing_start_factor + (1.0 - annealing_start_factor) * (i / (num_cloth_iter / 2.0)))
+    
+            current_weights = {
+                "normal": loss_weights["normal"] * anneal_factor,
+                "sil": loss_weights["sil"] * anneal_factor,
+                "stiff": loss_weights["stiff"],
+                "rigid": loss_weights["rigid"],
+                "anchor": loss_weights["anchor"],
+                "laplacian": loss_weights["laplacian"]
+            }
 
-            # Compute cloth loss over all views
-            cloth_losses = []
-            for view_idx in range(len(multi_view_data)):
-                view_key = f"view_{view_idx}"
-                view_info = in_tensor[view_key]
+            # Forward pass: Deform the initial vertices
+            deformed_verts, stiffness, rigid = local_affine_model(initial_verts)
+            deformed_mesh = Meshes(verts=deformed_verts, faces=mesh_pr.faces_padded())
+
+            # Initialize lists for side-view losses
+            side_normal_losses = []
+            side_silhouette_losses = []
+            # --- Compute DATA loss ONLY on side views ---
+            for view_data in multi_view_data:
+                frame_id = int(view_data['name'].split("_")[1])
                 
-                # Detach transformation to prevent graph persistence
-                T_view = transform_manager.get_transform_to_target(int(view_info["name"].split("_")[1])).detach()
-                verts_view = apply_homogeneous_transform(deformed_verts, T_view.T)
-                P_norm, _ = dataset.render_normal(verts_view, deformed_mesh.faces_padded())
+                # Skip front and back views for data loss calculation
+                if frame_id == front_view or frame_id == back_view:
+                    continue
+                
+                # --- Calculate losses for the side view ---
+                T_view = transform_manager.get_transform_to_target(frame_id).detach()
+                verts_in_view = apply_homogeneous_transform(deformed_verts, T_view.T)
+                P_norm, _ = dataset.render_normal(verts_in_view * torch.tensor([1.0, 1.0, 1.0]).to(device), deformed_mesh.faces_padded())
+                P_mask, _ = dataset.render.get_image(type="mask")
+                
+                target_normal = view_data["normal_F"].detach()
+                target_mask = view_data["img_mask"].to(device, dtype=torch.float32)
 
-                comparison_dir = os.path.join(args.out_dir, cfg.name, "debug_comparisons")
-                os.makedirs(comparison_dir, exist_ok=True)
+                normal_loss = (torch.abs(P_norm - target_normal) * target_mask).sum() / target_mask.sum().clamp(min=1.0)
+                sil_loss = torch.abs(P_mask - target_mask).mean()
 
-                # Detach target normals and mask to ensure independence
-                target_normal = view_info["normal_F"].detach()
+                side_normal_losses.append(normal_loss)
+                side_silhouette_losses.append(sil_loss)
 
-                # Save normal maps comparison every 10 iterations
-                if i % 10 == 0:
-                    save_normal_comparison(P_norm, target_normal, f"{comparison_dir}/normal_comparison_{view_idx}_{i}.png")
+                # Save normal map comparisons for visualization
+                if (i + 1) % 10 == 0 and i > 0:
+                    # Ensure P_norm and target_normal are in the right format (1,3,H,W)
+                    if len(P_norm.shape) == 3:
+                        P_norm = P_norm.unsqueeze(0)
+                    if len(target_normal.shape) == 3:
+                        target_normal = target_normal.unsqueeze(0)
+                    
+                    # Save the normal comparison
+                    normal_comparison_path = f"{args.out_dir}/{cfg.name}/normals/{data['name']}_iter_{i+1}_normals_{frame_id}.png"
+                    os.makedirs(os.path.dirname(normal_comparison_path), exist_ok=True)
+                    save_normal_comparison(P_norm, target_normal, normal_comparison_path)
+                    print(colored(f"\nSaved normal comparison at iteration {i+1}", "cyan"))
 
-                if "mask" in view_info:
-                    mask = torch.tensor(view_info["mask"], device=device, dtype=P_norm.dtype).unsqueeze(0).detach()
-                    diff = torch.abs(P_norm - target_normal) * mask
-                    cloth_loss = diff.sum() / mask.sum().clamp(min=1.0)
-                else:
-                    cloth_loss = torch.abs(P_norm - target_normal).mean()
-
-                cloth_losses.append(cloth_loss)
+            laplacian_loss = mesh_laplacian_smoothing(deformed_mesh, method="uniform")
 
             # Aggregate losses
-            losses["cloth"]["value"] = torch.stack(cloth_losses).mean()
-            losses["stiff"]["value"] = stiffness.mean()
-            losses["rigid"]["value"] = rigid.mean()
+            # Handle the case where there are no side views to prevent errors
+            avg_normal_loss = torch.stack(side_normal_losses).mean() if side_normal_losses else torch.tensor(0.0, device=device)
+            avg_sil_loss = torch.stack(side_silhouette_losses).mean() if side_silhouette_losses else torch.tensor(0.0, device=device)
+            
+            avg_stiffness_loss = stiffness.mean()
+            avg_rigid_loss = rigid.mean()
 
-            # Compute total loss
-            total_loss = sum(v["value"] * v["weight"] for v in losses.values() if v["weight"] > 0.0)
+            # --- NEW: Compute ANCHOR loss on fixed vertices ---
+            # Get the affine transformations for the fixed vertices
+            # Get the affine transformations for ALL vertices first
+            A_all = local_affine_model.A[0].squeeze(0)  # Shape: (N, 3, 3) - Select the first batch item
+            b_all = local_affine_model.b[0].squeeze(0)  # Shape: (N, 3, 1)
 
-            # Backward pass and optimization step
+            # Now, apply the 1D boolean mask to get the fixed vertices
+            A_fixed = A_all[fixed_vertex_mask]
+            b_fixed = b_all[fixed_vertex_mask]
+
+            # Also get the target identity matrix for the corresponding fixed vertices
+            identity_matrix_all = identity_matrix[0].squeeze(0) # Shape (N, 3, 3)
+            identity_fixed = identity_matrix_all[fixed_vertex_mask]
+
+            # Penalize deviation from identity transformation (A=I, b=0)
+            anchor_loss_A = torch.nn.functional.mse_loss(A_fixed, identity_fixed)
+            anchor_loss_b = torch.mean(b_fixed**2)
+            anchor_loss = anchor_loss_A + anchor_loss_b
+
+            # Compute total weighted loss
+            # Compute total weighted loss
+            total_loss = (
+                avg_normal_loss * current_weights["normal"] +
+                avg_sil_loss * current_weights["sil"] +
+                avg_stiffness_loss * current_weights["stiff"] +
+                avg_rigid_loss * current_weights["rigid"] +
+                anchor_loss * current_weights["anchor"] +
+                laplacian_loss * current_weights["laplacian"]
+            )
+
+            # Backward pass and optimization
             total_loss.backward()
             optimizer_cloth.step()
             scheduler_cloth.step(total_loss)
 
-            # Update vertices and mesh for the next iteration
-            with torch.no_grad():
-                current_verts = deformed_verts.clone().detach().requires_grad_(True)
-                current_mesh = Meshes(verts=current_verts, faces=current_mesh.faces_padded())
+            # Update progress bar
+            pbar.set_description(
+                f"Refining | Total: {total_loss.item():.4f} | "
+                f"SideNormal: {avg_normal_loss.item():.4f} | SideSil: {avg_sil_loss.item():.4f} | "
+                f"Anchor: {anchor_loss.item():.6f}"
+            )
 
-            # Save intermediate meshes at specified iterations
-            if i in [4, 9, 14, 19]:  # Using 0-based indexing for iterations
+            # Save intermediate meshes. Note that we use `deformed_verts`, not `current_verts`.
+            if (i + 1) % 10 == 0 and i > 0:
                 intermediate_mesh = trimesh.Trimesh(
-                    vertices=current_verts.detach().cpu().numpy()[0],
-                    faces=current_mesh.faces_padded().detach().cpu().numpy()[0]
+                    vertices=deformed_verts.detach().cpu().numpy()[0],
+                    faces=deformed_mesh.faces_padded().detach().cpu().numpy()[0]
                 )
-                iteration_num = i + 1  # Convert to 1-based for filename
+                iteration_num = i + 1
                 intermediate_mesh.export(f"{args.out_dir}/{cfg.name}/obj/{data['name']}_iter_{iteration_num}.obj")
-                print(f"Saved intermediate mesh at iteration {iteration_num}")
+                print(colored(f"\nSaved intermediate mesh at iteration {iteration_num}", "cyan"))
 
             # Clear GPU memory
             torch.cuda.empty_cache()
 
-        # Final output (e.g., deformed mesh)
+        # Final output: Save the final deformed mesh
         print("Optimization complete.")
-        
         final_mesh = trimesh.Trimesh(
-            vertices=current_verts.detach().cpu().numpy()[0],
-            faces=current_mesh.faces_padded().detach().cpu().numpy()[0]
+            vertices=deformed_verts.detach().cpu().numpy()[0],
+            faces=deformed_mesh.faces_padded().detach().cpu().numpy()[0]
         )
-        final_mesh.export(f"{args.out_dir}/{cfg.name}/obj/{data['name']}_final_mesh.obj")
+        final_mesh.export(f"{args.out_dir}/{cfg.name}/obj/{data['name']}_final_refined_mesh.obj")
+        print(colored(f"✅ Saved final refined mesh to {args.out_dir}/{cfg.name}/obj/{data['name']}_final_refined_mesh.obj", "green"))
+
+        final_path = f"{args.out_dir}/{cfg.name}/obj/"
+
+        # New class-based approach
+        generator = TextureGenerator(texture_size=2048, debug=True)
+        textured_mesh = generator(final_mesh, multi_view_data, transform_manager, final_path, "textured_mesh")
+
+
+        """
+        # 3. Texture Generation
+        
+        view_indices = {
+            'front': front_view, # Corresponds to multi_view_data[2]
+            'back': back_view,  # Corresponds to multi_view_data[6]
+            'left': 0,  # Corresponds to multi_view_data[0]
+            'right': 4  # Corresponds to multi_view_data[4]
+        }
+
+        if cfg.bni.texture_src == 'image':
+            final_colors = semantic_texture_from_multi_view(
+                final_mesh, 
+                multi_view_data, 
+                transform_manager, 
+                view_indices, 
+                device
+            )
+            final_mesh.visual.vertex_colors = final_colors
+
+            # Export the final, textured mesh
+            textured_path = f"{args.out_dir}/{cfg.name}/obj/{data['name']}_final_semantic_textured.obj"
+            final_mesh.export(textured_path)
+            print(colored(f"✅ Saved final semantic textured mesh to {textured_path}", "green"))
+        """
+        canonical_verts = torch.tensor(final_mesh.vertices, dtype=torch.float32, device=device)
+        canonical_faces = torch.tensor(final_mesh.faces, dtype=torch.long, device=device)
+        transform_manager_final = CameraTransformManager(cam_param_path, target_frame=back_view, device=device, debug=False, use_blender_to_cv=False)
+        T_canon_to_front_view = transform_manager_final.get_transform_to_target(0).detach()
+        verts_in_front_view = apply_homogeneous_transform(canonical_verts, T_canon_to_front_view.T)
+
+        (front_xy, front_z) = verts_in_front_view.split([2, 1], dim=-1)
+        front_visibility = get_visibility(front_xy, front_z, canonical_faces[:, [0, 2, 1]]).flatten()
+
+        transform_manager_final = CameraTransformManager(cam_param_path, target_frame=front_view, device=device, debug=False, use_blender_to_cv=False)
+        T_canon_to_back_view = transform_manager_final.get_transform_to_target(0).detach()
+        verts_in_back_view = apply_homogeneous_transform(canonical_verts, T_canon_to_back_view.T)
+
+        (back_xy, back_z) = verts_in_back_view.split([2, 1], dim=-1)
+        back_visibility = get_visibility(back_xy, back_z, canonical_faces[:, [0, 2, 1]]).flatten()
+
+        T_canon_to_left_view = transform_manager_final.get_transform_to_target(0).detach()
+        verts_in_left_view = apply_homogeneous_transform(canonical_verts, T_canon_to_left_view.T)
+
+        (left_xy, left_z) = verts_in_left_view.split([2, 1], dim=-1)
+        left_visibility = get_visibility(left_xy, left_z, canonical_faces[:, [0, 2, 1]]).flatten()
+
+        T_canon_to_right_view = transform_manager_final.get_transform_to_target(0).detach()
+        verts_in_right_view = apply_homogeneous_transform(canonical_verts, T_canon_to_right_view.T)
+
+        (right_xy, right_z) = verts_in_right_view.split([2, 1], dim=-1)
+        right_visibility = get_visibility(right_xy, right_z, canonical_faces[:, [0, 2, 1]]).flatten()
+
+        if cfg.bni.texture_src == 'image':
+
+            # coloring the final mesh (front: RGB pixels, back: normal colors)
+            front_colors = query_color(
+                verts=verts_in_front_view.squeeze(0), # Pass the TRANSFORMED vertices
+                faces=canonical_faces,          # The mesh topology is the same
+                image=in_tensor[f"view_{front_view}"]["image"],
+                device=device,
+                paint_normal=True # Set to False to see non-visible parts as gray
+            )
+
+            back_colors = query_color(
+                verts=verts_in_back_view.squeeze(0), # Pass the TRANSFORMED vertices
+                faces=canonical_faces,          # The mesh topology is the same
+                image=in_tensor[f"view_{back_view}"]["image"],
+                device=device,
+                paint_normal=True # Set to False to see non-visible parts as gray
+            )
+
+            left_colors = query_color(
+                verts=verts_in_left_view.squeeze(0), # Pass the TRANSFORMED vertices
+                faces=canonical_faces,          # The mesh topology is the same
+                image=in_tensor["view_0"]["image"],
+                device=device,
+                paint_normal=True # Set to False to see non-visible parts as gray
+            )
+
+            right_colors = query_color(
+                verts=verts_in_right_view.squeeze(0), # Pass the TRANSFORMED vertices
+                faces=canonical_faces,          # The mesh topology is the same
+                image=in_tensor["view_4"]["image"],
+                device=device,
+                paint_normal=True # Set to False to see non-visible parts as gray
+            )
+
+            final_colors = front_colors.clone()
+            update_mask = (back_visibility == 1) & (front_visibility == 0)
+            final_colors[update_mask] = back_colors[update_mask]
+
+            update_mask = (left_visibility == 1) & (front_visibility == 0) & (back_visibility == 0)
+            final_colors[update_mask] = left_colors[update_mask]
+
+            update_mask = (right_visibility == 1) & (front_visibility == 0) & (back_visibility == 0) & (left_visibility == 0)
+            final_colors[update_mask] = right_colors[update_mask]
+
+            final_mesh.visual.vertex_colors = final_colors
+            final_mesh.export(final_path)
+            print(colored(f"✅ Saved textured mesh to {final_path}", "green"))
+
+        elif cfg.bni.texture_src == 'SD':
+
+            # !TODO: add texture from Stable Diffusion
+            pass
+
+        exit()
+
+
+# =========================================================================
+# === HIERARCHICAL MULTI-VIEW TEXTURING (with Texture Diffusion) ==========
+# =========================================================================
+print("Starting hierarchical multi-view texturing...")
+
+# --- 1. Initialization (Same as before) ---
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+canonical_verts = torch.tensor(final_mesh.vertices, dtype=torch.float32, device=device)
+canonical_faces = torch.tensor(final_mesh.faces, dtype=torch.long, device=device)
+num_verts = canonical_verts.shape[0]
+
+transform_manager_final = CameraTransformManager(cam_param_path, target_frame=0, device=device)
+print("Applying base coat of normal colors...")
+final_colors = query_normal_color(canonical_verts, canonical_faces, device)
+is_textured_mask = torch.zeros(num_verts, dtype=torch.bool, device=device)
+
+# --- 2. Define View Processing Order (Same as before) ---
+priority_views = [args.front_view, args.back_view]
+all_view_indices = list(range(len(multi_view_data)))
+view_order = list(dict.fromkeys(priority_views + all_view_indices))
+print(f"Processing {len(view_order)} views in this order: {view_order}")
+
+# --- 3. Iterate Through All Views and Fill Texture (Same as before) ---
+for view_idx in tqdm(view_order, desc="Texturing from Views"):
+    # (The existing loop logic remains unchanged)
+    current_view_data = in_tensor[f"view_{view_idx}"]
+    T_canon_to_view = transform_manager_final.get_transform_to_target(view_idx).detach()
+    verts_in_view = apply_homogeneous_transform(canonical_verts, T_canon_to_view.T).squeeze(0)
+    verts_in_view = verts_in_view @ torch.tensor([[0.0, 0.0, 1.0], [0.0, -1.0, 0.0], [1.0, 0.0, 0.0]]).to(device)
+    (view_xy, view_z) = verts_in_view.split([2, 1], dim=1)
+    current_visibility = get_visibility(view_xy, view_z, canonical_faces[:, [0, 2, 1]]).flatten().to(device)
+    update_mask = (current_visibility == 1) & (~is_textured_mask)
+    if update_mask.sum().item() == 0:
+        continue
+    current_pass_colors = query_color(verts=verts_in_view, faces=canonical_faces, image=current_view_data["image"], device=device, paint_normal=False)
+    final_colors[update_mask] = current_pass_colors[update_mask]
+    is_textured_mask[update_mask] = True
+    if is_textured_mask.all():
+        break
+
+# --- 4. NEW: Texture Diffusion to Fill Holes ---
+uncolored_mask = ~is_textured_mask
+if uncolored_mask.sum().item() > 0:
+    print(f"\nFound {uncolored_mask.sum().item()} untextured vertices. Starting texture diffusion...")
+    
+    # Get the vertex adjacency list from the mesh
+    # This tells us which vertices are neighbors
+    adj = final_mesh.vertex_adjacency_graph
+    
+    # Perform a few iterations of diffusion
+    for i in range(15): # 15 iterations is usually enough to fill large holes
+        # Find the vertices at the boundary: uncolored vertices with colored neighbors
+        boundary_verts_mask = torch.zeros_like(uncolored_mask)
+        
+        # Create a temporary copy to hold the new colors for this iteration
+        iter_colors = final_colors.clone()
+        
+        # Get indices of all uncolored vertices
+        uncolored_indices = torch.where(uncolored_mask)[0]
+
+        # Use CPU for neighbor loops, as it's sparse and not easily parallelizable on GPU
+        uncolored_indices_cpu = uncolored_indices.cpu().numpy()
+        is_textured_mask_cpu = is_textured_mask.cpu().numpy()
+        
+        # This list will store which vertices we successfully colored in this iteration
+        newly_colored_indices = []
+
+        for v_idx in uncolored_indices_cpu:
+            neighbors = adj.neighbors(v_idx)
+            # Find which of the neighbors are already textured
+            textured_neighbors = [n for n in neighbors if is_textured_mask_cpu[n]]
+            
+            if len(textured_neighbors) > 0:
+                # If there are textured neighbors, this is a boundary vertex
+                boundary_verts_mask[v_idx] = True
+                # Calculate the average color of its textured neighbors
+                neighbor_colors = final_colors[torch.tensor(textured_neighbors, device=device)]
+                avg_color = torch.mean(neighbor_colors.float(), dim=0)
+                iter_colors[v_idx] = avg_color
+                newly_colored_indices.append(v_idx)
+        
+        # Update the final colors with the results from this iteration
+        final_colors = iter_colors
+        
+        # Update the master textured mask
+        if newly_colored_indices:
+            newly_colored_tensor = torch.tensor(newly_colored_indices, dtype=torch.long, device=device)
+            is_textured_mask[newly_colored_tensor] = True
+            uncolored_mask = ~is_textured_mask # Recalculate the remaining uncolored
+            print(f"Diffusion Iter {i+1}: Colored {len(newly_colored_indices)} vertices. Remaining: {uncolored_mask.sum().item()}")
+        else:
+            # If no new vertices were colored, the holes are filled.
+            print("Diffusion complete. No more boundary vertices found.")
+            break
+
+# --- 5. Export the Final Textured Mesh ---
+final_mesh.visual.vertex_colors = final_colors.cpu().numpy()
+textured_path = final_path.replace('.obj', '_diffused_textured.obj')
+final_mesh.export(textured_path)
+
+print(colored(f"\n✅ Exported final diffused-texture mesh to {textured_path}", "green"))

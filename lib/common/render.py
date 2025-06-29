@@ -89,7 +89,7 @@ def query_color(verts, faces, image, device, paint_normal=True):
     else:
         colors[visibility == 0.0] = (torch.tensor([0.5, 0.5, 0.5]) * 255.0).to(device)
 
-    return colors.detach().cpu()
+    return colors.detach()
 
 
 def query_normal_color(verts, faces, device):
@@ -111,7 +111,7 @@ def query_normal_color(verts, faces, device):
         0.5 * 255.0
     )
 
-    return colors.detach().cpu()
+    return colors.detach()
 
 
 class cleanShader(torch.nn.Module):
