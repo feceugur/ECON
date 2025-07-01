@@ -929,8 +929,8 @@ if __name__ == "__main__":
                 T_frame_to_target = transform_manager.get_transform_to_target(frame_id)
                 T_frame_to_target[:3, 3] = 0.0
 
-                view_data["smpl_verts"] = apply_homogeneous_transform(smpl_verts, (T_frame_to_target).T)
-                view_data["smpl_joints"] = apply_homogeneous_transform(smpl_joints, (T_frame_to_target).T)
+                view_data["smpl_verts"] = apply_homogeneous_transform(smpl_verts, (T_frame_to_target))
+                view_data["smpl_joints"] = apply_homogeneous_transform(smpl_joints, (T_frame_to_target))
 
                 # From SMPL-X rotmat output: [B, J, 3, 3]
                 head_rotmat = optimed_pose_mat[:, 14] 
@@ -1366,6 +1366,9 @@ if __name__ == "__main__":
             print(colored(f"✅ Saved front mesh for view {i} to {front_mesh_path}", "green"))
             bni_mesh_list.append(BNI_object.F_trimesh)
             bni_object_list.append(BNI_object)
+            if i == back_view:
+                #add 0.2mm up to the back mesh
+                BNI_object.F_trimesh.vertices[:, 2] -= 0.0005
         
         fused_bni_surface = trimesh.util.concatenate(bni_mesh_list)
         BNI_surface = trimesh2meshes(fused_bni_surface).to(device)

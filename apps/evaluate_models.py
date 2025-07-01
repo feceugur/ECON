@@ -81,19 +81,17 @@ if __name__ == "__main__":
         print("Error: Could not find a '*gt_aligned.obj' file in the directory.")
         exit()
 
-    original_econ_filename = 'intermediate.obj'
-    updated_econ_filename = 'final.obj'
+    updated_econ_filename = 'ext_econ.obj'
     econ_full_filename = 'econ_full.obj'
     # --- Construct full paths ---
     gt_path = os.path.join(args.input_dir, gt_filename)
-    original_econ_path = os.path.join(args.input_dir, original_econ_filename)
     updated_econ_path = os.path.join(args.input_dir, updated_econ_filename)
     econ_full_path = os.path.join(args.input_dir, econ_full_filename)
 
     # Check if all files exist
-    if not all(os.path.exists(p) for p in [gt_path, original_econ_path, updated_econ_path, econ_full_path]):
+    if not all(os.path.exists(p) for p in [gt_path, updated_econ_path, econ_full_path]):
         print("Error: One or more required files are missing from the directory.")
-        print(f"Looking for: {gt_filename}, {original_econ_filename}, {updated_econ_filename}, {econ_full_filename}")
+        print(f"Looking for: {gt_filename}, {updated_econ_filename}, {econ_full_filename}")
         exit()
 
     all_results = []
@@ -101,18 +99,12 @@ if __name__ == "__main__":
     try:
         print("Loading meshes...")
         gt_mesh = trimesh.load(gt_path, process=False)
-        original_econ_mesh = trimesh.load(original_econ_path, process=False)
         updated_econ_mesh = trimesh.load(updated_econ_path, process=False)
         econ_full_mesh = trimesh.load(econ_full_path, process=False)
         
-        print("Calculating metrics for d-BNI intermediate result (intermediate.obj)...")
-        original_econ_metrics = calculate_metrics(original_econ_mesh, gt_mesh)
-        original_econ_metrics['model'] = 'Intermediate'
-        original_econ_metrics['subject'] = os.path.basename(args.input_dir)
-        
-        print("Calculating metrics for after Side Surface Refinement (final.obj)...")
+        print("Calculating metrics for after Side Surface Refinement (ext_econ.obj)...")
         updated_econ_metrics = calculate_metrics(updated_econ_mesh, gt_mesh)
-        updated_econ_metrics['model'] = 'Final'
+        updated_econ_metrics['model'] = 'Ours (Ext. ECON)'
         updated_econ_metrics['subject'] = os.path.basename(args.input_dir)
 
         print("Calculating metrics for Original ECON (econ_full.obj)...")
@@ -120,7 +112,6 @@ if __name__ == "__main__":
         econ_full_metrics['model'] = 'Original ECON'
         econ_full_metrics['subject'] = os.path.basename(args.input_dir)
         
-        all_results.append(original_econ_metrics)
         all_results.append(updated_econ_metrics)
         all_results.append(econ_full_metrics)
 
