@@ -242,13 +242,22 @@ class TestDataset:
 
         return front_arr_dict, back_arr_dict
 
-
     def render_normal(self, verts, faces):
-
+        """
+        Loads meshes and renders both normal maps and masks in a single atomic operation
+        to prevent state issues with the renderer.
+        """
         # render optimized mesh (normal, T_normal, image [-1,1])
         self.render.load_meshes(verts, faces)
-        return self.render.get_image(type="rgb")
-
+        
+        # Render normals (the 'rgb' type in your renderer corresponds to normals)
+        T_normal_F, T_normal_B = self.render.get_image(type="rgb")
+        
+        # Immediately render masks while the mesh state is correct
+        T_mask_F, T_mask_B = self.render.get_image(type="mask")
+        
+        return T_normal_F, T_normal_B, T_mask_F, T_mask_B
+        
     def render_depth(self, verts, faces):
 
         # render optimized mesh (normal, T_normal, image [-1,1])

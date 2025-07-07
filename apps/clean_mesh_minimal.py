@@ -3,7 +3,6 @@ import trimesh
 import numpy as np
 from scipy.spatial import cKDTree  
 import os 
-# import traceback # No longer used
 import tempfile 
 from typing import List, Optional, Tuple
 from collections import Counter
@@ -18,29 +17,47 @@ logger = logging.getLogger(__name__)
 @dataclass
 class FaceGraftingConfig:
     """Configuration for the FaceGraftingPipeline."""
-    projection_footprint_threshold: float = 0.01
-    footprint_dilation_rings: int = 10
-    body_simplification_target_faces: int = 12000
+
+    # === Core methods ===
     stitch_method: str = "body_driven_loft"
     smplx_face_neck_loop_strategy: str = "full_face_silhouette"
-    alignment_resample_count: int = 1000
-    # loft_strip_resample_count: int = 100 # Unused by the current _create_loft_stitch_mesh
+
+    # === Geometry thresholds & precisions ===
+    projection_footprint_threshold: float = 0.01
+    footprint_dilation_rings: int = 0
+    squashed_triangle_drop_fraction: float = 0.7
+    vertex_coordinate_precision_digits: Optional[int] = 5
+
+    # === Body mesh simplification ===
+    body_simplification_target_faces: int = 12000
+
+    # === Hole–seam handling ===
+    close_smplx_face_holes: bool = True
     max_seam_hole_fill_vertices: int = 250
     final_polish_max_hole_edges: int = 100
+
+    # === Boundary smoothing ===
+    hole_boundary_smoothing_iterations: int = 25
+    hole_boundary_smoothing_factor: float = 0.1
+    pre_hole_cut_smoothing_iterations: int = 0
+    pre_hole_cut_smoothing_lambda: float = 0.5
+
+    # === Iterative repair & regularization ===
     iterative_repair_s1_iters: int = 5
-    # iterative_repair_s2_iters: int = 5 # Unused placeholder
-    # iterative_repair_s2_remesh_percent: Optional[float] = None # Unused placeholder
-    spider_filter_area_factor: Optional[float] = 300.0
-    spider_filter_max_edge_len_factor: Optional[float] = 0.15
-    vertex_coordinate_precision_digits: Optional[int] = 5 
-    hole_boundary_smoothing_iterations: int = 10
-    hole_boundary_smoothing_factor: float = 0.5
+    regularize_hole_loop_iterations: int = 5
+    regularize_hole_loop_relaxation: float = 0.35
+
+    # === Cleaning & debug options ===
+    use_open3d_cleaning: bool = False
+    save_debug_body_with_hole: bool = True
+    debug_smply_integrity_trace: bool = True
+
 
 class FaceGraftingPipeline:
     """
     Pipeline for grafting an SMPLX face mesh onto a full body mesh.
     """
-    INTERNAL_VERSION_TRACKER = "5.80_refactored_pipeline_with_seam_check"
+    INTERNAL_VERSION_TRACKER = "FinalFaceGraftingPipeline_V6.0"
 
     def __init__(self,
                  full_body_mesh_path: str,
@@ -62,6 +79,47 @@ class FaceGraftingPipeline:
         self.ordered_s_vidx_loop: Optional[np.ndarray] = None
         self.s_loop_coords_ordered: Optional[np.ndarray] = None
         self.b_loop_coords_aligned: Optional[np.ndarray] = None
+        self.debug_tracked_vertex_coords: Optional[np.ndarray] = None # <-- ADD THIS LINE
+
+    def _save_and_check_debug_vertices(self, 
+            mesh_to_check: Optional[trimesh.Trimesh], 
+            stage_name: str
+        ):
+            """
+            Saves the current mesh and checks for the presence of specific tracked vertices.
+            This is an intensive debug tool activated by a config flag.
+            """
+            if not self.config.debug_smply_integrity_trace or self.debug_tracked_vertex_coords is None:
+                return
+
+            if not mesh_to_check or mesh_to_check.is_empty:
+                logger.info(f"Integrity Trace ({stage_name}): Mesh is empty, cannot check. 0/{len(self.debug_tracked_vertex_coords)} found.")
+                return
+
+            base_name, _ = os.path.splitext(self.output_path)
+            
+            # Save the current state of the main mesh for visual inspection
+            mesh_debug_path = f"{base_name}_debug_mesh_at_{stage_name}.obj"
+            mesh_to_check.export(mesh_debug_path)
+            
+            # Save the points we are tracking as a separate file
+            points_debug_path = f"{base_name}_debug_points_tracked.ply"
+            if not os.path.exists(points_debug_path): # Only save once
+                trimesh.points.PointCloud(self.debug_tracked_vertex_coords).export(points_debug_path)
+
+            # Check how many of our tracked vertices still exist in the current mesh
+            kdtree = cKDTree(mesh_to_check.vertices)
+            distances, _ = kdtree.query(self.debug_tracked_vertex_coords, k=1)
+            
+            # A vertex is considered "found" if a point in the mesh is very close to its original position
+            found_mask = distances < 1e-5
+            num_found = np.sum(found_mask)
+            num_total = len(self.debug_tracked_vertex_coords)
+            
+            logger.warning(
+                f"Integrity Trace ({stage_name}): {num_found}/{num_total} tracked vertices found. "
+                f"Debug mesh saved to {mesh_debug_path}"
+            )
 
     def _make_temp_path(self, suffix_label: str, use_ply: bool = False) -> str:
         """Helper to create and track temporary file paths."""
@@ -81,57 +139,204 @@ class FaceGraftingPipeline:
                 except OSError as e:
                     logger.warning(f"Could not remove temp file {temp_path}: {e}")
         self.temp_files_to_clean.clear()
-
+            
     @staticmethod
     def _thoroughly_clean_trimesh_object(mesh: Optional[trimesh.Trimesh], mesh_name_for_log: str, 
-                                         version_tracker: str) -> Optional[trimesh.Trimesh]:
+                                         version_tracker: str, merge_verts: bool = True) -> Optional[trimesh.Trimesh]:
         if mesh is None: 
-            logger.warning(f"Skipping thorough cleaning for {mesh_name_for_log}: input mesh is None.")
             return None
         
         if not MeshCleanProcess._is_mesh_valid_for_concat(mesh, f"{mesh_name_for_log}_PreClean_V{version_tracker}"):
-            logger.warning(f"Skipping thorough cleaning for {mesh_name_for_log}: input mesh is initially invalid.")
             return mesh 
 
-        # logger.info(f"Thoroughly cleaning Trimesh object: {mesh_name_for_log} (Initial V={len(mesh.vertices)}, F={len(mesh.faces)})")
         try:
             mesh.remove_duplicate_faces()
-            if mesh.is_empty: 
-                logger.warning(f"  {mesh_name_for_log} became empty after remove_duplicate_faces.")
-                return None 
-            mesh.merge_vertices(merge_tex=False, merge_norm=False)
-            if mesh.is_empty:
-                logger.warning(f"  {mesh_name_for_log} became empty after merge_vertices.")
-                return None
+            if mesh.is_empty: return None 
+            
+            if merge_verts:
+                mesh.merge_vertices(merge_tex=False, merge_norm=False)
+                if mesh.is_empty: return None
+
             mesh.remove_unreferenced_vertices()
-            mesh.remove_degenerate_faces()
-            if mesh.is_empty:
-                logger.warning(f"  {mesh_name_for_log} became empty after remove_degenerate_faces.")
-                return None
-            mesh.fix_normals(multibody=True) 
+
+            # --- DEPRECATION FIX ---
+            non_degenerate_face_mask = mesh.nondegenerate_faces()
+            if np.any(~non_degenerate_face_mask):
+                mesh.update_faces(non_degenerate_face_mask)
+            # --- END FIX ---
+            
+            if mesh.is_empty: return None
+                
+            # mesh.fix_normals(multibody=True) 
             if not MeshCleanProcess._is_mesh_valid_for_concat(mesh, f"{mesh_name_for_log}_PostClean_V{version_tracker}"):
-                logger.warning(f"Thorough cleaning for {mesh_name_for_log} resulted in an invalid mesh.")
                 return None 
-            # logger.info(f"Thorough cleaning for {mesh_name_for_log} completed. Final V={len(mesh.vertices)}, F={len(mesh.faces)}")
+
             return mesh
         except Exception as e:
             logger.error(f"Exception during thorough cleaning of {mesh_name_for_log}: {e}", exc_info=True)
             return None
 
+    @staticmethod
+    def _close_smplx_holes_by_fan_fill(input_mesh: trimesh.Trimesh) -> Optional[trimesh.Trimesh]:
+        """
+        Closes all but the largest boundary loop on a mesh using fan triangulation
+        WITHOUT creating new vertices. This is for filling mouth/nostril holes.
+        """
+        if not MeshCleanProcess._is_mesh_valid_for_concat(input_mesh, "FanFillInput"):
+            return input_mesh
+
+        logger.info("Attempting to fan-fill internal SMPLX holes (No New Vertices Method)...")
+        
+        # This is critical for the orientation check later
+        # input_mesh.fix_normals()
+
+        all_loops_vidx = MeshCleanProcess.get_all_boundary_loops(input_mesh, min_loop_len=3)
+
+        if not all_loops_vidx or len(all_loops_vidx) <= 1:
+            logger.info("No internal holes found to fill or only one boundary loop exists.")
+            return input_mesh
+
+        # Identify the largest loop (the neck hole) and exclude it from filling.
+        all_loops_vidx.sort(key=len, reverse=True)
+        neck_hole_loop = all_loops_vidx[0]
+        loops_to_fill = all_loops_vidx[1:]
+        
+        logger.info(f"Found {len(loops_to_fill)} internal hole(s) to fill. Skipping largest loop with {len(neck_hole_loop)} vertices.")
+
+        if not loops_to_fill:
+            return input_mesh
+
+        current_faces = list(input_mesh.faces)
+        added_any_faces = False
+
+        for loop in loops_to_fill:
+            if len(loop) < 3:
+                continue
+            
+            try:
+                # --- FAN TRIANGULATION (ROOT VERTEX METHOD) ---
+                # This method uses an existing vertex and adds NO new geometry.
+
+                # 1. Find the average normal of faces surrounding the hole for orientation check.
+                neighbor_face_indices_nested = input_mesh.vertex_faces[loop]
+                if len(neighbor_face_indices_nested) > 0:
+                    valid_faces = [f for f_list in neighbor_face_indices_nested for f in f_list if f != -1]
+                    if not valid_faces: continue
+                    unique_face_indices = np.unique(valid_faces)
+                    target_normal = trimesh.util.unitize(np.mean(input_mesh.face_normals[unique_face_indices], axis=0))
+                else:
+                    continue
+
+                # 2. Choose a root vertex for the fan. The first vertex is a stable choice.
+                root_vidx = loop[0]
+
+                # 3. Create the fan of faces from the root vertex.
+                new_patch_faces = []
+                for i in range(1, len(loop) - 1):
+                    v1_idx = loop[i]
+                    v2_idx = loop[i + 1]
+                    new_patch_faces.append([root_vidx, v1_idx, v2_idx])
+                
+                # 4. Check and fix the orientation of the new patch.
+                if new_patch_faces and np.any(np.abs(target_normal) > 1e-6):
+                    v0_coords, v1_coords, v2_coords = input_mesh.vertices[new_patch_faces[0]]
+                    test_normal = trimesh.util.unitize(np.cross(v1_coords - v0_coords, v2_coords - v0_coords))
+                    
+                    if np.dot(test_normal, target_normal) < 0.0:
+                        new_patch_faces = [face[::-1] for face in new_patch_faces]
+
+                current_faces.extend(new_patch_faces)
+                added_any_faces = True
+            except Exception as e:
+                logger.warning(f"Failed to fill an internal hole: {e}", exc_info=True)
+
+        if not added_any_faces:
+            return input_mesh
+
+        # Create the new mesh with the added faces. Vertices are unchanged.
+        filled_mesh = trimesh.Trimesh(vertices=input_mesh.vertices, faces=np.array(current_faces, dtype=int), process=False)
+        # filled_mesh.fix_normals()
+
+        if MeshCleanProcess._is_mesh_valid_for_concat(filled_mesh, "FanFillResult"):
+            logger.info(f"Successfully filled internal holes without adding new vertices.")
+            return filled_mesh
+        else:
+            logger.warning("Fan-filling (root vertex) resulted in an invalid mesh. Reverting to original.")
+            return input_mesh
+                        
+    def _clean_with_open3d(self, input_mesh: trimesh.Trimesh, mesh_name_for_log: str) -> trimesh.Trimesh:
+        """
+        Applies a robust cleaning pipeline using Open3D.
+        Returns the cleaned mesh, or the original mesh if cleaning fails or is skipped.
+        """
+        if not MeshCleanProcess._is_mesh_valid_for_concat(input_mesh, f"PreO3D_{mesh_name_for_log}"):
+            return input_mesh
+        
+        try:
+            import open3d as o3d
+        except ImportError:
+            logger.warning("Open3D is not installed. Skipping Open3D cleaning step.")
+            return input_mesh
+
+        logger.info(f"--- Applying aggressive Open3D cleaning for '{mesh_name_for_log}' ---")
+        temp_in = self._make_temp_path("o3d_in", use_ply=True)
+        temp_out = self._make_temp_path("o3d_out", use_ply=True)
+
+        try:
+            input_mesh.export(temp_in)
+            mesh_o3d = o3d.io.read_triangle_mesh(temp_in)
+            
+            if not mesh_o3d.has_triangles():
+                logger.warning("Mesh became empty after loading into Open3D. Aborting O3D clean.")
+                return input_mesh
+
+            mesh_o3d.remove_duplicated_vertices()
+            mesh_o3d.remove_degenerate_triangles()
+            mesh_o3d.remove_duplicated_triangles()
+            mesh_o3d.remove_non_manifold_edges()
+            # The 'remove_self_intersecting_triangles' method call has been removed to avoid warnings.
+            mesh_o3d.orient_triangles()
+            mesh_o3d.compute_vertex_normals()
+            
+            o3d.io.write_triangle_mesh(temp_out, mesh_o3d)
+            cleaned_mesh = trimesh.load_mesh(temp_out, process=True)
+            
+            if MeshCleanProcess._is_mesh_valid_for_concat(cleaned_mesh, f"PostO3D_{mesh_name_for_log}"):
+                logger.info(f"--- Open3D cleaning successful for '{mesh_name_for_log}' ---")
+                return cleaned_mesh
+            else:
+                logger.warning(f"Open3D cleaning for '{mesh_name_for_log}' resulted in an invalid mesh. Reverting.")
+                return input_mesh
+
+        except Exception as e:
+            logger.error(f"Error during Open3D cleaning process for '{mesh_name_for_log}': {e}", exc_info=True)
+            return input_mesh
+
     def _load_and_simplify_meshes(self) -> bool:
         logger.info("=== STEP 1 & 2: Load meshes, clean face, simplify and clean body ===")
         
-        self.original_smplx_face_geom_tri = trimesh.load_mesh(self.smplx_face_mesh_path, process=True)
+        self.original_smplx_face_geom_tri = trimesh.load_mesh(self.smplx_face_mesh_path, process=False)
         if self.original_smplx_face_geom_tri is None or \
            not MeshCleanProcess._is_mesh_valid_for_concat(self.original_smplx_face_geom_tri, "InitialSMPLXFace"):
             logger.critical(f"Failed to load or invalid SMPLX Face mesh: '{self.smplx_face_mesh_path}'. Aborting.")
             return False
         
         cleaned_smplx_face = FaceGraftingPipeline._thoroughly_clean_trimesh_object(
-            self.original_smplx_face_geom_tri.copy(), "InitialSMPLXFace", self.INTERNAL_VERSION_TRACKER
+            self.original_smplx_face_geom_tri.copy(), "InitialSMPLXFace", self.INTERNAL_VERSION_TRACKER, merge_verts=False
         )
         if cleaned_smplx_face is not None: self.original_smplx_face_geom_tri = cleaned_smplx_face
         else: logger.warning("Thorough cleaning of initial SMPLX face failed. Using original loaded version.")
+
+        if self.config.close_smplx_face_holes:
+            filled_face = FaceGraftingPipeline._close_smplx_holes_by_fan_fill(self.original_smplx_face_geom_tri)
+            if filled_face is not None:
+                self.original_smplx_face_geom_tri = filled_face
+            else:
+                logger.warning("SMPLX hole filling failed, continuing with original face.")
+
+        self.original_smplx_v_pre_graft = self.original_smplx_face_geom_tri.vertices.copy()
+        self.original_smplx_edges_pre_graft = {tuple(sorted(edge)) for edge in self.original_smplx_face_geom_tri.edges_unique}
+        logger.info(f"Stored original SMPLX face integrity baseline: {len(self.original_smplx_v_pre_graft)} vertices, {len(self.original_smplx_edges_pre_graft)} unique edges.")
 
         self.simplified_body_trimesh = trimesh.load_mesh(self.full_body_mesh_path, process=True)
         if self.simplified_body_trimesh is None or \
@@ -139,8 +344,8 @@ class FaceGraftingPipeline:
             logger.critical(f"Failed to load or invalid Full Body mesh: '{self.full_body_mesh_path}'. Aborting.")
             return False
 
-        if self.original_smplx_face_geom_tri: self.original_smplx_face_geom_tri.fix_normals()
-        if self.simplified_body_trimesh: self.simplified_body_trimesh.fix_normals()
+        # if self.original_smplx_face_geom_tri: self.original_smplx_face_geom_tri.fix_normals()
+        # if self.simplified_body_trimesh: self.simplified_body_trimesh.fix_normals()
 
         if self.simplified_body_trimesh.faces.shape[0] > self.config.body_simplification_target_faces:
             logger.info(f"Simplifying body mesh to target {self.config.body_simplification_target_faces} faces...")
@@ -161,7 +366,7 @@ class FaceGraftingPipeline:
                         ms_s.meshing_repair_non_manifold_edges(method='Remove Faces')
                         ms_s.meshing_repair_non_manifold_edges(method='Split Vertices') 
                         try: ms_s.meshing_repair_non_manifold_vertices_by_splitting(threshold=pymeshlab.Percentage(0.01))
-                        except (AttributeError, pymeshlab.PyMeshLabException): pass # Ignore if not available or fails
+                        except (AttributeError, pymeshlab.PyMeshLabException): pass
                         ms_s.meshing_remove_unreferenced_vertices()
                         ms_s.save_current_mesh(temp_out)
                         loaded_s_from_pml = trimesh.load_mesh(temp_out, process=True)
@@ -182,12 +387,21 @@ class FaceGraftingPipeline:
         if self.simplified_body_trimesh is None:
             logger.critical("Simplified body is None before final cleaning. Aborting.")
             return False
-
-        cleaned_simplified_body = FaceGraftingPipeline._thoroughly_clean_trimesh_object(
-            self.simplified_body_trimesh.copy(), "SimplifiedBodyFinalClean", self.INTERNAL_VERSION_TRACKER
-        )
-        if cleaned_simplified_body is not None: self.simplified_body_trimesh = cleaned_simplified_body
-        else: logger.warning("Final thorough cleaning of simplified body failed. Using pre-clean version.")
+            
+        # --- MODIFIED FINAL CLEANING STEP ---
+        if self.config.use_open3d_cleaning:
+            self.simplified_body_trimesh = self._clean_with_open3d(
+                self.simplified_body_trimesh, "SimplifiedBodyFinalClean_O3D"
+            )
+        else:
+            cleaned_simplified_body = FaceGraftingPipeline._thoroughly_clean_trimesh_object(
+                self.simplified_body_trimesh.copy(), "SimplifiedBodyFinalClean", self.INTERNAL_VERSION_TRACKER
+            )
+            if cleaned_simplified_body is not None:
+                self.simplified_body_trimesh = cleaned_simplified_body
+            else:
+                logger.warning("Final thorough cleaning of simplified body failed. Using pre-clean version.")
+        # --- END MODIFIED STEP ---
 
         if not MeshCleanProcess._is_mesh_valid_for_concat(self.simplified_body_trimesh, "FinalSimplifiedBody"):
             logger.critical("Simplified body mesh is invalid after all steps in _load_and_simplify. Aborting.")
@@ -195,141 +409,319 @@ class FaceGraftingPipeline:
             
         if self.simplified_body_trimesh is not None and not self.simplified_body_trimesh.is_empty:
             try:
-                _ = self.simplified_body_trimesh.edges # Ensure graph properties
+                _ = self.simplified_body_trimesh.edges
                 if len(self.simplified_body_trimesh.boundary_edges) > 0:
                     logger.warning(f"FINAL SIMPLIFIED BODY MESH has boundary edges. Not watertight.")
-            except Exception: pass # Ignore errors in this non-critical check
+            except Exception: pass
         
         logger.info(f"Finished loading and simplifying. Final body: V={len(self.simplified_body_trimesh.vertices)}, F={len(self.simplified_body_trimesh.faces)}")
         return True
 
+    @staticmethod
+    def _regularize_loop_to_equal_edge_lengths(
+        verts: np.ndarray,
+        loop_vidx: np.ndarray,
+        iters: int,
+        relax: float
+    ) -> None:
+        """
+        Modifies vertex positions IN-PLACE to make all boundary edges
+        approximately equal length without adding or removing vertices.
+        """
+        if len(loop_vidx) < 3:
+            return
+
+        for _ in range(iters):
+            # Get current vertex positions for the loop
+            p = verts[loop_vidx]
+
+            # Calculate edge vectors and their lengths
+            edge_vecs = np.roll(p, -1, axis=0) - p
+            lengths = np.linalg.norm(edge_vecs, axis=1)
+            
+            # Avoid division by zero if a loop collapses
+            if np.any(lengths < 1e-9): break 
+            
+            # Calculate the target average edge length
+            L_avg = lengths.mean()
+
+            # Error for each edge (how much longer/shorter it is than the average)
+            err_current_edge = lengths - L_avg
+            err_previous_edge = np.roll(err_current_edge, 1)
+
+            # Tangent vectors (direction of each edge)
+            tangents = edge_vecs / (lengths[:, None] + 1e-12)
+
+            # For each vertex, the move is influenced by the error of the two edges connected to it.
+            # A vertex is "pulled" from its longer-edge side and "pushed" from its shorter-edge side.
+            move = (
+                -(err_current_edge[:, None] * tangents) +
+                 (err_previous_edge[:, None] * np.roll(tangents, 1, axis=0))
+            )
+            
+            # Apply the displacement, scaled by the relaxation factor.
+            # This is an in-place modification of the original `verts` array.
+            verts[loop_vidx] += relax * move * 0.5
+                
+    @staticmethod
+    def _triangle_altitudes(v0: np.ndarray, v1: np.ndarray, v2: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Returns the three altitudes (h0, h1, h2) for an array of triangles.
+        h0 = altitude from v0 onto edge v1–v2, and so on.
+        This is a fully vectorized version.
+        """
+        # edge lengths (F,)
+        a = np.linalg.norm(v1 - v0, axis=1)
+        b = np.linalg.norm(v2 - v1, axis=1)
+        c = np.linalg.norm(v0 - v2, axis=1)
+
+        # twice the area via Heron's formula (robust for slivers)
+        s = 0.5 * (a + b + c)
+        # We use clip(min=0) to prevent small floating point errors from yielding negative numbers
+        area2 = (s * (s - a) * (s - b) * (s - c)).clip(min=0)
+
+        # Mask for valid, non-collapsed triangles
+        valid_mask = area2 > 1e-12
+        A = np.sqrt(area2[valid_mask])
+        twoA = 2 * A
+
+        # Initialize altitudes to 0
+        h0, h1, h2 = np.zeros_like(a), np.zeros_like(a), np.zeros_like(a)
+        
+        # Calculate altitudes only for valid triangles
+        h0[valid_mask] = twoA / a[valid_mask]
+        h1[valid_mask] = twoA / b[valid_mask]
+        h2[valid_mask] = twoA / c[valid_mask]
+
+        return h0, h1, h2
+
+    @staticmethod
+    def _remove_faces_if_any_altitude_drops(
+            mesh_before: trimesh.Trimesh,
+            mesh_after:  trimesh.Trimesh,
+            drop_fraction: float
+    ) -> trimesh.Trimesh:
+        """
+        Deletes every face for which *any one* of its three altitudes has
+        decreased by >= drop_fraction between mesh_before and mesh_after.
+        The two meshes must share the same face indexing.
+        """
+        if not np.array_equal(mesh_before.faces, mesh_after.faces):
+            logger.error("Cannot compare altitudes; meshes have different face indexing. Returning original mesh.")
+            return mesh_after
+
+        # Get vertices for all faces in a (F, 3, 3) array, then transpose to (3, F, 3)
+        v0b, v1b, v2b = (mesh_before.vertices[mesh_before.faces].transpose(1, 0, 2))
+        v0a, v1a, v2a = (mesh_after.vertices[mesh_after.faces].transpose(1, 0, 2))
+
+        # Vectorised altitude computation for all faces at once
+        h0b, h1b, h2b = FaceGraftingPipeline._triangle_altitudes(v0b, v1b, v2b)
+        h0a, h1a, h2a = FaceGraftingPipeline._triangle_altitudes(v0a, v1a, v2a)
+
+        keep = np.ones(len(mesh_before.faces), dtype=bool)
+
+        # Test each altitude separately
+        for hb, ha in ((h0b, h0a), (h1b, h1a), (h2b, h2a)):
+            # Avoid division by zero; if original altitude was near zero, keep it.
+            mask = hb > 1e-9
+            
+            # Create a mask for faces where the altitude has dropped too much
+            dropped_mask = np.zeros_like(keep, dtype=bool)
+            dropped_mask[mask] = ha[mask] < (1.0 - drop_fraction) * hb[mask]
+            
+            # Update the master 'keep' mask. If a face is dropped, it stays dropped.
+            keep[dropped_mask] = False
+
+        num_to_remove = len(keep) - np.sum(keep)
+        if num_to_remove > 0:
+            logger.info(f"...found and removed {num_to_remove} squashed faces based on altitude drop.")
+            cleaned = mesh_after.copy()
+            cleaned.update_faces(keep)
+            cleaned.remove_unreferenced_vertices()
+            return cleaned
+        else:
+            logger.info("...no squashed faces found to remove based on altitude drop.")
+            return mesh_after
+
     def _smooth_main_hole_boundary(self) -> bool:
-        if self.config.hole_boundary_smoothing_iterations <= 0:
-            return True
         if not self.body_with_hole_trimesh or \
-           not MeshCleanProcess._is_mesh_valid_for_concat(self.body_with_hole_trimesh, "BodyForHoleSmooth"):
+            not MeshCleanProcess._is_mesh_valid_for_concat(self.body_with_hole_trimesh, "BodyForHoleSmooth"):
             logger.warning("Cannot smooth hole boundary: body_with_hole_trimesh is invalid or None.")
             return False
 
-        logger.info(f"Smoothing main hole boundary ({self.config.hole_boundary_smoothing_iterations} iter)...")
         all_loops_vidx = MeshCleanProcess.get_all_boundary_loops(self.body_with_hole_trimesh, min_loop_len=3)
-        if not all_loops_vidx: return True
+        if not all_loops_vidx: 
+            logger.info("Hole smoothing: No boundary loops found. Skipping.")
+            return True # Not an error, just nothing to do.
+
         largest_loop_vidx = max(all_loops_vidx, key=len, default=None)
-        if largest_loop_vidx is None or len(largest_loop_vidx) < 3: return True
+        if largest_loop_vidx is None or len(largest_loop_vidx) < 3: 
+            logger.info("Hole smoothing: No sufficiently large boundary loop found. Skipping.")
+            return True
+
+        # NOTE: The problematic 'before' copy and squashed-face-removal logic have been removed.
+
+        if self.config.hole_boundary_smoothing_iterations > 0:
+            logger.info(f"Smoothing main hole boundary ({self.config.hole_boundary_smoothing_iterations} iter)...")
+            vertices_copy = self.body_with_hole_trimesh.vertices.copy()
+            num_loop_verts = len(largest_loop_vidx)
+            for _ in range(self.config.hole_boundary_smoothing_iterations):
+                new_positions_for_loop = np.zeros((num_loop_verts, 3))
+                for i in range(num_loop_verts):
+                    curr_v, prev_v, next_v = largest_loop_vidx[i], largest_loop_vidx[(i - 1 + num_loop_verts) % num_loop_verts], largest_loop_vidx[(i + 1) % num_loop_verts]
+                    lap_target = (vertices_copy[prev_v] + vertices_copy[next_v]) / 2.0
+                    new_positions_for_loop[i] = vertices_copy[curr_v] + self.config.hole_boundary_smoothing_factor * (lap_target - vertices_copy[curr_v])
+                for i in range(num_loop_verts): vertices_copy[largest_loop_vidx[i]] = new_positions_for_loop[i]
+            self.body_with_hole_trimesh.vertices = vertices_copy
         
-        vertices_copy = self.body_with_hole_trimesh.vertices.copy()
-        num_loop_verts = len(largest_loop_vidx)
-        for _ in range(self.config.hole_boundary_smoothing_iterations):
-            new_positions_for_loop = np.zeros((num_loop_verts, 3))
-            for i in range(num_loop_verts):
-                curr_v, prev_v, next_v = largest_loop_vidx[i], largest_loop_vidx[(i - 1 + num_loop_verts) % num_loop_verts], largest_loop_vidx[(i + 1) % num_loop_verts]
-                lap_target = (vertices_copy[prev_v] + vertices_copy[next_v]) / 2.0
-                new_positions_for_loop[i] = vertices_copy[curr_v] + self.config.hole_boundary_smoothing_factor * (lap_target - vertices_copy[curr_v])
-            for i in range(num_loop_verts): vertices_copy[largest_loop_vidx[i]] = new_positions_for_loop[i]
-        self.body_with_hole_trimesh.vertices = vertices_copy
+        if self.config.regularize_hole_loop_iterations > 0:
+            logger.info(f"Regularizing hole boundary edge lengths ({self.config.regularize_hole_loop_iterations} iter)...")
+            FaceGraftingPipeline._regularize_loop_to_equal_edge_lengths(
+                verts=self.body_with_hole_trimesh.vertices,
+                loop_vidx=largest_loop_vidx,
+                iters=self.config.regularize_hole_loop_iterations,
+                relax=self.config.regularize_hole_loop_relaxation
+            )
+
+        # The aggressive face removal and vertex merging have been removed from this function
+        # to prevent the hole from being prematurely closed. We only modify vertex positions here.
+        
         if hasattr(self.body_with_hole_trimesh, '_cache'): self.body_with_hole_trimesh._cache.clear()
         return True
 
+    def _debug_log_and_save(self, mesh_to_debug: Optional[trimesh.Trimesh], stage_id: str, stage_description: str):
+        """Logs the state of a mesh and saves it for visual inspection."""
+        base_name, _ = os.path.splitext(self.output_path)
+        debug_path = f"{base_name}_debug_{stage_id}_{stage_description}.obj"
+
+        logger.info(f"--- DEBUG CHECKPOINT: {stage_id} ---")
+        
+        if not mesh_to_debug or mesh_to_debug.is_empty:
+            logger.info(f"DEBUG ({stage_id}): Mesh is None or empty.")
+            return
+
+        # Log what trimesh reports about its state
+        try:
+            loops = MeshCleanProcess.get_all_boundary_loops(mesh_to_debug, min_loop_len=3)
+            num_loops = len(loops)
+            logger.info(f"DEBUG ({stage_id}): Trimesh reports {num_loops} boundary loop(s).")
+        except Exception as e:
+            logger.error(f"DEBUG ({stage_id}): Could not get boundary loops. Error: {e}")
+
+        # Save the mesh for visual inspection
+        try:
+            mesh_to_debug.export(debug_path)
+            logger.info(f"DEBUG ({stage_id}): Saved mesh state to {debug_path}")
+        except Exception as e:
+            logger.error(f"DEBUG ({stage_id}): Failed to save debug mesh: {e}")
+        logger.info("-" * (23 + len(stage_id)))
+
     def _determine_hole_faces_and_create_body_with_hole(self) -> bool:
-        if self.simplified_body_trimesh is None or self.original_smplx_face_geom_tri is None: 
+        if self.simplified_body_trimesh is None or self.original_smplx_face_geom_tri is None:
             logger.error("Missing meshes for hole creation. Aborting.")
-            return False 
+            return False
+
+        logger.info(f"=== STEP 3: Determining Hole Faces & Creating Body With Hole (Proximity Method) ===")
         
-        logger.info(f"=== STEP 3: Determining Hole Faces & Creating Body With Hole ===")
-        if len(self.simplified_body_trimesh.faces) == 0 and self.config.projection_footprint_threshold > 0: 
-             logger.warning("Simplified body has no faces; body_with_hole will be empty if removal intended.")
-             self.faces_to_remove_mask_on_body = np.array([], dtype=bool)
-        else:
-            self.faces_to_remove_mask_on_body = np.zeros(len(self.simplified_body_trimesh.faces), dtype=bool)
-        
+        self.faces_to_remove_mask_on_body = np.zeros(len(self.simplified_body_trimesh.faces), dtype=bool)
+
         if self.original_smplx_face_geom_tri.vertices.shape[0] > 0 and \
-           hasattr(self.original_smplx_face_geom_tri, 'vertex_normals') and \
-           self.original_smplx_face_geom_tri.vertex_normals.shape == self.original_smplx_face_geom_tri.vertices.shape and \
-           len(self.simplified_body_trimesh.faces) > 0: 
+           hasattr(self.original_smplx_face_geom_tri, 'vertex_normals'):
+            
+            logger.info("Using proximity search to determine hole footprint...")
             try:
                 _, d_cp, t_cp = trimesh.proximity.closest_point(self.simplified_body_trimesh, self.original_smplx_face_geom_tri.vertices)
                 if d_cp is not None and t_cp is not None:
-                    self.faces_to_remove_mask_on_body[np.unique(t_cp[d_cp < self.config.projection_footprint_threshold])] = True
+                    valid_mask = (d_cp < self.config.projection_footprint_threshold) & (t_cp < len(self.faces_to_remove_mask_on_body))
+                    if np.any(valid_mask): self.faces_to_remove_mask_on_body[np.unique(t_cp[valid_mask])] = True
+                
                 offset = self.config.projection_footprint_threshold * 0.5
                 p_f = self.original_smplx_face_geom_tri.vertices + self.original_smplx_face_geom_tri.vertex_normals * offset
-                p_b = self.original_smplx_face_geom_tri.vertices - self.original_smplx_face_geom_tri.vertex_normals * offset
                 _, _, t_f = trimesh.proximity.closest_point(self.simplified_body_trimesh, p_f)
-                if t_f is not None: self.faces_to_remove_mask_on_body[np.unique(t_f)] = True
+                if t_f is not None:
+                    valid_mask = t_f < len(self.faces_to_remove_mask_on_body)
+                    if np.any(valid_mask): self.faces_to_remove_mask_on_body[np.unique(t_f[valid_mask])] = True
+                
+                p_b = self.original_smplx_face_geom_tri.vertices - self.original_smplx_face_geom_tri.vertex_normals * offset
                 _, dists_b, t_b = trimesh.proximity.closest_point(self.simplified_body_trimesh, p_b)
                 if dists_b is not None and t_b is not None:
-                    self.faces_to_remove_mask_on_body[np.unique(t_b[dists_b < self.config.projection_footprint_threshold])] = True
-            except Exception as e_p: logger.warning(f"Error during robust hole determination: {e_p}")
+                    valid_mask = (dists_b < self.config.projection_footprint_threshold) & (t_b < len(self.faces_to_remove_mask_on_body))
+                    if np.any(valid_mask): self.faces_to_remove_mask_on_body[np.unique(t_b[valid_mask])] = True
+            except Exception as e_p: 
+                logger.warning(f"Error during proximity-based hole determination: {e_p}", exc_info=True)
 
-            if self.config.footprint_dilation_rings > 0 and np.any(self.faces_to_remove_mask_on_body):
-                adj = self.simplified_body_trimesh.face_adjacency
-                current_wavefront = self.faces_to_remove_mask_on_body.copy()
-                for _ in range(self.config.footprint_dilation_rings):
-                    wave_indices = np.where(current_wavefront)[0]
-                    if not wave_indices.size: break
-                    all_neigh = [p[0] if p[1] in wave_indices else p[1] for p in adj if p[0] in wave_indices or p[1] in wave_indices]
-                    if not all_neigh: break
-                    unique_neigh = np.unique(all_neigh)
-                    new_to_add = unique_neigh[~self.faces_to_remove_mask_on_body[unique_neigh]]
-                    if not new_to_add.size: break
-                    self.faces_to_remove_mask_on_body[new_to_add] = True
-                    current_wavefront.fill(False); current_wavefront[new_to_add] = True
+        if self.config.footprint_dilation_rings > 0 and np.any(self.faces_to_remove_mask_on_body):
+            logger.info(f"Dilating footprint by {self.config.footprint_dilation_rings} ring(s)...")
+            adj = self.simplified_body_trimesh.face_adjacency
+            current_wavefront = self.faces_to_remove_mask_on_body.copy()
+            for _ in range(self.config.footprint_dilation_rings):
+                wave_indices = np.where(current_wavefront)[0]
+                if not wave_indices.size: break
+                all_neighbors_this_ring = adj[np.isin(adj, wave_indices).any(axis=1)].flatten()
+                unique_neigh = np.unique(all_neighbors_this_ring)
+                new_to_add = unique_neigh[~self.faces_to_remove_mask_on_body[unique_neigh]]
+                if not new_to_add.size: break
+                self.faces_to_remove_mask_on_body[new_to_add] = True
+                current_wavefront.fill(False); current_wavefront[new_to_add] = True
 
-        body_state_before_hole_cut = self.simplified_body_trimesh.copy() 
-        current_body_for_hole = self.simplified_body_trimesh.copy() 
+        # --- MODIFIED LOGIC: REMOVE FACES AND IMMEDIATELY ISOLATE LARGEST COMPONENT ---
+        current_mesh = self.simplified_body_trimesh.copy()
         if np.any(self.faces_to_remove_mask_on_body):
-            if len(self.faces_to_remove_mask_on_body) == len(current_body_for_hole.faces): 
-                if np.all(self.faces_to_remove_mask_on_body): 
-                    logger.warning("All body faces marked for removal. Body_with_hole will be empty.")
-                    current_body_for_hole = trimesh.Trimesh() 
-                else:
-                    current_body_for_hole.update_faces(~self.faces_to_remove_mask_on_body)
-                    current_body_for_hole.remove_unreferenced_vertices()
-            else: logger.error("Face removal mask length mismatch. Skipping removal.")
-        
-        self.body_with_hole_trimesh = current_body_for_hole 
-        if self.body_with_hole_trimesh is not None and not self.body_with_hole_trimesh.is_empty and \
-           MeshCleanProcess._is_mesh_valid_for_concat(self.body_with_hole_trimesh, "BodyWHolePreSplit"):
-            if hasattr(self.body_with_hole_trimesh, 'split'):
-                components = self.body_with_hole_trimesh.split(only_watertight=False)
-                if components:
-                    largest_comp = max(components, key=lambda c: len(c.faces if hasattr(c, 'faces') else []))
-                    if MeshCleanProcess._is_mesh_valid_for_concat(largest_comp, "LargestCompBodyWHole"):
-                        self.body_with_hole_trimesh = largest_comp 
-                    else: logger.warning("Largest component of body-with-hole invalid. Using pre-split.")
-        elif self.body_with_hole_trimesh is None: logger.error("body_with_hole_trimesh is None. Unexpected."); return False
-
-        body_state_before_final_clean = self.body_with_hole_trimesh.copy() if self.body_with_hole_trimesh is not None else None
-        cleaned_body_with_hole = FaceGraftingPipeline._thoroughly_clean_trimesh_object(
-            body_state_before_final_clean, "BodyWithHoleClean", self.INTERNAL_VERSION_TRACKER
-        )
-        if cleaned_body_with_hole is not None: self.body_with_hole_trimesh = cleaned_body_with_hole
-        else: 
-            logger.warning("Thorough cleaning of body-with-hole failed. Using pre-clean version or fallback.")
-            if body_state_before_final_clean is not None and MeshCleanProcess._is_mesh_valid_for_concat(body_state_before_final_clean, "BodyWHoleFallback1"):
-                self.body_with_hole_trimesh = body_state_before_final_clean
-            else: 
-                self.body_with_hole_trimesh = FaceGraftingPipeline._thoroughly_clean_trimesh_object(
-                    body_state_before_hole_cut.copy(), "BodyWHoleFallbackSimplified", self.INTERNAL_VERSION_TRACKER)
-
-        if self.body_with_hole_trimesh is not None and self.config.hole_boundary_smoothing_iterations > 0:
-            if not self._smooth_main_hole_boundary(): logger.warning("Hole boundary smoothing failed or skipped.")
+            # 1. Apply the (potentially messy) removal mask
+            current_mesh.update_faces(~self.faces_to_remove_mask_on_body)
+            current_mesh.remove_unreferenced_vertices()
+            
+            # 2. Split the result into all its parts (main body + floating islands)
+            logger.info("Isolating main body component to remove floating face islands...")
+            components = current_mesh.split(only_watertight=False)
+            
+            # 3. Robustly find the largest component and discard the rest
+            actual_components_list = [c for c in np.atleast_1d(components) if c is not None and not c.is_empty]
+            if len(actual_components_list) > 1:
+                logger.info(f"Found {len(actual_components_list)} components after removal. Keeping largest.")
+                current_mesh = max(actual_components_list, key=lambda c: len(c.faces))
+            elif actual_components_list:
+                current_mesh = actual_components_list[0]
             else:
-                if not MeshCleanProcess._is_mesh_valid_for_concat(self.body_with_hole_trimesh, "BodyWHolePostSmooth"):
-                    logger.warning("Body-with-hole invalid after smoothing. Attempting re-clean.")
-                    cleaned_after_smooth = FaceGraftingPipeline._thoroughly_clean_trimesh_object(
-                        self.body_with_hole_trimesh.copy(), "BodyWHolePostSmoothReClean", self.INTERNAL_VERSION_TRACKER
-                    )
-                    if cleaned_after_smooth is not None: self.body_with_hole_trimesh = cleaned_after_smooth
-                    else: logger.warning("Re-cleaning after smoothing failed. Proceeding with potentially problematic mesh.")
+                logger.warning("Splitting after face removal resulted in no valid components.")
+                current_mesh = trimesh.Trimesh() # Create empty mesh if all else fails
+        else:
+            logger.warning("No faces were marked for removal.")
+        # --- END OF MODIFIED LOGIC ---
 
-        if not MeshCleanProcess._is_mesh_valid_for_concat(self.body_with_hole_trimesh, "FinalBodyWHole"):
-             logger.critical("Final Body-with-hole mesh is invalid. Aborting.")
-             return False
+        self._debug_log_and_save(current_mesh, "01", "AfterFaceRemovalAndSplit")
+
+        logger.info("Forcing mesh re-processing to update internal state...")
+        current_mesh = trimesh.Trimesh(vertices=current_mesh.vertices, faces=current_mesh.faces, process=True)
+        self._debug_log_and_save(current_mesh, "02", "AfterReprocessing")
+
+        loops = MeshCleanProcess.get_all_boundary_loops(current_mesh, min_loop_len=3)
+        if len(loops) > 1:
+            logger.warning(f"Detected {len(loops)} holes, attempting to fill all but the largest.")
+            filled_mesh = self._close_smplx_holes_by_fan_fill(current_mesh)
+            if filled_mesh:
+                current_mesh = filled_mesh
+        self._debug_log_and_save(current_mesh, "04", "AfterHoleFill")
+
+        self.body_with_hole_trimesh = current_mesh
+        if self._smooth_main_hole_boundary():
+             current_mesh = self.body_with_hole_trimesh
+        self._debug_log_and_save(current_mesh, "05", "AfterSmoothing")
+
+        cleaned_mesh = self._thoroughly_clean_trimesh_object(current_mesh.copy(), "BodyWithHoleClean", self.INTERNAL_VERSION_TRACKER)
+        if cleaned_mesh:
+            current_mesh = cleaned_mesh
+        self._debug_log_and_save(current_mesh, "06", "AfterFinalClean")
+
+        self.body_with_hole_trimesh = current_mesh
         
-        # Removed DEBUG save of body_with_hole_trimesh
+        if not MeshCleanProcess._is_mesh_valid_for_concat(self.body_with_hole_trimesh, "FinalBodyWHole"):
+            logger.critical("Final Body-with-hole mesh is invalid. Aborting.")
+            return False
+
         logger.info(f"Finished body_with_hole creation. V={len(self.body_with_hole_trimesh.vertices)}, F={len(self.body_with_hole_trimesh.faces)}")
         return True
-
+    
     def _extract_smplx_face_loop(self) -> bool:
         if not self.original_smplx_face_geom_tri: return False
         # logger.info("Extracting SMPLX face loop.") 
@@ -362,53 +754,227 @@ class FaceGraftingPipeline:
             logger.warning("Not enough points in loops for alignment.")
             return False
 
-        # logger.info("Aligning body loop to SMPLX face loop.")
-        b_loop_coords_to_align = b_loop_coords_ordered_pre_align.copy()
-        s_start_pt = self.s_loop_coords_ordered[0]
-        _, closest_idx_on_b = cKDTree(b_loop_coords_to_align).query(s_start_pt, k=1)
-        b_rolled = np.roll(b_loop_coords_to_align, -closest_idx_on_b, axis=0)
+        # logger.info("Aligning body loop to SMPLX face loop (KD-Tree Method).")
         
-        resample_count = self.config.alignment_resample_count
-        if len(self.s_loop_coords_ordered) >= 2 and len(b_rolled) >= 2 and resample_count >= 2:
-            s_r = MeshCleanProcess.resample_polyline_to_count(self.s_loop_coords_ordered, resample_count)
-            b_rf = MeshCleanProcess.resample_polyline_to_count(b_rolled, resample_count) 
-            b_rb = MeshCleanProcess.resample_polyline_to_count(b_rolled[::-1], resample_count) 
-            if s_r is not None and b_rf is not None and b_rb is not None and \
-               len(s_r) == resample_count and len(b_rf) == resample_count and len(b_rb) == resample_count:
-                if np.sum(np.linalg.norm(s_r - b_rb, axis=1)) < np.sum(np.linalg.norm(s_r - b_rf, axis=1)):
-                    self.b_loop_coords_aligned = b_rolled[::-1].copy()
-                else: self.b_loop_coords_aligned = b_rolled.copy()
-            else:
-                logger.warning("Resampling for alignment failed; using rolled loop.")
-                self.b_loop_coords_aligned = b_rolled.copy()
-        else: self.b_loop_coords_aligned = b_rolled.copy()
-        return self.b_loop_coords_aligned is not None and len(self.b_loop_coords_aligned) >=3
+        # Step 1: Align the starting points by rolling the body loop.
+        s_start_pt = self.s_loop_coords_ordered[0]
+        _, closest_idx_on_b = cKDTree(b_loop_coords_ordered_pre_align).query(s_start_pt, k=1)
+        b_rolled = np.roll(b_loop_coords_ordered_pre_align, -closest_idx_on_b, axis=0)
+        
+        # Step 2: Determine the correct orientation (forward vs. reversed) without resampling.
+        # We create two candidates and see which one is a better overall match to the smplx loop.
+        b_candidate_forward = b_rolled
+        b_candidate_reversed = b_rolled[::-1].copy()
 
-    def _create_loft_stitch_mesh(self) -> Optional[trimesh.Trimesh]:
+        # Build KD-Trees for both candidate orientations
+        kdt_forward = cKDTree(b_candidate_forward)
+        kdt_reversed = cKDTree(b_candidate_reversed)
+
+        # Query both trees using the SMPLX loop points to find the sum of nearest-neighbor distances.
+        distances_forward, _ = kdt_forward.query(self.s_loop_coords_ordered, k=1)
+        distances_reversed, _ = kdt_reversed.query(self.s_loop_coords_ordered, k=1)
+        
+        total_dist_forward = np.sum(distances_forward)
+        total_dist_reversed = np.sum(distances_reversed)
+
+        # The orientation with the smaller total distance is the correct one.
+        if total_dist_reversed < total_dist_forward:
+            self.b_loop_coords_aligned = b_candidate_reversed
+            # logger.info("Body loop orientation was reversed for best fit.")
+        else:
+            self.b_loop_coords_aligned = b_candidate_forward
+            # logger.info("Body loop orientation kept forward for best fit.")
+
+        return self.b_loop_coords_aligned is not None and len(self.b_loop_coords_aligned) >= 3
+
+    def _body_index_sequence(self,
+                            body_loop: np.ndarray,
+                            n_target: int) -> np.ndarray:
+        """
+        Return an array of length `n_target` whose entries are *indices* into
+        `body_loop` (len = Nb).  The sequence is strictly non-decreasing modulo Nb
+        and wraps exactly once (Rule R1).  Duplicates are grouped (Rule R2).
+
+        • If Nb >= n_target  → some indices are skipped.
+        • If Nb <  n_target  → some indices are repeated in short runs.
+        """
+        Nb = len(body_loop)
+        if Nb == 0:
+            return np.empty(0, dtype=int)
+
+        # Ideal fractional step around the rim
+        step = Nb / n_target
+        seq  = np.floor(np.arange(n_target) * step).astype(int)  # len = n_target
+
+        # Ensure wrap exactly once (seq[-1] may be Nb-1 twice otherwise)
+        seq[-1] = Nb - 1
+        return seq
+
+    # -------------------------------------------------------------------------
+    #  2) MAIN: watertight strip where *only* body rim is resampled
+    # -------------------------------------------------------------------------
+    def _create_loft_stitch_mesh_resample_body(self) -> Optional[trimesh.Trimesh]:
+        """
+        Builds a topologically robust stitch strip by creating a 1-to-1 correspondence
+        between the face loop and an index-sampled body loop. This version uses
+        plane projection and signed area for robust orientation matching.
+        """
         if (self.s_loop_coords_ordered is None or len(self.s_loop_coords_ordered) < 3 or
-                self.b_loop_coords_aligned   is None or len(self.b_loop_coords_aligned)   < 3):
-            logger.warning("Loft strip: missing or too-short loops for creation.")
+            self.b_loop_coords_aligned is None or len(self.b_loop_coords_aligned) < 3):
             return None
-        b_loop, s_loop = self.b_loop_coords_aligned, self.s_loop_coords_ordered
-        Nb, Ns = len(b_loop), len(s_loop)
-        nearest_s_idx = cKDTree(s_loop).query(b_loop, k=1)[1]
-        strip_verts = np.vstack((b_loop, s_loop))
+
+        face_loop = self.s_loop_coords_ordered
+        body_loop_full = self.b_loop_coords_aligned
+        Ns, Nb = len(face_loop), len(body_loop_full)
+
+        # 1. Resample the body loop BY INDEX to match the number of vertices on the face loop.
+        step = Nb / Ns
+        body_idx = np.floor(np.arange(Ns) * step).astype(int)
+        body_idx[-1] = Nb - 1 # Ensure the loop closes properly
+        body_loop_resampled = body_loop_full[body_idx]
+
+        # 2. Use 2D polygon signed area to robustly determine and match loop orientation.
+        def _get_signed_area(points_3d: np.ndarray) -> float:
+            if len(points_3d) < 3: return 0.0
+            # Project points onto their best-fit plane to get 2D coordinates
+            plane_origin, plane_normal = trimesh.points.plane_fit(points_3d)
+            transform = trimesh.geometry.plane_transform(plane_origin, plane_normal)
+            points_2d = trimesh.transform_points(points_3d, transform)[:, :2]
+            # Shoelace formula for signed area
+            x, y = points_2d.T
+            return 0.5 * np.sum(x * np.roll(y, -1) - y * np.roll(x, -1))
+        
+        # 3. If winding orders differ (signs of area are different), reverse the body loop
+        if np.sign(_get_signed_area(body_loop_resampled)) != np.sign(_get_signed_area(face_loop)):
+            logger.info("Reversing body loop orientation to match face loop winding order.")
+            body_loop_resampled = body_loop_resampled[::-1]
+
+        # 4. Final alignment of start points after orientation is fixed
+        k0 = np.argmin(np.linalg.norm(body_loop_resampled - face_loop[0], axis=1))
+        body_loop_final = np.roll(body_loop_resampled, -k0, axis=0)
+
+        # 5. Build the strip vertices and faces
+        strip_verts = np.vstack([body_loop_final, face_loop])
         faces = []
-        for i in range(Nb):
-            i_next = (i + 1) % Nb
-            v0, v1 = i, i_next
-            s_curr, s_next = nearest_s_idx[i] + Nb, nearest_s_idx[i_next]  + Nb
-            faces.extend([[v0, v1, s_next], [v0, s_next, s_curr]])
-        strip = trimesh.Trimesh(vertices=strip_verts, faces=np.asarray(faces, dtype=int), process=True)
-        if not MeshCleanProcess._is_mesh_valid_for_concat(strip, "LoftStripExactFace"):
-            logger.warning("Loft strip failed validation.")
-            return None
-        if strip.face_normals is not None and len(strip.face_normals): # Basic orientation check
-            if (np.dot(strip.face_normals[0], strip.triangles_center[0] - strip.centroid) > 0):
-                strip.invert()
-        # logger.info("Loft stitch mesh (exact face verts) built.")
+        for i in range(Ns):
+            j = (i + 1) % Ns
+            # Quad: (i, j, j+Ns, i+Ns) -> Triangles: (i, j, j+Ns) and (i, j+Ns, i+Ns)
+            faces.extend([[i, j, j + Ns], [i, j + Ns, i + Ns]])
+
+        strip = trimesh.Trimesh(vertices=strip_verts, faces=np.array(faces, dtype=int), process=False)
+        logger.info("Built a topologically robust stitch strip (body-resample method).")
         return strip
 
+    def _create_loft_stitch_mesh_projection(self) -> Optional[trimesh.Trimesh]:
+        """Creates a stitch strip using the original, simpler projection method. (FALLBACK)"""
+        if (self.s_loop_coords_ordered is None or len(self.s_loop_coords_ordered) < 3 or
+                self.b_loop_coords_aligned   is None or len(self.b_loop_coords_aligned)   < 3):
+            return None
+        b_loop, s_loop = self.b_loop_coords_aligned, self.s_loop_coords_ordered
+        Nb = len(b_loop)
+        
+        # Project body loop vertices onto the SMPLX loop to find correspondences
+        nearest_s_idx = cKDTree(s_loop).query(b_loop, k=1)[1]
+        
+        strip_verts = np.vstack((b_loop, s_loop))
+        faces = []
+        
+        # Create faces based on the projection. This can sometimes skip vertices.
+        for i in range(Nb):
+            i_next = (i + 1) % Nb
+            v0, v1 = i, i_next # Indices in the first part of strip_verts (b_loop)
+            
+            # Indices in the second part of strip_verts (s_loop), offset by Nb
+            s_curr = nearest_s_idx[i] + Nb
+            s_next = nearest_s_idx[i_next] + Nb
+            
+            # Create two triangles to form a quad
+            faces.extend([[v0, v1, s_next], [v0, s_next, s_curr]])
+            
+        strip = trimesh.Trimesh(vertices=strip_verts, faces=np.asarray(faces, dtype=int), process=False)
+        if not MeshCleanProcess._is_mesh_valid_for_concat(strip, "LoftStripProjection"):
+            logger.warning("Projection-based loft strip failed validation.")
+            return None
+            
+        logger.info("Fallback loft stitch mesh (projection-based) built.")
+        return strip
+
+    def _create_loft_stitch_mesh_zipper(self) -> Optional[trimesh.Trimesh]:
+        """Creates a stitch strip using the robust zipper method. (PRIMARY)"""
+        if (self.s_loop_coords_ordered is None or len(self.s_loop_coords_ordered) < 3 or
+                self.b_loop_coords_aligned   is None or len(self.b_loop_coords_aligned)   < 3):
+            logger.warning("Loft strip (zipper): missing or too-short loops for creation.")
+            return None
+        
+        b_loop, s_loop = self.b_loop_coords_aligned, self.s_loop_coords_ordered
+        Nb, Ns = len(b_loop), len(s_loop)
+        strip_verts = np.vstack((b_loop, s_loop))
+        faces = []
+        i, j = 0, 0
+
+        for _ in range(Nb + Ns + 5):
+            b_vidx_curr = i
+            s_vidx_curr = j + Nb
+            b_loop_idx_next = (i + 1) % Nb
+            s_loop_idx_next = (j + 1) % Ns
+            b_vidx_next = b_loop_idx_next
+            s_vidx_next = s_loop_idx_next + Nb
+            p_b_curr, p_s_curr = b_loop[i], s_loop[j]
+            p_b_next, p_s_next = b_loop[b_loop_idx_next], s_loop[s_loop_idx_next]
+            diag_len_sq_1 = np.sum((p_b_next - p_s_curr)**2)
+            diag_len_sq_2 = np.sum((p_b_curr - p_s_next)**2)
+
+            if diag_len_sq_1 < diag_len_sq_2:
+                faces.append([b_vidx_curr, b_vidx_next, s_vidx_curr])
+                i = b_loop_idx_next
+            else:
+                faces.append([b_vidx_curr, s_vidx_next, s_vidx_curr])
+                j = s_loop_idx_next
+            
+            if i == 0 and j == 0:
+                break
+        
+        if not faces:
+            logger.warning("Zipper stitch failed to generate any faces.")
+            return None
+
+        strip = trimesh.Trimesh(vertices=strip_verts, faces=np.asarray(faces, dtype=int), process=False)
+        strip.remove_degenerate_faces()
+        if not MeshCleanProcess._is_mesh_valid_for_concat(strip, "ZipperStitchMesh"):
+            logger.warning("Zipper stitch mesh failed validation.")
+            return None
+            
+        strip.fix_normals()
+        if strip.face_normals is not None and len(strip.face_normals) > 0:
+            face_center = strip.triangles_center[0]
+            vec_to_center = strip.centroid - face_center
+            if np.dot(strip.face_normals[0], vec_to_center) > 0:
+                strip.invert()
+                
+        return strip
+
+    @staticmethod
+    def _is_stitch_strip_valid(strip_mesh: Optional[trimesh.Trimesh]) -> bool:
+        """
+        Validates if a generated stitch strip is topologically sound.
+        A valid strip must be a single component with exactly two boundary loops.
+        """
+        if not MeshCleanProcess._is_mesh_valid_for_concat(strip_mesh, "StitchStripValidation"):
+            return False
+        
+        # A valid strip must be one single connected component.
+        if len(strip_mesh.split(only_watertight=False)) > 1:
+            logger.warning("Stitch strip validation failed: contains multiple components.")
+            return False
+            
+        # A valid strip must have exactly two boundary loops (top and bottom).
+        # Any other number indicates holes in the strip or other topological errors.
+        boundary_loops = MeshCleanProcess.get_all_boundary_loops(strip_mesh, min_loop_len=3)
+        if len(boundary_loops) != 2:
+            logger.warning(f"Stitch strip validation failed: found {len(boundary_loops)} boundary loops instead of 2.")
+            return False
+            
+        return True
     def _extract_main_boundary_loop_from_body_with_hole(self) -> Optional[np.ndarray]:
         if not self.body_with_hole_trimesh or \
            not MeshCleanProcess._is_mesh_valid_for_concat(self.body_with_hole_trimesh, "BodyForLoopExtract"):
@@ -416,14 +982,14 @@ class FaceGraftingPipeline:
             return None
         if self.s_loop_coords_ordered is None or len(self.s_loop_coords_ordered) < 3:
             logger.warning("EXTRACT_MAIN_BWH_LOOP: s_loop (SMPLX face) missing. Fallback to largest loop on body_with_hole.")
-            all_loops_vidx = MeshCleanProcess.get_all_boundary_loops(self.body_with_hole_trimesh, min_loop_len=3)
+            all_loops_vidx = MeshCleanProcess.get_all_boundary_loops(self.body_with_hole_trimesh, min_loop_len=2)
             if not all_loops_vidx: return None
             largest_loop_vidx = max(all_loops_vidx, key=len, default=None)
             if largest_loop_vidx is not None and len(largest_loop_vidx) >=3 and largest_loop_vidx.max() < len(self.body_with_hole_trimesh.vertices):
                 return self.body_with_hole_trimesh.vertices[largest_loop_vidx]
             return None
 
-        all_loops_vidx = MeshCleanProcess.get_all_boundary_loops(self.body_with_hole_trimesh, min_loop_len=3)
+        all_loops_vidx = MeshCleanProcess.get_all_boundary_loops(self.body_with_hole_trimesh, min_loop_len=2)
         if not all_loops_vidx: return None
         best_loop_coords, min_avg_distance = None, float('inf')
         s_loop_kdtree = cKDTree(self.s_loop_coords_ordered)
@@ -439,88 +1005,125 @@ class FaceGraftingPipeline:
         return None
 
     def _attempt_body_driven_loft(self) -> bool:
-        logger.info("=== STEP 4 & 5: Attempting 'BODY_DRIVEN_LOFT' ===")
-        if not self._extract_smplx_face_loop(): logger.warning("Loft: SMPLX face loop extraction failed."); return False
+        """
+        Builds a watertight composite mesh by trying a cascade of methods.
+        This version now uses a "Keep and Weld" assembly strategy that preserves
+        all original SMPLX face vertices.
+        """
+        logger.info("=== STEP 4 & 5: Attempting Hybrid 'BODY_DRIVEN_LOFT' (Keep and Weld Strategy) ===")
+        
+        # Step 1: Extract the SMPLX face loop
+        if not self._extract_smplx_face_loop():
+            logger.error("LOFT_FAIL: Prep Step 1/3 failed. Could not extract a valid boundary loop from the SMPLX face mesh.")
+            return False
+        logger.info(f"LOFT_OK: Prep Step 1/3 - Extracted SMPLX face loop with {len(self.ordered_s_vidx_loop)} vertices.")
+
+        # Step 2: Extract the main boundary loop from the body with the hole
         b_loop_pre_align = self._extract_main_boundary_loop_from_body_with_hole()
-        if b_loop_pre_align is None or len(b_loop_pre_align) < 3: logger.warning("Loft: Body hole loop extraction failed."); return False
-        if not self._align_body_loop_to_smplx_loop(b_loop_pre_align): logger.warning("Loft: Loop alignment failed."); return False
-        strip_mesh_obj = self._create_loft_stitch_mesh()
-        if not strip_mesh_obj or not MeshCleanProcess._is_mesh_valid_for_concat(strip_mesh_obj, "StitchStrip"):
-            logger.warning("Loft: Stitch mesh creation failed or invalid."); return False
+        if b_loop_pre_align is None or len(b_loop_pre_align) < 3:
+            num_verts_found = len(b_loop_pre_align) if b_loop_pre_align is not None else 0
+            num_loops_total = 0
+            if self.body_with_hole_trimesh:
+                all_loops = MeshCleanProcess.get_all_boundary_loops(self.body_with_hole_trimesh, min_loop_len=0)
+                num_loops_total = len(all_loops)
 
-        face_concat, body_concat = self.original_smplx_face_geom_tri, self.body_with_hole_trimesh
-        if self.config.vertex_coordinate_precision_digits is not None:
-            digits = self.config.vertex_coordinate_precision_digits
-            if face_concat is not None:
-                temp_f = face_concat.copy(); temp_f.vertices = np.round(temp_f.vertices, digits)
-                if MeshCleanProcess._is_mesh_valid_for_concat(temp_f, "RoundedFace"): face_concat = temp_f
-                else: logger.warning("Rounding SMPLX face vertices made it invalid.")
-            if body_concat is not None:
-                temp_b = body_concat.copy(); temp_b.vertices = np.round(temp_b.vertices, digits)
-                if MeshCleanProcess._is_mesh_valid_for_concat(temp_b, "RoundedBodyHole"): body_concat = temp_b
-                else: logger.warning("Rounding body_with_hole vertices made it invalid.")
-        
-        if not face_concat or not body_concat: logger.error("Loft: SMPLX face or body_with_hole missing for concat."); return False
-        valid_cs = [m for m in [face_concat, body_concat, strip_mesh_obj] if MeshCleanProcess._is_mesh_valid_for_concat(m, "LoftFinalComp")]
-        
-        if len(valid_cs) == 3:
+            logger.error("LOFT_FAIL: Prep Step 2/3 failed. Could not extract a valid main hole loop from the body mesh.")
+            logger.error(f"  - Diagnostic: Found {num_loops_total} total boundary loop(s) on the 'body_with_hole_trimesh' object.")
+            logger.error(f"  - Diagnostic: The best candidate loop had {num_verts_found} vertices (minimum required is 3).")
+            logger.error("  - ACTION: Please inspect the saved '..._debug_body_with_hole.obj' file. It likely has no hole or the hole is malformed.")
+            return False
+        logger.info(f"LOFT_OK: Prep Step 2/3 - Extracted main body hole loop with {len(b_loop_pre_align)} vertices.")
+
+        # Step 3: Align the body and face loops
+        if not self._align_body_loop_to_smplx_loop(b_loop_pre_align):
+            logger.error("LOFT_FAIL: Prep Step 3/3 failed. Could not align the body and face loops for stitching.")
+            return False
+        logger.info("LOFT_OK: Prep Step 3/3 - Successfully aligned body and face loops.")
+
+        base_name, ext = os.path.splitext(self.output_path)
+
+        def _save_debug_stitch(mesh, method_name):
+            if not mesh: return
             try:
-                cand_m = trimesh.util.concatenate(valid_cs)
-                trimesh.constants.tol.merge = 1e-5 # Fine-tune merge tolerance
-                cand_m.merge_vertices(merge_tex=False, merge_norm=False)
+                debug_path = f"{base_name}_debug_stitch_{method_name}{ext}"
+                mesh.export(debug_path)
+                logger.info(f"Saved debug mesh from {method_name} stitch attempt to: {debug_path}")
+            except Exception as e:
+                logger.warning(f"Could not save {method_name} stitch debug mesh: {e}")
 
-                if not MeshCleanProcess._is_mesh_valid_for_concat(cand_m, "ConcatLoftRaw"):
-                    logger.warning("Concatenated loft mesh (raw) is invalid."); self.stitched_mesh_intermediate = None; return False
-                
-                final_m_proc = None 
-                temp_pml_in = self._make_temp_path("merge_pml_in", use_ply=True)
-                temp_pml_out = self._make_temp_path("merge_pml_out", use_ply=True)
-                ms_merge = None
-                try:
-                    if cand_m.export(temp_pml_in):
-                        ms_merge = pymeshlab.MeshSet(); ms_merge.load_new_mesh(temp_pml_in)
-                        if ms_merge.current_mesh_id() != -1 and ms_merge.current_mesh().vertex_number() > 0:
-                            # logger.info(f"PML merge input: V={ms_merge.current_mesh().vertex_number()}, F={ms_merge.current_mesh().face_number()}")
-                            ms_merge.meshing_merge_close_vertices(threshold=pymeshlab.AbsoluteValue(1e-5))
-                            ms_merge.meshing_remove_unreferenced_vertices()
-                            if ms_merge.current_mesh().vertex_number() > 0:
-                                try: ms_merge.meshing_close_holes(maxholesize=100, newfaceselected=False)
-                                except Exception: pass # Ignore PML close holes error
-                            ms_merge.save_current_mesh(temp_pml_out)
-                            reloaded_pml = trimesh.load_mesh(temp_pml_out, process=True)
-                            if MeshCleanProcess._is_mesh_valid_for_concat(reloaded_pml, "LoadedPMLMerge"):
-                                reloaded_pml.fill_holes() # Trimesh fill holes
-                                if MeshCleanProcess._is_mesh_valid_for_concat(reloaded_pml, "PMLPlusTrimeshFill"):
-                                    final_m_proc = reloaded_pml.copy()
-                                    # logger.info(f"PML merge path succeeded. V={len(final_m_proc.vertices)}, F={len(final_m_proc.faces)}")
-                except Exception as e_pml_merge_block: logger.warning(f"PML merge block exception: {e_pml_merge_block}")
-                finally:
-                    if ms_merge is not None: del ms_merge
-                
-                if final_m_proc is None: 
-                    logger.info("PML merge path failed or skipped. Using Trimesh merge on concatenated mesh.")
-                    final_m_proc = cand_m.copy() 
-                    final_m_proc.merge_vertices(merge_tex=False, merge_norm=False) # Redundant if already merged above, but safe.
-                        
-                final_m_proc.remove_unreferenced_vertices(); final_m_proc.remove_degenerate_faces()
+        # --- MODIFIED ASSEMBLY LOGIC ---
+        def _assemble(strip: trimesh.Trimesh) -> Optional[trimesh.Trimesh]:
+            """
+            Assembles the body, the original face, and the stitch strip by
+            concatenating all three and then merging vertices at the seams.
+            This preserves all original SMPLX face vertices.
+            """
+            try:
+                body_h = self.body_with_hole_trimesh
+                smplx_f = self.original_smplx_face_geom_tri
 
-                if MeshCleanProcess._is_mesh_valid_for_concat(final_m_proc, "ProcessedLoft"):
-                    self.stitched_mesh_intermediate = final_m_proc
-                    if self.stitched_mesh_intermediate is not None and MeshCleanProcess._is_mesh_valid_for_concat(self.stitched_mesh_intermediate, "IntermediateForSeam"):
-                        self._verify_seam_closure_on_mesh(self.stitched_mesh_intermediate, "IntermediateStitchedMesh")
-                else:
-                    logger.warning("Processed lofted mesh invalid. Setting stitched_mesh_intermediate to initial concat if valid.")
-                    self.stitched_mesh_intermediate = cand_m if MeshCleanProcess._is_mesh_valid_for_concat(cand_m, "CandMFallback") else None
+                # 1. Create a list of all three mesh parts to combine.
+                #    Crucially, we are now including the *entire* SMPLX face.
+                all_parts = [body_h, smplx_f, strip]
                 
-                if self.stitched_mesh_intermediate is not None and not self.stitched_mesh_intermediate.is_empty:
-                    logger.info(f"Stitch method '{self.config.stitch_method}' successful.")
-                    return True
-                logger.warning("Lofted concatenation resulted in empty/None mesh after processing."); return False
-            except Exception as e_f_cat:
-                logger.error(f"Exception in final loft concat/merge: {e_f_cat}", exc_info=True)
-                self.stitched_mesh_intermediate = None; return False
+                # 2. Concatenate all parts into a single (disconnected) object.
+                #    No vertices have been lost at this stage.
+                final_mesh = trimesh.util.concatenate(all_parts)
+                
+                # 3. Perform the "weld". merge_vertices finds vertices that occupy the
+                #    same 3D space (within a tolerance) and merges them into one.
+                #    This is what connects the boundaries.
+                final_mesh.merge_vertices()
+                
+                # 4. Standard cleanup.
+                final_mesh.remove_unreferenced_vertices()
+                final_mesh.remove_degenerate_faces()
+
+                return final_mesh if MeshCleanProcess._is_mesh_valid_for_concat(final_mesh, "WeldedLoftResult") else None
+            except Exception as e:
+                logger.error(f"Welded assembly failed: {e}", exc_info=False)
+                return None
+        # --- END OF MODIFIED LOGIC ---
+        
+        # --- Method 1: Zipper ---
+        logger.info("Attempting stitch method 1/3: Zipper")
+        strip = self._create_loft_stitch_mesh_zipper()
+        if self._is_stitch_strip_valid(strip):
+            stitched = _assemble(strip)
+            _save_debug_stitch(stitched, "zipper")
+            if stitched and self._verify_seam_closure_on_mesh(stitched, "ZipperResult"):
+                self.stitched_mesh_intermediate = stitched
+                return True
+            logger.warning("Zipper stitch was valid, but resulted in an open seam or invalid assembly. Falling back.")
         else:
-            logger.warning(f"Not all 3 components valid for loft concat. Valid: {len(valid_cs)}"); return False
+            logger.warning("Zipper strip was topologically invalid. Falling back.")
+
+        # --- Method 2: Body Resample ---
+        logger.info("Attempting stitch method 2/3: Body-Resample")
+        strip = self._create_loft_stitch_mesh_resample_body()
+        if self._is_stitch_strip_valid(strip):
+            stitched = _assemble(strip)
+            _save_debug_stitch(stitched, "body_resample")
+            if stitched and self._verify_seam_closure_on_mesh(stitched, "BodyResampleResult"):
+                self.stitched_mesh_intermediate = stitched
+                return True
+            logger.warning("Body-Resample stitch was valid, but resulted in an open seam or invalid assembly. Falling back.")
+        else:
+             logger.warning("Body-Resample strip was topologically invalid. Falling back.")
+        
+        # --- Method 3: Projection (Last Resort) ---
+        logger.info("Attempting stitch method 3/3: Projection (Last Resort)")
+        strip = self._create_loft_stitch_mesh_projection()
+        if strip:
+            stitched = _assemble(strip)
+            _save_debug_stitch(stitched, "projection")
+            if stitched:
+                logger.info("SUCCESS: Fallback Projection method assembled a mesh.")
+                self.stitched_mesh_intermediate = stitched
+                return True
+
+        logger.critical("All stitching strategies failed.")
+        return False
 
     def _verify_seam_closure_on_mesh(self, mesh_to_check: trimesh.Trimesh, mesh_name_for_log: str) -> bool:
         # logger.info(f"--- Verifying Seam Closure on: {mesh_name_for_log} ---")
@@ -549,197 +1152,160 @@ class FaceGraftingPipeline:
         else:
             logger.warning(f"Seam check ({mesh_name_for_log}): Found {len(gap_edges_indices)} potential gap edges."); return False 
         
-    def _perform_simple_concatenation(self) -> bool:
-        logger.info("=== STEP 5 (Fallback): Performing simple concatenation ===")
-        if not self.original_smplx_face_geom_tri or not self.body_with_hole_trimesh:
-             logger.error("Simple concat: one or both base meshes missing."); return False
-        valid_comps = [m for m in [self.original_smplx_face_geom_tri, self.body_with_hole_trimesh] 
-                          if MeshCleanProcess._is_mesh_valid_for_concat(m, "FallbackComp")]
-        if not valid_comps: logger.critical("No valid components for simple concat."); return False
+    def _attempt_direct_weld(self) -> bool:
+        """
+        Builds a composite mesh by directly 'welding' the body hole loop to the
+        SMPLX face loop. This strategy preserves ALL original SMPLX vertices.
+        """
+        logger.info("=== STEP 4 & 5: Attempting 'DIRECT_WELD' Strategy ===")
+        
+        # 1. Get the ordered vertex loops from the body hole and the SMPLX face.
+        if not self._extract_smplx_face_loop(): return False
+        b_loop_pre_align = self._extract_main_boundary_loop_from_body_with_hole()
+        if b_loop_pre_align is None or len(b_loop_pre_align) < 3: return False
+        if not self._align_body_loop_to_smplx_loop(b_loop_pre_align): return False
+        
         try:
-            self.stitched_mesh_intermediate = trimesh.util.concatenate(valid_comps)
-            self.stitched_mesh_intermediate.merge_vertices(merge_tex=False, merge_norm=False) # Important for simple concat too
-            if not MeshCleanProcess._is_mesh_valid_for_concat(self.stitched_mesh_intermediate, "FallbackConcatResult"):
-                logger.critical("Simple concatenation resulted in invalid mesh."); return False
-            self.stitched_mesh_intermediate.fix_normals() 
-            logger.info("Simple concatenation successful.")
-            return True
-        except Exception as e_concat:
-            logger.error(f"Exception during simple concatenation: {e_concat}", exc_info=True)
+            body_h = self.body_with_hole_trimesh
+            smplx_f = self.original_smplx_face_geom_tri
+
+            # 2. Concatenate the two meshes. ALL original vertices are now preserved in a single object.
+            combined_mesh = trimesh.util.concatenate(body_h, smplx_f)
+            
+            # 3. We need to find the vertex indices of our loops *within the new combined mesh*.
+            num_body_verts = len(body_h.vertices)
+            
+            # The body loop indices are easy to find as they don't need an offset.
+            kdtree_combined = cKDTree(combined_mesh.vertices)
+            _, body_loop_indices_in_combined = kdtree_combined.query(self.b_loop_coords_aligned, k=1)
+            
+            # The SMPLX loop indices must be offset by the number of vertices in the body mesh.
+            # We use the original index loop (`self.ordered_s_vidx_loop`) plus the offset.
+            smplx_loop_indices_in_combined = self.ordered_s_vidx_loop + num_body_verts
+            
+            # 4. Use trimesh's utility to "zip" the two loops together by creating new faces.
+            # We must ensure both loops have the same winding order for this to work.
+            # We already aligned them in `_align_body_loop_to_smplx_loop`, but we double-check.
+            
+            # Resample the body loop to match the length of the SMPLX loop for trimesh.graph.stitch
+            resampled_body_indices = trimesh.graph.resample_path(
+                combined_mesh.vertices, body_loop_indices_in_combined, count=len(smplx_loop_indices_in_combined)
+            )
+
+            # Generate the faces for the stitch strip
+            new_faces = trimesh.graph.stitch(
+                combined_mesh, resampled_body_indices, smplx_loop_indices_in_combined
+            )
+            
+            # 5. Add the new faces to the combined mesh
+            combined_mesh.faces = np.vstack([combined_mesh.faces, new_faces])
+            
+            # 6. Final cleanup
+            combined_mesh.remove_unreferenced_vertices()
+            combined_mesh.remove_degenerate_faces()
+            
+            if MeshCleanProcess._is_mesh_valid_for_concat(combined_mesh, "DirectWeldResult"):
+                self.stitched_mesh_intermediate = combined_mesh
+                logger.info("SUCCESS: Direct Weld method created a valid stitched mesh.")
+                return True
+            else:
+                logger.error("Direct Weld failed to produce a valid mesh.")
+                return False
+
+        except Exception as e:
+            logger.error(f"An exception occurred during direct weld: {e}", exc_info=True)
             return False
 
     def _stitch_components(self) -> bool:
-        if self.config.stitch_method == "body_driven_loft":
-            if self._attempt_body_driven_loft(): return True
-            logger.info("Body_driven_loft failed or not applicable. Falling back to simple concatenation.")
-            return self._perform_simple_concatenation()
-        # logger.info(f"Stitch method is '{self.config.stitch_method}'. Proceeding with simple concatenation.")
-        return self._perform_simple_concatenation()
+        """
+        Dispatches to the chosen stitching method. The chosen method MUST succeed,
+        otherwise the pipeline fails. There are no fallbacks.
+        """
+        if self.config.stitch_method == "direct_weld":
+            if self._attempt_direct_weld():
+                return True
+        elif self.config.stitch_method == "body_driven_loft":
+            if self._attempt_body_driven_loft():
+                return True
 
-    def _fill_seam_holes_ear_clip(self) -> bool:
-        from scipy.spatial import cKDTree 
-        if not self.stitched_mesh_intermediate or \
-           not MeshCleanProcess._is_mesh_valid_for_concat(self.stitched_mesh_intermediate, "MeshBeforeSeamFill"):
-            logger.warning("Skipping seam hole fill: stitched mesh invalid/missing.")
-            self.final_processed_mesh = self.stitched_mesh_intermediate; return True 
-        if self.config.stitch_method not in ["trimesh_dynamic_loft", "body_driven_loft"]: # trimesh_dynamic_loft is not implemented here
-            self.final_processed_mesh = self.stitched_mesh_intermediate; return True
+        logger.critical(
+            f"The chosen stitch method '{self.config.stitch_method}' failed to produce a valid result. "
+            "The pipeline cannot continue."
+        )
+        return False
 
-        logger.info("Attempting EAR-CLIP SEAM HOLE FILL post-loft...")
-        mesh_to_fill = self.stitched_mesh_intermediate.copy() 
-        try: # Pre-computation
-            if hasattr(mesh_to_fill, 'fix_normals'): mesh_to_fill.fix_normals(multibody=True)
-            if hasattr(mesh_to_fill, 'edges_unique') and hasattr(mesh_to_fill, 'face_adjacency_edges') and hasattr(mesh_to_fill, 'edge_faces'):
-                _ = mesh_to_fill.edges_unique; _ = mesh_to_fill.face_adjacency_edges; _ = mesh_to_fill.edge_faces
-                mesh_to_fill._edges_unique_sorted_lookup = {tuple(sorted(edge)): idx for idx, edge in enumerate(mesh_to_fill.edges_unique)}
-        except Exception: logger.warning("Could not fully pre-cache graph properties for ear-clip fill.")
-
-        orig_verts = mesh_to_fill.vertices.copy()
-        curr_faces_list = list(mesh_to_fill.faces)
-        added_fill_faces = False 
-        s_loop_ref, b_loop_ref = self.s_loop_coords_ordered, self.b_loop_coords_aligned
-        all_loops = MeshCleanProcess.get_all_boundary_loops(mesh_to_fill, min_loop_len=3)
-        kdt_s, kdt_b = (cKDTree(s_loop_ref) if s_loop_ref is not None else None), (cKDTree(b_loop_ref) if b_loop_ref is not None else None)
-        prox_thresh = 0.025 
-        z_thresh_limb = None
-        if self.simplified_body_trimesh and MeshCleanProcess._is_mesh_valid_for_concat(self.simplified_body_trimesh, "BodyLimbZ"):
-            b_min, b_max = self.simplified_body_trimesh.bounds; height = b_max[2] - b_min[2]
-            if height > 1e-6: z_thresh_limb = b_min[2] + height * 0.30 
-
-        for loop_vidx in all_loops:
-            if not (3 <= len(loop_vidx) <= self.config.max_seam_hole_fill_vertices and loop_vidx.max() < len(orig_verts)): continue
-            loop_coords = orig_verts[loop_vidx]
-            if z_thresh_limb is not None and np.mean(loop_coords[:, 2]) < z_thresh_limb: continue
-            is_seam = False 
-            if kdt_s and kdt_b:
-                d_s, _ = kdt_s.query(loop_coords, k=1, distance_upper_bound=prox_thresh*2)
-                d_b, _ = kdt_b.query(loop_coords, k=1, distance_upper_bound=prox_thresh*2)
-                if np.mean(d_s[np.isfinite(d_s)]) < prox_thresh and np.mean(d_b[np.isfinite(d_b)]) < prox_thresh: is_seam = True
-            
-            if is_seam:
-                new_faces_cand = None
-                try:
-                    if len(loop_coords) < 3: continue
-                    plane_orig, normal = MeshCleanProcess.get_dominant_plane(loop_coords)
-                    if np.allclose(normal, [0,0,0]): continue
-                    xform_2d = trimesh.geometry.plane_transform(plane_orig, normal)
-                    loop_2d = trimesh.transform_points(loop_coords, xform_2d)[:, :2]
-                    if len(np.unique(loop_2d, axis=0)) < 3: continue
-                    from shapely.geometry import Polygon
-                    patch_v_2d, patch_f_loc = None, None; tri_ok = False
-                    try:
-                        poly2d = Polygon(loop_2d) 
-                        patch_v_2d, patch_f_loc = trimesh.creation.triangulate_polygon(poly2d, triangle_args="p")
-                        tri_ok = (patch_f_loc is not None and len(patch_f_loc) > 0)
-                    except Exception: # Catch all for PSLG, then try ear-cut
-                        path_2d_obj = trimesh.path.Path2D(entities=[trimesh.path.entities.Line(np.arange(len(loop_2d)))], vertices=loop_2d)
-                        if hasattr(path_2d_obj, 'polygons_full') and path_2d_obj.polygons_full:
-                           poly_earcut = path_2d_obj.polygons_full[0] 
-                           patch_v_2d, patch_f_loc = trimesh.creation.triangulate_polygon(poly_earcut)
-                           tri_ok = (patch_f_loc is not None and len(patch_f_loc) > 0)
-                    if not tri_ok: continue
-                    idx_map = cKDTree(loop_2d).query(patch_v_2d, k=1)[1]
-                    new_faces_cand = loop_vidx[idx_map[patch_f_loc]]
-
-                    if new_faces_cand is not None and len(new_faces_cand) > 0:
-                        patch_mesh = trimesh.Trimesh(vertices=orig_verts, faces=new_faces_cand, process=False); patch_mesh.fix_normals()
-                        if len(patch_mesh.faces) > 0 and hasattr(patch_mesh, 'face_normals') and patch_mesh.face_normals is not None:
-                            avg_patch_n = trimesh.util.unitize(np.mean(patch_mesh.face_normals, axis=0))
-                            adj_normals = []
-                            if hasattr(mesh_to_fill, '_edges_unique_sorted_lookup'):
-                                for i in range(len(loop_vidx)):
-                                    e_tuple = tuple(sorted((loop_vidx[i], loop_vidx[(i+1)%len(loop_vidx)])))
-                                    e_idx = mesh_to_fill._edges_unique_sorted_lookup.get(e_tuple)
-                                    if e_idx is not None and hasattr(mesh_to_fill, 'edge_faces') and hasattr(mesh_to_fill, 'face_normals') and \
-                                       e_idx < len(mesh_to_fill.edge_faces):
-                                        for f_idx in mesh_to_fill.edge_faces[e_idx]:
-                                            if f_idx != -1 and f_idx < len(mesh_to_fill.face_normals): adj_normals.append(mesh_to_fill.face_normals[f_idx])
-                            if adj_normals:
-                                target_n = trimesh.util.unitize(np.mean(np.array(adj_normals), axis=0))
-                                if np.dot(avg_patch_n, target_n) < 0.1: 
-                                    new_faces_cand = new_faces_cand[:, ::-1] # Flip
-                                    logger.info(f"Loop {loop_idx}: Flipped patch orientation for seam fill.")
-                    if new_faces_cand is not None: curr_faces_list.extend(new_faces_cand); added_fill_faces = True
-                except Exception as e_outer: logger.warning(f"Error ear-clipping loop {loop_idx}: {e_outer}", exc_info=False) # exc_info False for brevity
-        
-        if added_fill_faces:
-            updated_mesh = trimesh.Trimesh(vertices=orig_verts, faces=np.array(curr_faces_list,dtype=int), process=True) 
-            if MeshCleanProcess._is_mesh_valid_for_concat(updated_mesh, "MeshAfterEarClip"):
-                self.final_processed_mesh = updated_mesh; logger.info("Ear-clip seam hole filling applied.")
-            else:
-                logger.warning("Mesh invalid after ear-clip. Reverting."); self.final_processed_mesh = self.stitched_mesh_intermediate 
-        else: self.final_processed_mesh = self.stitched_mesh_intermediate 
-        return True
-        
     def _apply_final_polish(self) -> bool:
         if not self.final_processed_mesh or \
            not MeshCleanProcess._is_mesh_valid_for_concat(self.final_processed_mesh, "MeshBeforeFinalPolish"):
             logger.warning("Skipping final polish: mesh invalid/missing."); return True 
 
-        logger.info("=== STEP 5.5: Applying Final Polish ===")
+        logger.info("=== STEP 5.5: Applying AGGRESSIVE Final Polish and Repair ===")
         temp_in = self._make_temp_path("polish_in", use_ply=True)
         temp_out = self._make_temp_path("polish_out", use_ply=True)
-        polished_loaded = None; ms_polish = None
+        polished_loaded = None
+        ms_polish = None
         try:
             self.final_processed_mesh.export(temp_in)
-            ms_polish = pymeshlab.MeshSet(); ms_polish.load_new_mesh(temp_in)
+            ms_polish = pymeshlab.MeshSet()
+            ms_polish.load_new_mesh(temp_in)
+            
             if ms_polish.current_mesh_id() != -1 and ms_polish.current_mesh().vertex_number() > 0:
+                logger.info("...merging duplicate vertices...")
                 ms_polish.meshing_remove_duplicate_vertices()
-                try: ms_polish.meshing_repair_non_manifold_edges(method='Split Vertices')
-                except Exception: 
-                    try: ms_polish.meshing_repair_non_manifold_edges(method='Remove Faces')
-                    except Exception: pass
+
+                logger.info("...repairing non-manifold edges...")
+                try:
+                    ms_polish.meshing_repair_non_manifold_edges(method='Split Vertices')
+                except Exception:
+                    try: 
+                        ms_polish.meshing_repair_non_manifold_edges(method='Remove Faces')
+                    except Exception: 
+                        logger.warning("Could not repair non-manifold edges.")
+
+                # --- The problematic degenerate face removal step has been REMOVED. ---
+                # Trimesh will handle this more robustly upon final loading.
+                
+                logger.info("...final unreferenced vertex removal...")
+                ms_polish.meshing_remove_unreferenced_vertices()
+
                 is_mani = False
                 try:
-                    if ms_polish.get_topological_measures().get('non_manifold_edges', -1) == 0: is_mani = True
-                except Exception: pass
+                    if ms_polish.get_topological_measures().get('non_manifold_edges', -1) == 0:
+                        is_mani = True
+                except Exception:
+                    pass
+
                 if is_mani:
-                    try: ms_polish.meshing_close_holes(maxholesize=self.config.final_polish_max_hole_edges)
-                    except Exception as e_ch: logger.info(f"Polish: PML close_holes failed: {e_ch}")
-                ms_polish.meshing_remove_unreferenced_vertices(); ms_polish.compute_normal_per_face() 
+                    logger.info("...mesh is now manifold, attempting to close remaining small holes...")
+                    try:
+                        ms_polish.meshing_close_holes(maxholesize=self.config.final_polish_max_hole_edges)
+                    except Exception as e_ch:
+                        logger.info(f"Polish: PML close_holes failed: {e_ch}")
+                else:
+                    logger.warning("...mesh is still not manifold after repairs, skipping hole filling.")
+
+                ms_polish.compute_normal_per_face() 
                 ms_polish.save_current_mesh(temp_out)
+                
+                # Trimesh's `process=True` flag will automatically handle the removal of
+                # any degenerate faces that PyMeshLab might have missed or created.
                 polished_loaded = trimesh.load_mesh(temp_out, process=True)
             
             if MeshCleanProcess._is_mesh_valid_for_concat(polished_loaded, "PolishedMeshPML"):
-                self.final_processed_mesh = polished_loaded; self.final_processed_mesh.fix_normals() 
-                logger.info("Final polish applied.")
-            else: logger.warning("Final polish resulted in invalid mesh. Keeping pre-polish.")
-        except Exception as e_polish: logger.warning(f"Error in final polish: {e_polish}", exc_info=True)
+                self.final_processed_mesh = polished_loaded
+                self.final_processed_mesh.fix_normals() 
+                logger.info("Aggressive final polish applied.")
+            else:
+                logger.warning("Aggressive final polish resulted in invalid mesh. Keeping pre-polish version.")
+        
+        except Exception as e_polish:
+            logger.warning(f"Error in final polish step: {e_polish}", exc_info=True)
         finally:
-            if ms_polish is not None: del ms_polish
+            if ms_polish is not None:
+                del ms_polish
+        
         return True
-
-    def _filter_spider_triangles(self) -> bool:
-        if not self.final_processed_mesh or \
-           not MeshCleanProcess._is_mesh_valid_for_concat(self.final_processed_mesh, "MeshBeforeSpiderFilter"):
-            logger.warning("Skipping spider filter: mesh invalid/missing."); return True 
-        if self.config.spider_filter_area_factor is None and self.config.spider_filter_max_edge_len_factor is None:
-            return True
-        logger.info("=== STEP 5.75: Filtering Spider-Web Triangles ===")
-        target_faces = None
-        if MeshCleanProcess._is_mesh_valid_for_concat(self.original_smplx_face_geom_tri, "SpiderRefBounds") and \
-           self.final_processed_mesh.faces.shape[0] > 0 and self.original_smplx_face_geom_tri.vertices.shape[0] > 0: 
-            centroids = self.final_processed_mesh.triangles_center
-            s_min, s_max = self.original_smplx_face_geom_tri.bounds; pad = 0.05 
-            min_b, max_b = s_min - pad, s_max + pad
-            ids = [i for i, c in enumerate(centroids) if (min_b[0] <= c[0] <= max_b[0] and min_b[1] <= c[1] <= max_b[1] and min_b[2] <= c[2] <= max_b[2])]
-            if ids: target_faces = np.array(ids, dtype=int)
-        max_edge_len = None
-        if self.config.spider_filter_max_edge_len_factor is not None and self.config.spider_filter_max_edge_len_factor > 0:
-            if self.simplified_body_trimesh and MeshCleanProcess._is_mesh_valid_for_concat(self.simplified_body_trimesh, "SpiderEdgeRef") and \
-               len(self.simplified_body_trimesh.edges_unique_length) > 0:
-                max_edge_len = np.max(self.simplified_body_trimesh.edges_unique_length) * (1.0 + self.config.spider_filter_max_edge_len_factor)
-        ref_stats = self.original_smplx_face_geom_tri if MeshCleanProcess._is_mesh_valid_for_concat(self.original_smplx_face_geom_tri, "SpiderAreaRef") else None
-        filtered = MeshCleanProcess._filter_large_triangles_from_fill(
-            self.final_processed_mesh, target_face_indices=target_faces, max_allowed_edge_length=max_edge_len,
-            max_allowed_area_factor=self.config.spider_filter_area_factor, reference_mesh_for_stats=ref_stats
-        )
-        if not MeshCleanProcess._is_mesh_valid_for_concat(filtered, "MeshAfterSpiderFilter"):
-            logger.critical("Mesh invalid after spider filter. Aborting save."); return False 
-        self.final_processed_mesh = filtered; self.final_processed_mesh.fix_normals()
-        # logger.info("Spider-web triangle filter applied.")
-        return True
-
+        
     def _verify_seam_closure(self) -> bool:
         logger.info(f"=== STEP 6 (Verify): Verifying Seam Closure ===")
         if not MeshCleanProcess._is_mesh_valid_for_concat(self.final_processed_mesh, "FinalMeshForSeamVerify"):
@@ -754,7 +1320,7 @@ class FaceGraftingPipeline:
         boundary_edges = MeshCleanProcess._get_boundary_edges_manually_from_faces(self.final_processed_mesh)
         if boundary_edges is None or len(boundary_edges) == 0:
             logger.info("Seam verify: Final mesh no boundary edges. Seam closed."); return True
-        gap_thresh = getattr(self.config, 'seam_gap_verification_threshold', 1e-4) 
+        gap_thresh = getattr(self.config, 'seam_gap_verification_threshold', 1e-8) 
         gap_edges_found = []
         for v_a, v_b in boundary_edges:
             if v_a >= len(self.final_processed_mesh.vertices) or v_b >= len(self.final_processed_mesh.vertices): continue
@@ -767,41 +1333,582 @@ class FaceGraftingPipeline:
             logger.info(f"Seam verify: No gap edges found. Seam effectively closed (thresh {gap_thresh:.1e})."); return True 
         logger.warning(f"Seam verify: Found {len(gap_edges_found)} potential gap edges (thresh {gap_thresh:.1e})."); return False 
 
+    def _verify_smplx_face_integrity(self) -> bool:
+        """
+        Checks the final mesh to ensure the original SMPLX face geometry has not been altered.
+        If debug_smply_integrity_trace is True, it will capture lost vertices for tracing.
+        """
+        logger.info("=== STEP 7 (Verify): Verifying SMPLX Face Integrity ===")
+        if self.final_processed_mesh is None or not MeshCleanProcess._is_mesh_valid_for_concat(self.final_processed_mesh, "FinalMeshForIntegrityCheck"):
+            logger.warning("SMPLX Integrity Check: Final mesh is invalid or missing. Skipping.")
+            return True
+
+        if self.original_smplx_v_pre_graft is None:
+            logger.warning("SMPLX Integrity Check: Original geometry baseline not found. Skipping.")
+            return True
+
+        try:
+            final_mesh_kdtree = cKDTree(self.final_processed_mesh.vertices)
+            distances, new_indices = final_mesh_kdtree.query(self.original_smplx_v_pre_graft, k=1)
+
+            # Check 1: Were any vertices lost or moved significantly?
+            lost_vertices_mask = distances > 1e-5
+            if np.any(lost_vertices_mask):
+                lost_count = np.sum(lost_vertices_mask)
+                lost_indices_original = np.where(lost_vertices_mask)[0]
+                logger.warning(f"SMPLX Integrity FAIL: {lost_count} original vertices seem to be lost or moved.")
+                logger.warning(f"  - Original indices of lost vertices: {lost_indices_original[:10]}...")
+
+                # --- INITIATE DEBUG TRACING ---
+                if self.config.debug_smply_integrity_trace:
+                    self.debug_tracked_vertex_coords = self.original_smplx_v_pre_graft[lost_vertices_mask]
+                    logger.warning(f"*** Initiating integrity trace for {len(self.debug_tracked_vertex_coords)} lost vertices. ***")
+                # --- END ---
+                return False
+
+            # ... (rest of the function for merge/topology checks remains the same) ...
+            num_original_verts = len(self.original_smplx_v_pre_graft)
+            num_unique_found_verts = len(np.unique(new_indices))
+            if num_unique_found_verts < num_original_verts:
+                merged_count = num_original_verts - num_unique_found_verts
+                logger.warning(f"SMPLX Integrity FAIL: {merged_count} original vertices were merged into others.")
+                return False
+                
+            if self.original_smplx_edges_pre_graft is not None:
+                original_vidx_to_new_vidx_map = dict(enumerate(new_indices))
+                reconstructed_edges = set()
+                for v1_orig, v2_orig in self.original_smplx_edges_pre_graft:
+                    if v1_orig in original_vidx_to_new_vidx_map and v2_orig in original_vidx_to_new_vidx_map:
+                        reconstructed_edges.add(tuple(sorted((original_vidx_to_new_vidx_map[v1_orig], original_vidx_to_new_vidx_map[v2_orig]))))
+                missing_edges = reconstructed_edges - {tuple(sorted(e)) for e in self.final_processed_mesh.edges_unique}
+                if missing_edges:
+                    logger.warning(f"SMPLX Integrity FAIL: {len(missing_edges)} topological edges were broken.")
+                    return False
+                    
+            logger.info("SMPLX Integrity PASS: Original face geometry and topology preserved in the final mesh.")
+            return True
+
+        except Exception as e:
+            logger.error(f"An exception occurred during SMPLX integrity check: {e}", exc_info=True)
+            return False
+
+    def _fill_seam_holes_by_fan(self) -> bool:
+        """
+        Identifies boundary loops corresponding to the grafting seam and fills them using fan triangulation.
+        This version uses an existing vertex on the loop as the fan's origin (no new vertices).
+        """
+        if not self.stitched_mesh_intermediate or \
+           not MeshCleanProcess._is_mesh_valid_for_concat(self.stitched_mesh_intermediate, "MeshBeforeSeamFill"):
+            logger.warning("Skipping seam hole fill: stitched mesh invalid/missing.")
+            self.final_processed_mesh = self.stitched_mesh_intermediate
+            return True
+        
+        if self.config.stitch_method not in ["trimesh_dynamic_loft", "body_driven_loft"]:
+            self.final_processed_mesh = self.stitched_mesh_intermediate
+            return True
+
+        logger.info("Attempting FAN TRIANGULATION SEAM HOLE FILL post-loft (Root Vertex Method)...")
+        mesh_to_fill = self.stitched_mesh_intermediate.copy()
+        
+        mesh_to_fill.fix_normals()
+
+        # We will modify the faces list in place
+        current_faces = list(mesh_to_fill.faces)
+        
+        all_loops = MeshCleanProcess.get_all_boundary_loops(mesh_to_fill, min_loop_len=3)
+        if not all_loops:
+            self.final_processed_mesh = self.stitched_mesh_intermediate
+            return True
+
+        kdt_s = cKDTree(self.s_loop_coords_ordered) if self.s_loop_coords_ordered is not None else None
+        kdt_b = cKDTree(self.b_loop_coords_aligned) if self.b_loop_coords_aligned is not None else None
+        prox_thresh = 0.025
+
+        added_any_faces = False
+        for loop_idx, loop_vidx in enumerate(all_loops):
+            if not (3 <= len(loop_vidx) <= self.config.max_seam_hole_fill_vertices):
+                continue
+
+            loop_coords = mesh_to_fill.vertices[loop_vidx]
+            
+            is_seam = False
+            if kdt_s and kdt_b:
+                d_s, _ = kdt_s.query(loop_coords, k=1, distance_upper_bound=prox_thresh * 2)
+                d_b, _ = kdt_b.query(loop_coords, k=1, distance_upper_bound=prox_thresh * 2)
+                finite_d_s, finite_d_b = d_s[np.isfinite(d_s)], d_b[np.isfinite(d_b)]
+                if finite_d_s.size > 0 and finite_d_b.size > 0 and np.mean(finite_d_s) < prox_thresh and np.mean(finite_d_b) < prox_thresh:
+                    is_seam = True
+            
+            if not is_seam:
+                continue
+
+            try:
+                # --- FAN TRIANGULATION (ROOT VERTEX METHOD) ---
+                
+                # 1. Find the average normal of faces surrounding the hole for orientation check.
+                neighbor_face_indices_nested = mesh_to_fill.vertex_faces[loop_vidx]
+                if len(neighbor_face_indices_nested) > 0:
+                    valid_faces = [f for f_list in neighbor_face_indices_nested for f in f_list if f != -1]
+                    if not valid_faces: continue
+                    unique_face_indices = np.unique(valid_faces)
+                    target_normal = trimesh.util.unitize(np.mean(mesh_to_fill.face_normals[unique_face_indices], axis=0))
+                else:
+                    continue
+
+                # 2. Choose a root vertex for the fan. The first vertex in the loop is a stable choice.
+                root_vidx = loop_vidx[0]
+
+                # 3. Create the fan of faces from the root vertex.
+                # We iterate from the second vertex to the one before the last, creating triangles.
+                new_patch_faces = []
+                for i in range(1, len(loop_vidx) - 1):
+                    v1_idx = loop_vidx[i]
+                    v2_idx = loop_vidx[i + 1]
+                    new_patch_faces.append([root_vidx, v1_idx, v2_idx])
+                
+                # 4. Check and fix the orientation of the new patch.
+                if new_patch_faces and np.any(np.abs(target_normal) > 1e-6):
+                    # We can check the normal of the first new face to determine the whole patch's orientation.
+                    v0, v1, v2 = mesh_to_fill.vertices[new_patch_faces[0]]
+                    test_normal = trimesh.util.unitize(np.cross(v1 - v0, v2 - v0))
+                    
+                    if np.dot(test_normal, target_normal) < 0.0:
+                        logger.info(f"Flipping fan patch for loop {loop_idx} to match surrounding geometry.")
+                        # Reverse the winding of all new faces
+                        new_patch_faces = [face[::-1] for face in new_patch_faces]
+
+                current_faces.extend(new_patch_faces)
+                added_any_faces = True
+                logger.info(f"Filled seam hole (loop {loop_idx}) with {len(new_patch_faces)} fan faces.")
+
+            except Exception as e:
+                logger.warning(f"Failed to fan-fill loop {loop_idx}: {e}", exc_info=True)
+
+        if added_any_faces:
+            # Rebuild the mesh with the added faces. No new vertices were added.
+            updated_mesh = trimesh.Trimesh(vertices=mesh_to_fill.vertices, faces=np.array(current_faces, dtype=int), process=True)
+            
+            if MeshCleanProcess._is_mesh_valid_for_concat(updated_mesh, "MeshAfterFanFill"):
+                self.final_processed_mesh = updated_mesh
+                logger.info("Fan-fill seam hole filling applied.")
+            else:
+                logger.warning("Mesh invalid after fan-fill. Reverting.")
+                self.final_processed_mesh = self.stitched_mesh_intermediate
+        else:
+            self.final_processed_mesh = self.stitched_mesh_intermediate
+            
+        return True
+
+    def _perform_global_orientation_fix(self) -> bool:
+        """
+        Performs a robust, global orientation of the entire mesh using Trimesh's
+        built-in graph-based algorithm. This is the definitive way to ensure
+        all face normals are consistent.
+        """
+        logger.info("=== Performing Global and Final Mesh Orientation Fix ===")
+        if not self.final_processed_mesh or self.final_processed_mesh.is_empty:
+            logger.warning("Skipping global orientation fix: final mesh is missing or empty.")
+            return True
+
+        mesh_before_fix = self.final_processed_mesh.copy()
+        try:
+            # fix_normals() uses a robust traversal algorithm to make all face windings consistent.
+            # multibody=True is important as it handles disconnected components gracefully.
+            self.final_processed_mesh.fix_normals(multibody=True)
+
+            if not MeshCleanProcess._is_mesh_valid_for_concat(self.final_processed_mesh, "PostGlobalOrientation"):
+                logger.warning("Global orientation fix resulted in an invalid mesh. REVERTING this step.")
+                self.final_processed_mesh = mesh_before_fix
+            else:
+                logger.info("Global orientation fix completed successfully.")
+            
+            return True
+
+        except Exception as e:
+            logger.error(f"Error during global orientation fix: {e}", exc_info=True)
+            self.final_processed_mesh = mesh_before_fix # Revert on any error
+            return False
+
+    def _perform_aggressive_final_repair(self) -> bool:
+        if not self.final_processed_mesh or \
+           not MeshCleanProcess._is_mesh_valid_for_concat(self.final_processed_mesh, "MeshBeforeFinalRepair"):
+            logger.warning("Skipping final aggressive repair: mesh invalid/missing."); return True
+
+        logger.info("=== STEP 5.5: Applying ULTIMATE Final Repair and Polish ===")
+        temp_in = self._make_temp_path("agg_repair_in", use_ply=True)
+        temp_out = self._make_temp_path("agg_repair_out", use_ply=True)
+        repaired_mesh = None
+        ms_repair = None
+        try:
+            self.final_processed_mesh.export(temp_in)
+            ms_repair = pymeshlab.MeshSet()
+            ms_repair.load_new_mesh(temp_in)
+
+            if ms_repair.current_mesh_id() != -1 and ms_repair.current_mesh().vertex_number() > 0:
+                logger.info("...merging duplicate vertices as a pre-pass...")
+                ms_repair.meshing_remove_duplicate_vertices()
+
+                # --- ULTIMATE REPAIR SEQUENCE ---
+                logger.info("...Step 1/2: Splitting non-manifold vertices (the root of the problem)...")
+                try:
+                    # This is the most powerful filter for fixing "bad contiguous edges."
+                    ms_repair.meshing_repair_non_manifold_vertices_by_splitting()
+                except (AttributeError, pymeshlab.PyMeshLabException):
+                    logger.warning("Could not run `repair_non_manifold_vertices_by_splitting`. Your PyMeshLab version might be too old. Proceeding with edge-based repair.")
+
+                logger.info("...Step 2/2: Iteratively repairing non-manifold edges...")
+                # After splitting vertices, we clean up the resulting edges.
+                for i in range(3): # Run multiple passes to be thorough
+                    num_nm_edges = ms_repair.get_topological_measures().get('non_manifold_edges', -1)
+                    if num_nm_edges == 0:
+                        logger.info(f"...non-manifold edge repair complete after {i} iterations.")
+                        break
+                    ms_repair.meshing_repair_non_manifold_edges(method='Split Vertices')
+                
+                # --- DEGENERATE FACE REMOVAL IS NOW HANDLED BY TRIMESH ON LOAD ---
+                # This makes the pipeline robust against older PyMeshLab versions.
+                logger.info("...topological repair complete. Removing unreferenced vertices...")
+                ms_repair.meshing_remove_unreferenced_vertices()
+                # --- END OF REPAIR SEQUENCE ---
+
+                # Now, attempt final hole filling on the topologically repaired mesh.
+                if ms_repair.get_topological_measures().get('non_manifold_edges', 0) == 0:
+                    logger.info("...mesh is now manifold, closing final holes.")
+                    try:
+                        ms_repair.meshing_close_holes(maxholesize=self.config.final_polish_max_hole_edges)
+                    except Exception as e_ch:
+                        logger.info(f"Final hole filling failed: {e_ch}")
+                else:
+                    logger.warning("Mesh is still non-manifold after ultimate repair. Cannot fill holes.")
+                
+                ms_repair.save_current_mesh(temp_out)
+                
+                # Load with `process=True` to let Trimesh handle final geometric cleanup,
+                # including the removal of any zero-area faces.
+                repaired_mesh = trimesh.load_mesh(temp_out, process=True)
+
+            if repaired_mesh and MeshCleanProcess._is_mesh_valid_for_concat(repaired_mesh, "AggressiveRepairResult"):
+                self.final_processed_mesh = repaired_mesh
+                self.final_processed_mesh.fix_normals()
+                logger.info("Ultimate final repair and polish completed successfully.")
+            else:
+                logger.warning("Ultimate repair resulted in invalid mesh. Using pre-repair version.")
+
+        except Exception as e:
+            logger.error(f"An exception occurred during the ultimate repair step: {e}", exc_info=True)
+        finally:
+            if ms_repair: del ms_repair
+        
+        return True
+
+    def _fill_internal_face_holes_on_final_mesh(self) -> bool:
+        """
+        Intelligently finds and fills the internal holes of the face (e.g., mouth, nostrils)
+        on the final, fully assembled mesh.
+        """
+        if not self.config.close_face_holes_at_end:
+            return True # Feature is turned off
+
+        logger.info("=== Attempting to fill internal face holes on final mesh ===")
+        if self.final_processed_mesh is None or self.final_processed_mesh.is_empty:
+            logger.warning("Skipping: final mesh is missing or empty.")
+            return True
+            
+        if self.original_smplx_v_pre_graft is None or self.b_loop_coords_aligned is None:
+            logger.warning("Skipping: Missing reference geometry for face/body loops.")
+            return True
+
+        mesh = self.final_processed_mesh
+        all_loops = MeshCleanProcess.get_all_boundary_loops(mesh, min_loop_len=3)
+        if not all_loops:
+            logger.info("No boundary loops found to fill.")
+            return True
+        
+        # Build KDTrees from our original reference geometry
+        face_ref_kdtree = cKDTree(self.original_smplx_v_pre_graft)
+        body_seam_ref_kdtree = cKDTree(self.b_loop_coords_aligned)
+
+        # A distance threshold to decide if a loop "belongs" to a reference
+        proximity_threshold = 0.05 
+        loops_to_fill = []
+        
+        for loop_vidx in all_loops:
+            loop_coords = mesh.vertices[loop_vidx]
+            
+            # Check distance to original face vertices
+            dist_to_face, _ = face_ref_kdtree.query(loop_coords, k=1)
+            avg_dist_to_face = np.mean(dist_to_face)
+            
+            # Check distance to original body seam vertices
+            dist_to_body, _ = body_seam_ref_kdtree.query(loop_coords, k=1)
+            avg_dist_to_body = np.mean(dist_to_body)
+            
+            # A hole is an "internal face hole" if it is VERY close to the face reference
+            # points but NOT close to the body seam reference points.
+            if avg_dist_to_face < proximity_threshold and avg_dist_to_body > proximity_threshold:
+                loops_to_fill.append(loop_vidx)
+
+        if not loops_to_fill:
+            logger.info("No holes were identified as internal face holes.")
+            return True
+
+        logger.info(f"Identified {len(loops_to_fill)} internal face hole(s) to fill.")
+        
+        # Now, fill the identified loops using the robust fan-fill method
+        current_faces = list(mesh.faces)
+        for loop_vidx in loops_to_fill:
+            root_vidx = loop_vidx[0]
+            for i in range(1, len(loop_vidx) - 1):
+                v1_idx = loop_vidx[i]
+                v2_idx = loop_vidx[i + 1]
+                current_faces.append([root_vidx, v1_idx, v2_idx])
+                
+        # Create a new mesh with the filled holes
+        filled_mesh = trimesh.Trimesh(vertices=mesh.vertices, faces=current_faces)
+        
+        if MeshCleanProcess._is_mesh_valid_for_concat(filled_mesh, "FinalMeshWithHolesFilled"):
+            self.final_processed_mesh = filled_mesh
+            logger.info("Successfully filled internal face holes on final mesh.")
+        else:
+            logger.warning("Mesh became invalid after filling face holes. Reverting.")
+
+        return True
+
+    def _smooth_simplified_body_pre_hole_cut(self) -> bool:
+        """
+        Applies Laplacian smoothing to the entire simplified body mesh before cutting the hole.
+        This is an optional step controlled by the config.
+        """
+        if self.config.pre_hole_cut_smoothing_iterations <= 0:
+            return True
+
+        if not self.simplified_body_trimesh or not MeshCleanProcess._is_mesh_valid_for_concat(self.simplified_body_trimesh, "PreBodySmooth"):
+            logger.warning("Simplified body mesh is invalid or None, skipping pre-hole smoothing.")
+            return True 
+    
+        logger.info(f"=== STEP 2.75: Smoothing simplified body ({self.config.pre_hole_cut_smoothing_iterations} iter, lambda={self.config.pre_hole_cut_smoothing_lambda}) ===")
+        body_before_smooth = self.simplified_body_trimesh.copy()
+        
+        try:
+            smoothed_body = trimesh.smoothing.filter_laplacian(
+                self.simplified_body_trimesh,
+                iterations=self.config.pre_hole_cut_smoothing_iterations,
+                lamb=self.config.pre_hole_cut_smoothing_lambda
+            )
+
+            if MeshCleanProcess._is_mesh_valid_for_concat(smoothed_body, "PostBodySmooth"):
+                if self.config.use_open3d_cleaning:
+                    smoothed_body = self._clean_with_open3d(smoothed_body, "PostBodySmoothing_O3D")
+                else:
+                    logger.info("...ensuring consistent face orientation after smoothing (Trimesh).")
+                    smoothed_body.fix_normals()
+
+                self.simplified_body_trimesh = smoothed_body
+                logger.info("Successfully smoothed and cleaned simplified body.")
+            else:
+                logger.warning("Smoothing resulted in an empty or invalid mesh. Reverting to pre-smooth state.")
+                self.simplified_body_trimesh = body_before_smooth
+
+        except Exception as e:
+            logger.error(f"An exception occurred during simplified body smoothing: {e}. Reverting to pre-smooth state.", exc_info=True)
+            self.simplified_body_trimesh = body_before_smooth
+    
+        return True
+
+    def _split_and_save_main_and_secondary_components(self) -> bool:
+        """
+        Splits the mesh into its disconnected components. It saves the largest
+        component (the body) as the main output and intelligently combines and
+        saves any smaller components (like eyeballs) to a separate file.
+        This version ensures the resulting mesh is fully processed.
+        """
+        logger.info("--- Splitting mesh into main (body) and secondary (eyeballs) components ---")
+        if not self.final_processed_mesh or self.final_processed_mesh.is_empty:
+            return True
+
+        mesh_before_split = self.final_processed_mesh.copy()
+        
+        try:
+            components = self.final_processed_mesh.split(only_watertight=False)
+            
+            if len(components) > 1:
+                logger.info(f"Found {len(components)} disconnected components.")
+                components.sort(key=lambda c: len(c.faces), reverse=True)
+                largest_component = components[0]
+                secondary_components = components[1:]
+
+                if MeshCleanProcess._is_mesh_valid_for_concat(largest_component, "LargestComponent"):
+                    
+                    # --- THE DEFINITIVE FIX ---
+                    # Re-create the Trimesh object from its core data with process=True.
+                    # This forces a full build of all internal graph data, including
+                    # any version of boundary properties that may or may not exist.
+                    # This is the most robust way to solve the raw mesh problem.
+                    logger.info("Re-processing the largest component to ensure graph integrity...")
+                    self.final_processed_mesh = trimesh.Trimesh(
+                        vertices=largest_component.vertices,
+                        faces=largest_component.faces,
+                        process=True
+                    )
+                    logger.info("Successfully isolated and processed the main body component.")
+                    # --- END OF FIX ---
+
+                else:
+                    logger.error("The largest component was invalid after splitting. Reverting.")
+                    self.final_processed_mesh = mesh_before_split
+                    return False
+
+                if secondary_components:
+                    logger.info(f"Found {len(secondary_components)} secondary component(s) to save separately.")
+                    secondary_mesh = trimesh.util.concatenate(secondary_components)
+                    base_name, ext = os.path.splitext(self.output_path)
+                    secondary_path = f"{base_name}_eyeballs{ext}"
+                    secondary_mesh.export(secondary_path)
+                    logger.info(f"Saved secondary components (eyeballs) to: {secondary_path}")
+            else:
+                logger.info("Mesh is already a single connected component. No splitting needed.")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"An error occurred during component splitting: {e}", exc_info=True)
+            self.final_processed_mesh = mesh_before_split
+            return False
+
+    def _final_watertightness_check_and_save(self) -> bool:
+        """
+        Saves the final processed mesh unconditionally, then performs a
+        watertightness check and returns the result of that check.
+        A False return indicates the pipeline produced a non-watertight mesh,
+        even though the file was saved.
+        """
+        if not self.final_processed_mesh or not MeshCleanProcess._is_mesh_valid_for_concat(self.final_processed_mesh, "FinalMeshForSave"):
+            logger.critical("Cannot save final mesh: Mesh is invalid or missing.")
+            return False
+
+        # --- STEP 1: Unconditionally save the file ---
+        logger.info(f"--- Saving final processed mesh to: {self.output_path} ---")
+        try:
+            self.final_processed_mesh.export(self.output_path)
+            logger.info("File saved successfully.")
+        except Exception as e:
+            logger.critical(f"Failed to export the final mesh: {e}", exc_info=True)
+            return False # The save operation itself failed.
+
+        # --- STEP 2: Perform the quality check and report on it ---
+        logger.info("--- Performing Final Watertightness Check on Saved Mesh ---")
+        
+        if self.final_processed_mesh.is_watertight:
+            logger.info("SUCCESS: The saved mesh is watertight.")
+            return True # The pipeline's goal was met.
+        else:
+            logger.warning("--- WATERTIGHTNESS CHECK FAILED ---")
+            logger.warning("The saved mesh is NOT watertight, but the file was saved as requested.")
+            
+            # Use a robust try-except block for diagnostics
+            try:
+                # This block will ONLY run if the necessary attributes exist.
+                is_manifold = self.final_processed_mesh.is_manifold
+                boundary_edge_count = len(self.final_processed_mesh.boundary_edges)
+                
+                if boundary_edge_count > 0:
+                    logger.warning(f"  - Diagnostics: Found {boundary_edge_count} boundary edges (gaps in the mesh).")
+                if not is_manifold:
+                    logger.warning("  - Diagnostics: Mesh is not manifold (e.g., contains edges shared by more than two faces).")
+            
+            except AttributeError:
+                # If ANY attribute is missing, fall back to a generic message.
+                logger.warning("  - Detailed diagnostics unavailable for this Trimesh version.")
+
+            # Return False to indicate the watertightness GOAL was not met.
+            return False
+                        
+    def _retain_largest_component_only(self) -> bool:
+        """
+        Ensures the mesh consists of only one single connected component by
+        discarding any smaller, disconnected "islands" of geometry.
+        """
+        logger.info("--- Verifying mesh consists of a single connected component ---")
+        if not self.final_processed_mesh or self.final_processed_mesh.is_empty:
+            return True # Nothing to do
+
+        mesh_before_split = self.final_processed_mesh.copy()
+        
+        try:
+            # The split operation returns a list of Trimesh objects
+            components = self.final_processed_mesh.split(only_watertight=False)
+            
+            if len(components) > 1:
+                logger.warning(f"Found {len(components)} disconnected components. Retaining only the largest.")
+                
+                # Find the largest component by number of faces
+                largest_component = max(components, key=lambda c: len(c.faces))
+                
+                if MeshCleanProcess._is_mesh_valid_for_concat(largest_component, "LargestComponent"):
+                    self.final_processed_mesh = largest_component
+                    logger.info("Successfully isolated the largest mesh component.")
+                else:
+                    logger.error("The largest component was invalid after splitting. Reverting.")
+                    self.final_processed_mesh = mesh_before_split
+                    return False
+            else:
+                logger.info("Mesh is already a single connected component. No action needed.")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"An error occurred during component splitting: {e}", exc_info=True)
+            self.final_processed_mesh = mesh_before_split
+            return False
+
     def process(self) -> Optional[trimesh.Trimesh]:
+        """
+        Executes the full face grafting pipeline.
+        Returns the processed Trimesh object if successful, None otherwise.
+        """
         logger.info(f"--- Starting Face Grafting Pipeline (V{self.INTERNAL_VERSION_TRACKER}) ---")
         pipeline_ok = False
+        final_mesh_for_return = None
         try:
             if not self._load_and_simplify_meshes(): return None
             if not self._perform_iterative_body_repair(): return None
+            if not self._smooth_simplified_body_pre_hole_cut(): return None
             if not self._determine_hole_faces_and_create_body_with_hole(): return None
-            if not self._stitch_components(): logger.error("Component stitching failed."); return None
-            self._fill_seam_holes_ear_clip() # Updates self.final_processed_mesh
-            self._apply_final_polish()      # Updates self.final_processed_mesh
+            if not self._stitch_components(): return None 
+            
+            self.final_processed_mesh = self.stitched_mesh_intermediate
+            
+            self._fill_seam_holes_by_fan() 
+            self._apply_final_polish()
 
-            # _filter_spider_triangles() is commented out by user
-            # if not self._filter_spider_triangles(): logger.error("Spider filtering failed critically."); return None
+            # --- REORDERED VERIFICATION STEPS (AS REQUESTED) ---
+            # 1. Verify SMPLX integrity on the fully assembled mesh BEFORE component splitting.
+            self._verify_smplx_face_integrity()
 
-            if not MeshCleanProcess._is_mesh_valid_for_concat(self.final_processed_mesh, "MeshBeforeFinalSave"):
-                logger.critical("Final mesh is invalid or empty before save. CANNOT SAVE."); return None
-            self.final_processed_mesh.export(self.output_path)
-            logger.info(f"--- Pipeline Finished. Output: {self.output_path} ---")
+            # 2. Retain only the largest component.
+            self._retain_largest_component_only()
+            # --- END OF REORDERED STEPS ---
+
+            self._save_and_check_debug_vertices(self.final_processed_mesh, "04_after_component_filter")
+            
+            if self._final_watertightness_check_and_save():
+                pipeline_ok = True
+                final_mesh_for_return = self.final_processed_mesh
+            else:
+                return None
+            
+            # The seam closure check is still performed on the final, saved mesh.
             self._verify_seam_closure()
-            logger.info("--- Performing Final Watertightness Check ---")
-            if self.final_processed_mesh and not self.final_processed_mesh.is_empty:
-                temp_final_check = self._make_temp_path("final_watertight_check", use_ply=True)
-                if self.final_processed_mesh.export(temp_final_check):
-                    checker = MeshCleanProcess(temp_final_check, "dummy.ply")
-                    if checker.load_mesh(): logger.info(f"Final Watertightness: {checker.check_watertight()}")
-                    else: logger.warning("Could not load final for watertight check.")
-                    del checker
-            pipeline_ok = True
-            return self.final_processed_mesh
-        except Exception as e: 
-            logger.error(f"--- Pipeline V{self.INTERNAL_VERSION_TRACKER} Failed: {e}", exc_info=True); return None
+            
+            return final_mesh_for_return
+        except Exception as e_main_pipeline: 
+            logger.error(f"--- Pipeline V{self.INTERNAL_VERSION_TRACKER} Failed with unhandled exception: {e_main_pipeline}", exc_info=True)
+            return None
         finally:
             self._cleanup_temp_files()
-            if not pipeline_ok: logger.error(f"Pipeline V{self.INTERNAL_VERSION_TRACKER} did not complete successfully.")
-
+            if not pipeline_ok: 
+                logger.error(f"Pipeline V{self.INTERNAL_VERSION_TRACKER} did not complete successfully.")
+                                
     @staticmethod
     def _iterative_non_manifold_repair_pml_aggressive(
         input_mesh: trimesh.Trimesh,
@@ -960,7 +2067,13 @@ class FaceGraftingPipeline:
             cleaned = current_mesh.copy()
             cleaned.merge_vertices()                     # default tolerance
             cleaned.remove_unreferenced_vertices()
-            cleaned.remove_degenerate_faces()
+            
+            # --- DEPRECATION FIX ---
+            non_degenerate_face_mask = cleaned.nondegenerate_faces()
+            if np.any(~non_degenerate_face_mask):
+                cleaned.update_faces(non_degenerate_face_mask)
+            # --- END FIX ---
+            
             cleaned.fix_normals()
 
             if MeshCleanProcess._is_mesh_valid_for_concat(cleaned, "AggRepairFinalClean"):
@@ -984,7 +2097,6 @@ class FaceGraftingPipeline:
 
         # logger.info(f"--- Finished AGGRESSIVE Iterative Repair for '{temp_file_prefix}' ---")
         return current_mesh
-
 
     def _perform_iterative_body_repair(self) -> bool:
         if self.simplified_body_trimesh is None: logger.error("Iterative repair: body None."); return False
@@ -1047,14 +2159,80 @@ class MeshCleanProcess:
             except pymeshlab.PyMeshLabException as e: logger.error(f"Poisson recon error: {e}"); return False
         raise ValueError("Unsupported recon method.")
 
-    def check_watertight(self):
-        if self.ms.current_mesh().vertex_number() == 0: return False 
+    def check_watertight(self, engine: str = "trimesh") -> bool:
+        """
+        Return True if the current PyMeshLab mesh is watertight,
+        as determined by the selected *engine*.
+
+        Parameters
+        ----------
+        engine : {"trimesh", "open3d"}, default "trimesh"
+            Library used for the test.
+
+        Notes
+        -----
+        • Requires trimesh ≥ 2.38.0 when *engine* == "trimesh".
+        • Requires open3d ≥ 0.18 when *engine* == "open3d".
+        """
+        cm = self.ms.current_mesh()                          # PyMeshLab mesh
+        if cm.vertex_number() == 0:
+            return False                                     # empty set → not watertight
+
         try:
-            metrics = self.ms.get_topological_measures()
-            is_wt = (metrics.get('boundary_edges',-1)==0 and metrics.get('number_holes',-1)==0 and metrics.get('is_mesh_two_manifold',False))
-            if not is_wt: logger.info(f"Watertight Check (PML): BE={metrics.get('boundary_edges')}, Holes={metrics.get('number_holes')}, IsTwoManifold={metrics.get('is_mesh_two_manifold')}")
+            verts: np.ndarray = cm.vertex_matrix()           # (N, 3) float64
+            faces: np.ndarray = cm.face_matrix()             # (M, 3) int32
+
+            if engine == "trimesh":
+                import trimesh
+                mesh = trimesh.Trimesh(
+                    vertices=verts,
+                    faces=faces,
+                    process=False            # keep topology untouched
+                )
+                is_wt = mesh.is_watertight
+
+                # --- ADDED DIAGNOSTIC BLOCK ---
+                if not is_wt:
+                    reasons = []
+                    # This is the check for "every single edge that is only part of one face"
+                    if len(mesh.boundary_edges) > 0:
+                        reasons.append(f"{len(mesh.boundary_edges)} boundary edges (gaps) found")
+                    
+                    # Trimesh's `is_watertight` also checks for other non-manifold conditions.
+                    if not mesh.is_manifold:
+                         reasons.append("mesh is not manifold (e.g., edges shared by >2 faces)")
+                    
+                    if not reasons:
+                        reasons.append("unknown reason (topology may be complex)")
+                    
+                    logger.info(f"Watertight check (trimesh) failed. Reasons: {'; '.join(reasons)}.")
+                # --- END DIAGNOSTIC BLOCK ---
+
+            elif engine == "open3d":
+                import open3d as o3d
+                mesh = o3d.geometry.TriangleMesh(
+                    o3d.utility.Vector3dVector(verts),
+                    o3d.utility.Vector3iVector(faces)
+                )
+                is_wt = mesh.is_watertight()
+
+                # --- ADDED DIAGNOSTIC BLOCK ---
+                if not is_wt:
+                    # In Open3D, boundary edges are a type of non-manifold edge.
+                    non_manifold_edges = mesh.get_non_manifold_edges()
+                    logger.info(
+                        f"Watertight check (open3d) failed. Found {len(non_manifold_edges)} non-manifold/boundary edges."
+                    )
+                # --- END DIAGNOSTIC BLOCK ---
+
+            else:
+                raise ValueError(f"Unknown engine '{engine}'")
+
             return is_wt
-        except pymeshlab.PyMeshLabException as e: logger.error(f"Error checking watertight (PML): {e}"); return False
+
+        except Exception as exc:
+            logger.error("Error checking watertight (%s): %s", engine, exc)
+            return False
 
     def save_mesh(self):
         if self.ms.current_mesh().vertex_number() == 0:
@@ -1071,7 +2249,7 @@ class MeshCleanProcess:
         return self.check_watertight() and self.save_mesh()
     
     @staticmethod
-    def get_all_boundary_loops(mesh: trimesh.Trimesh, min_loop_len: int = 3) -> List[np.ndarray]:
+    def get_all_boundary_loops(mesh: trimesh.Trimesh, min_loop_len: int = 2) -> List[np.ndarray]:
         all_loops = []
         if not MeshCleanProcess._is_mesh_valid_for_concat(mesh, "InputMeshForAllLoops"): return all_loops
         boundary_edges = MeshCleanProcess._get_boundary_edges_manually_from_faces(mesh)
@@ -1110,8 +2288,7 @@ class MeshCleanProcess:
         except Exception as e: logger.error(f"Err in _get_boundary_edges: {e}", exc_info=True); return None
 
     @staticmethod
-    def _order_loop_vertices_from_edges(mesh_name_for_debug: str, loop_vidx_unique: np.ndarray, all_edges_loop: np.ndarray, 
-                                        min_comp_ok: float = 0.75, min_path_len_ok: int = 10) -> Optional[np.ndarray]:
+    def _order_loop_vertices_from_edges(mesh_name_for_debug: str, loop_vidx_unique: np.ndarray, all_edges_loop: np.ndarray) -> Optional[np.ndarray]:
         if loop_vidx_unique is None or len(loop_vidx_unique) < 3 or all_edges_loop is None or len(all_edges_loop) < max(0, len(loop_vidx_unique)-1): return None
         adj = {v:[] for v in loop_vidx_unique}; degrees = {v:0 for v in loop_vidx_unique}
         for u,v in all_edges_loop:
@@ -1132,25 +2309,8 @@ class MeshCleanProcess:
         if len(path) > 1 and path[0] == path[-1]: path = path[:-1] # Close loop
         unique_in_path = len(np.unique(path)); expected_unique = len(loop_vidx_unique)
         if unique_in_path == expected_unique and len(path) == expected_unique: return np.array(path,dtype=int)
-        if unique_in_path >= expected_unique*min_comp_ok and len(path) >= min_path_len_ok: return np.array(path,dtype=int) # Partial ok
+        # The problematic line that caused the NameError has been removed.
         return None
-
-    @staticmethod
-    def resample_polyline_to_count(polyline: np.ndarray, count: int) -> Optional[np.ndarray]:
-        if polyline is None or polyline.ndim!=2 or polyline.shape[1]!=3: return None
-        if len(polyline)<2: return polyline
-        if count < 2: return polyline[:count] if count > 0 else np.array([],dtype=polyline.dtype).reshape(0,3)
-        if len(polyline)==count: return polyline
-        dists = np.linalg.norm(np.diff(polyline,axis=0),axis=1)
-        cum_dists = np.concatenate(([0], np.cumsum(dists))); total_len = cum_dists[-1]
-        if total_len < 1e-9: return np.tile(polyline[0],(count,1)) if count > 0 and len(polyline)>0 else np.array([],dtype=polyline.dtype).reshape(0,3)
-        sampled_lens = np.linspace(0,total_len,count); resampled = []
-        for s_len in sampled_lens:
-            idx = np.searchsorted(cum_dists, s_len, side='right')-1; idx=np.clip(idx,0,len(polyline)-2)
-            p0,p1=polyline[idx],polyline[idx+1]; seg_len=cum_dists[idx+1]-cum_dists[idx]
-            t = (s_len-cum_dists[idx])/seg_len if seg_len > 1e-9 else 0.0
-            resampled.append(p0+np.clip(t,0,1)*(p1-p0))
-        return np.array(resampled) if resampled else np.array([],dtype=polyline.dtype).reshape(0,3)
 
     @staticmethod
     def get_dominant_plane(points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -1161,122 +2321,109 @@ class MeshCleanProcess:
         except Exception: return np.array([0.,0.,1.]), center
 
     @staticmethod
-    def _get_hole_boundary_edges_from_removed_faces(orig_mesh: trimesh.Trimesh, faces_removed: np.ndarray) -> Optional[np.ndarray]:
-        if not MeshCleanProcess._is_mesh_valid_for_concat(orig_mesh, "OrigMeshHoleBoundary") or \
-           faces_removed is None or faces_removed.ndim!=1 or len(faces_removed)!=len(orig_mesh.faces): return None
-        if not np.any(faces_removed) or np.all(faces_removed): return np.array([],dtype=int).reshape(-1,2)
-        try:
-            adj_pairs, adj_edges = orig_mesh.face_adjacency, orig_mesh.face_adjacency_edges
-            hole_edges = [adj_edges[i] for i in range(len(adj_pairs)) if faces_removed[adj_pairs[i][0]] != faces_removed[adj_pairs[i][1]]]
-            return np.array(hole_edges,dtype=int) if hole_edges else np.array([],dtype=int).reshape(-1,2)
-        except Exception as e: logger.error(f"Error in _get_hole_boundary_edges: {e}", exc_info=True); return None
-
-    @staticmethod
-    def _filter_large_triangles_from_fill(
-        mesh: trimesh.Trimesh, target_face_indices: Optional[np.ndarray] = None, 
-        max_allowed_edge_length: Optional[float] = None, max_allowed_area_factor: Optional[float] = None,
-        reference_mesh_for_stats: Optional[trimesh.Trimesh] = None, mesh_name_for_debug: str = "large_tri" # name not used if logs removed
-    ) -> trimesh.Trimesh:
-        if not MeshCleanProcess._is_mesh_valid_for_concat(mesh, f"InputLargeTriFilter"): return mesh
-        if max_allowed_edge_length is None and max_allowed_area_factor is None: return mesh 
-        keep_mask = np.ones(len(mesh.faces),dtype=bool)
-        cand_mask = np.zeros(len(mesh.faces),dtype=bool)
-        if target_face_indices is not None and len(target_face_indices)>0:
-            valid_targets = target_face_indices[target_face_indices < len(mesh.faces)]
-            cand_mask[valid_targets]=True
-        else: cand_mask.fill(True)
-        remove_criteria_mask = np.zeros(len(mesh.faces),dtype=bool)
-        if max_allowed_edge_length is not None and max_allowed_edge_length > 0 and np.any(cand_mask): 
-            face_edges_len = np.zeros((len(mesh.faces),3))
-            for i,f_verts in enumerate(mesh.faces):
-                if cand_mask[i]: 
-                    if f_verts.max()<len(mesh.vertices): v0,v1,v2=mesh.vertices[f_verts]; face_edges_len[i,:]=[np.linalg.norm(v0-v1),np.linalg.norm(v1-v2),np.linalg.norm(v2-v0)]
-                    else: face_edges_len[i,:]=np.inf 
-            remove_criteria_mask[(np.max(face_edges_len,axis=1) > max_allowed_edge_length) & cand_mask] = True
-        if max_allowed_area_factor is not None and max_allowed_area_factor > 0 and np.any(cand_mask): 
-            areas = mesh.area_faces; median_area = 0
-            if reference_mesh_for_stats and MeshCleanProcess._is_mesh_valid_for_concat(reference_mesh_for_stats,"RefStatsArea") and len(reference_mesh_for_stats.faces)>0:
-                median_area = np.median(reference_mesh_for_stats.area_faces)
-            elif len(areas[cand_mask & ~remove_criteria_mask])>0: median_area = np.median(areas[cand_mask & ~remove_criteria_mask])
-            if median_area > 1e-9: remove_criteria_mask[(areas > median_area*max_allowed_area_factor) & cand_mask] = True 
-        keep_mask[remove_criteria_mask]=False
-        if np.sum(~keep_mask) > 0:
-            if np.all(~keep_mask): logger.warning("All faces removed by large tri filter. Aborting filter."); return mesh 
-            filtered = mesh.copy(); filtered.update_faces(keep_mask); filtered.remove_unreferenced_vertices()
-            if MeshCleanProcess._is_mesh_valid_for_concat(filtered, f"FilteredMeshLargeTri"): return filtered
-            logger.warning("Mesh invalid after large tri filter. Returning original."); return mesh 
-        return mesh
-    
-    @staticmethod
     def run_face_grafting_pipeline(
         full_body_mesh_path: str, output_path: str, smplx_face_mesh_path: str,
-        projection_footprint_threshold: float = 0.01, footprint_dilation_rings: int = 3,
-        body_simplification_target_faces: int = 12000, stitch_method: str = "body_driven_loft", 
-        smplx_face_neck_loop_strategy: str = "full_face_silhouette", alignment_resample_count: int = 1000,
-        # loft_strip_resample_count removed as unused by current loft
-        max_seam_hole_fill_vertices: int = 250, final_polish_max_hole_edges: int = 100,
-        iterative_repair_s1_iters: int = 5, spider_filter_area_factor: Optional[float] = 300.0,
-        spider_filter_max_edge_len_factor: Optional[float] = 0.20,
-        hole_boundary_smoothing_iterations=10, hole_boundary_smoothing_factor=0.5
-        # debug_dir removed
+        **pipeline_params
     ) -> Optional[trimesh.Trimesh]:
-        config = FaceGraftingConfig(
-            projection_footprint_threshold=projection_footprint_threshold,
-            footprint_dilation_rings=footprint_dilation_rings,
-            body_simplification_target_faces=body_simplification_target_faces,
-            stitch_method=stitch_method,
-            smplx_face_neck_loop_strategy=smplx_face_neck_loop_strategy,
-            alignment_resample_count=alignment_resample_count,
-            # loft_strip_resample_count=loft_strip_resample_count, # Unused
-            max_seam_hole_fill_vertices=max_seam_hole_fill_vertices,
-            final_polish_max_hole_edges=final_polish_max_hole_edges,
-            iterative_repair_s1_iters=iterative_repair_s1_iters,
-            spider_filter_area_factor=spider_filter_area_factor,
-            spider_filter_max_edge_len_factor=spider_filter_max_edge_len_factor,
-            vertex_coordinate_precision_digits=6, 
-            hole_boundary_smoothing_iterations=hole_boundary_smoothing_iterations,
-            hole_boundary_smoothing_factor=hole_boundary_smoothing_factor
-        )
-        pipeline = FaceGraftingPipeline(full_body_mesh_path,smplx_face_mesh_path,output_path,config)
-        return pipeline.process()
+        """
+        Initializes and runs the grafting pipeline.
         
+        Parameters
+        ----------
+        full_body_mesh_path : str
+            Path to the full body mesh file.
+        output_path : str
+            Path where the final grafted mesh will be saved.
+        smplx_face_mesh_path : str
+            Path to the SMPLX face mesh file.
+        **pipeline_params : dict
+            A dictionary of optional parameters to override the defaults in FaceGraftingConfig.
+        """
+        # Create the configuration by unpacking the provided dictionary.
+        # Any parameters not in the dictionary will use the defaults from the dataclass.
+        config = FaceGraftingConfig(**pipeline_params)
+        
+        # Initialize and run the pipeline instance with this config.
+        pipeline = FaceGraftingPipeline(
+            full_body_mesh_path=full_body_mesh_path,
+            smplx_face_mesh_path=smplx_face_mesh_path,
+            output_path=output_path,
+            config=config
+        )
+        return pipeline.process()
+
 def main():
-    base_input_dir = "/home/ubuntu/projects/induxr/econ_s/ECON/results/Fulden/IFN+_face_thresh_0.01/econ/obj"
-    body_mesh_filename = "fulden_tpose_f1_0_full_wt.obj" 
-    face_mesh_filename = "fulden_tpose_f1_0_face.obj"
-    full_body_mesh_path = os.path.join(base_input_dir, body_mesh_filename)
-    smplx_face_mesh_path = os.path.join(base_input_dir, face_mesh_filename)
+    # Base output directory
     output_dir = '/home/ubuntu/projects/induxr/econ_s/ECON/results/standalone_face_graft_test_results'
     os.makedirs(output_dir, exist_ok=True)
-    output_filename = f"grafted_{os.path.splitext(body_mesh_filename)[0]}_with_{os.path.splitext(face_mesh_filename)[0]}.obj"
-    output_path = os.path.join(output_dir, output_filename)
-
-    script_logger = logging.getLogger("standalone_graft_test")
-    if not logging.getLogger().hasHandlers(): # Ensure basicConfig is set if no handlers exist
+    
+    script_logger = logging.getLogger("standalone_graft_test_runner")
+    if not logging.getLogger().hasHandlers():
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
-    script_logger.setLevel(logging.INFO) # Explicitly set level for this logger
+    script_logger.setLevel(logging.INFO)
 
-    script_logger.info(f"--- Standalone Face Grafting Test ---")
-    script_logger.info(f"Body Mesh: {full_body_mesh_path}")
-    script_logger.info(f"Face Mesh: {smplx_face_mesh_path}")
-    script_logger.info(f"Output: {output_path}")
+    # ========================================================================
+    #               *** SINGLE POINT OF CONTROL FOR PARAMETERS ***
+    # ========================================================================
+    pipeline_parameters = {
+        "footprint_dilation_rings": 1,
+        "body_simplification_target_faces": 12000,
+        "iterative_repair_s1_iters": 5,
+        "max_seam_hole_fill_vertices": 250,
+        "final_polish_max_hole_edges": 100,
+        "hole_boundary_smoothing_iterations": 30,
+        "hole_boundary_smoothing_factor": 0.1,
+    }
+    script_logger.info(f"Using pipeline parameters: {pipeline_parameters}")
+    # ========================================================================
 
-    if not os.path.exists(full_body_mesh_path):
-        script_logger.error(f"CRITICAL: Body mesh not found: '{full_body_mesh_path}'. Update filename/path."); return
-    if not os.path.exists(smplx_face_mesh_path):
-        script_logger.error(f"CRITICAL: Face mesh not found: '{smplx_face_mesh_path}'. Update filename/path."); return
-    script_logger.info("Input files found. Starting pipeline...")
-    try:
-        result_mesh = MeshCleanProcess.run_face_grafting_pipeline(
-            full_body_mesh_path=full_body_mesh_path, smplx_face_mesh_path=smplx_face_mesh_path, output_path=output_path,
-            hole_boundary_smoothing_iterations=10, hole_boundary_smoothing_factor=0.5    
-        )
-    except Exception as e:
-        script_logger.error(f"Unhandled pipeline exception: {e}", exc_info=True); result_mesh = None
-    if result_mesh:
-        script_logger.info(f"--- Pipeline successful. Result V={len(result_mesh.vertices)}, F={len(result_mesh.faces)}. Saved to: {output_path} ---")
-    else:
-        script_logger.error(f"--- Pipeline failed or no result. Output might not be saved to {output_path}. Check logs. ---")
+    test_cases = [
+        {
+            "id": "Fulden",
+            "body_path": "/home/ubuntu/projects/induxr/econ_s/ECON/results/Fulden/face_thresh_0.01/econ/obj/fulden_tpose_f1_0_full_wt.obj",
+            "face_path": "/home/ubuntu/projects/induxr/econ_s/ECON/results/Fulden/face_thresh_0.01/econ/obj/fulden_tpose_f1_0_face.obj",
+        },
+        {
+            "id": "Carla",
+            "body_path": "/home/ubuntu/projects/induxr/econ_s/ECON/results/Carla/face_thresh_0.01/econ/obj/carla_Apose_0_full_wt.obj",
+            "face_path": "/home/ubuntu/projects/induxr/econ_s/ECON/results/Carla/face_thresh_0.01/econ/obj/carla_Apose_0_face.obj",
+        },
+    ]
+    
+    for i, case in enumerate(test_cases):
+        case_id = case.get("id", f"test_{i+1}")
+        script_logger.info(f"\n{'='*80}\n--- Running Test Case {i+1}/{len(test_cases)} ({case_id}) ---")
+        
+        full_body_mesh_path = case['body_path']
+        smplx_face_mesh_path = case['face_path']
+        output_path = os.path.join(output_dir, f"grafted_{case_id}.obj")
+
+        script_logger.info(f"Body Mesh: {full_body_mesh_path}")
+        script_logger.info(f"Face Mesh: {smplx_face_mesh_path}")
+        script_logger.info(f"Output: {output_path}")
+
+        if not all(os.path.exists(p) for p in [full_body_mesh_path, smplx_face_mesh_path]):
+            script_logger.error(f"One or both input files not found. Skipping case."); continue
+            
+        script_logger.info("Input files found. Starting pipeline...")
+        result_mesh = None
+        try:
+            # Pass the single dictionary to the pipeline runner
+            result_mesh = MeshCleanProcess.run_face_grafting_pipeline(
+                full_body_mesh_path=full_body_mesh_path,
+                smplx_face_mesh_path=smplx_face_mesh_path,
+                output_path=output_path,
+                **pipeline_parameters # <-- Unpack the parameters dictionary here
+            )
+        except Exception as e:
+            script_logger.error(f"Unhandled pipeline exception for this case: {e}", exc_info=True)
+        
+        if result_mesh:
+            script_logger.info(f"--- Pipeline SUCCEEDED for this case ({case_id}). Result V={len(result_mesh.vertices)}, F={len(result_mesh.faces)}. Saved to: {output_path} ---")
+        else:
+            script_logger.error(f"--- Pipeline FAILED for this case ({case_id}). Output might not be saved to {output_path}. Check logs. ---")
+            
+    script_logger.info(f"\n{'='*80}\n--- All test cases processed. ---")
 
 if __name__ == "__main__":
     main()

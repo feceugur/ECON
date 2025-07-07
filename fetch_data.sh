@@ -1,6 +1,6 @@
 #!/bin/bash
 
-output_dir="/home/ubuntu/Data/Fulden"
+output_dir="/var/locally-mounted/myshareddir/Fulden"
 
 urle () { [[ "${1}" ]] || return 1; local LANG=C i x; for (( i = 0; i < ${#1}; i++ )); do x="${1:i:1}"; [[ "${x}" == [a-zA-Z0-9.~-] ]] && echo -n "${x}" || printf '%%%02X' "'${x}"; done; echo; }
 

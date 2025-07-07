@@ -1,7 +1,7 @@
 name: econ
-ckpt_dir: "/home/ubuntu/Data/Fulden/ckpt/"
-normal_path: "/home/ubuntu/Data/Fulden/ckpt/normal.ckpt"
-ifnet_path: "/home/ubuntu/Data/Fulden/ckpt/ifnet.ckpt"
+ckpt_dir: "/var/locally-mounted/myshareddir/Fulden/ckpt/"
+normal_path: "/var/locally-mounted/myshareddir/Fulden/ckpt/normal.ckpt"
+ifnet_path: "/var/locally-mounted/myshareddir/Fulden/ckpt/ifnet.ckpt"
 results_path: "./results"
 
 net:
@@ -25,9 +25,9 @@ force_smpl_optim: True
 # normal_model could be '1b' if CUDA OOM, see apps/sapiens.py
 
 sapiens:
-  use: False
+  use: True
   seg_model: "fg-bg-1b"
-  normal_model: "2b" 
+  normal_model: "0.3b" 
 
 # For crowded / occluded scene
 # body_overlap_thres: 0.98
