@@ -26,7 +26,6 @@ class FaceGraftingConfig:
     projection_footprint_threshold: float = 0.01
     footprint_dilation_rings: int = 0
     squashed_triangle_drop_fraction: float = 0.7
-    vertex_coordinate_precision_digits: Optional[int] = 5
 
     # === Body mesh simplification ===
     body_simplification_target_faces: int = 12000
