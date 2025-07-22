@@ -1007,26 +1007,6 @@ if __name__ == "__main__":
                 ghum_lmks = view_data["landmark"][:, SMPLX_object.ghum_smpl_pairs[:, 0], :2].to(device)
                 ghum_conf = view_data["landmark"][:, SMPLX_object.ghum_smpl_pairs[:, 0], -1].to(device)
 
-                # A. Apply vertical offset (before loss calculation)
-                # This shifts SMPL landmarks down to better align with GT
-                #smpl_lmks[:, :, 1] = smpl_lmks[:, :, 1] + 0.03  # Shift down by 2% of image height
-
-                # Save landmark visualization
-                """
-                if frame_id == 0 or frame_id == 1 or frame_id == 6 or frame_id ==7:
-                    os.makedirs(os.path.join(save_vis_dir, f"landmarks_{frame_id}"), exist_ok=True)
-                    save_path = os.path.join(save_vis_dir, f"landmarks_{frame_id}/landmarks_view_{frame_id}_iter_{i:03d}.png")
-                    visualize_landmarks_detailed(
-                        view_data["img_icon"].to(device),
-                        view_data["smpl_verts"],  # or smpl_verts if already in view space
-                        None,           # faces (optional, not used in this scatter version)
-                        smpl_lmks,
-                        ghum_lmks,
-                        ghum_conf,
-                        save_path
-                    )
-                """
-                
                 # Compute landmark loss with confidence weighting
                 valid_landmarks = ghum_conf > 0.5
                 if valid_landmarks.any():
@@ -1050,70 +1030,6 @@ if __name__ == "__main__":
                 sil_loss = diff_S.mean()
                 normal_loss = (torch.abs(view_data["T_normal_F"]) - torch.abs(view_data["normal_F"])).mean()
                 #normal_loss = torch.abs(view_data["T_normal_F"]).mean()
-
-                """
-                if i%2 == 0:
-                    normal_diff = torch.abs(view_data["T_normal_F"] - view_data["normal_F"]).detach().cpu().numpy()
-                    if normal_diff.shape[0] == 1:  # Assuming batch size of 1
-                        normal_diff = normal_diff[0].transpose(1, 2, 0)  # Convert to HWC
-                        normal_diff_mean = np.abs(normal_diff).mean(axis=2)  # Mean across channels for grayscale
-                        v_min, v_max = np.percentile(normal_diff_mean, [5, 95])  # Use 5th and 95th percentiles
-                        normal_diff_scaled = np.clip((normal_diff_mean - v_min) / (v_max - v_min) * 255, 0, 255).astype(np.uint8)
-                        normal_diff_colored = cv2.applyColorMap(normal_diff_scaled, cv2.COLORMAP_JET)
-                        save_path = os.path.join(args.out_dir, cfg.name, "png", f'normal_loss_contribution_{view_data["name"]}_iter_{i}.png')
-                        cv2.imwrite(save_path, normal_diff_colored)
-
-                ### METRICS: Capture individual loss components for this view
-                if i == 0:
-                    # For Silhouette IoU (a better metric than L1 for tables)
-                    rendered_mask = (view_data["T_mask_F"] > 0).bool()
-                    gt_mask = (view_data["img_mask"].to(device) > 0.5).bool()
-                    intersection = torch.sum(rendered_mask & gt_mask).float()
-                    union = torch.sum(rendered_mask | gt_mask).float()
-                    iou = intersection / (union + 1e-8)
-                    first_iter_losses[f'{view_data["name"]}_silhouette_iou'].append(iou.item())
-                    first_iter_losses[f'{view_data["name"]}_landmark_error_px'].append(landmark_loss.item())
-                    first_iter_losses[f'{view_data["name"]}_sil_l1_loss'].append(sil_loss.item())
-                    first_iter_losses[f'{view_data["name"]}_normal_loss'].append(normal_loss.item())
-                    first_iter_losses[f'{view_data["name"]}_head_roll_loss'].append(head_roll_loss.item())
-                    first_iter_losses[f'{view_data["name"]}_total_loss'].append(view_total_loss.item())
-                
-                if i == 26:
-                    rendered_mask = (view_data["T_mask_F"] > 0).bool()
-                    gt_mask = (view_data["img_mask"].to(device) > 0.5).bool()
-                    intersection = torch.sum(rendered_mask & gt_mask).float()
-                    union = torch.sum(rendered_mask | gt_mask).float()
-                    iou = intersection / (union + 1e-8)
-                    print(f"{view_data['name']} IoU: {iou.item()}")
-                    
-
-                if i == args.loop_smpl - 1:
-                    # For Silhouette IoU (a better metric than L1 for tables)
-                    rendered_mask = (view_data["T_mask_F"] > 0).bool()
-                    gt_mask = (view_data["img_mask"].to(device) > 0.5).bool()
-                    intersection = torch.sum(rendered_mask & gt_mask).float()
-                    union = torch.sum(rendered_mask | gt_mask).float()
-                    iou = intersection / (union + 1e-8)
-                    last_iter_losses[f'{view_data["name"]}_silhouette_iou'].append(iou.item())
-                    last_iter_losses[f'{view_data["name"]}_landmark_error_px'].append(landmark_loss.item())
-                    last_iter_losses[f'{view_data["name"]}_sil_l1_loss'].append(sil_loss.item())
-                    last_iter_losses[f'{view_data["name"]}_normal_loss'].append(normal_loss.item())
-                    last_iter_losses[f'{view_data["name"]}_head_roll_loss'].append(head_roll_loss.item())
-                    last_iter_losses[f'{view_data["name"]}_total_loss'].append(view_total_loss.item())
-                    print(f"{view_data['name']} IoU: {iou.item()}")
-                    
-                    # Visualize normal loss contributions
-                    normal_diff = torch.abs(view_data["T_normal_F"] - view_data["normal_F"]).detach().cpu().numpy()
-                    if normal_diff.shape[0] == 1:  # Assuming batch size of 1
-                        normal_diff = normal_diff[0].transpose(1, 2, 0)  # Convert to HWC
-                        normal_diff_mean = np.abs(normal_diff).mean(axis=2)  # Mean across channels for grayscale
-                        v_min, v_max = np.percentile(normal_diff_mean, [5, 95])  # Use 5th and 95th percentiles
-                        normal_diff_scaled = np.clip((normal_diff_mean - v_min) / (v_max - v_min) * 255, 0, 255).astype(np.uint8)
-                        normal_diff_colored = cv2.applyColorMap(normal_diff_scaled, cv2.COLORMAP_JET)  # Use JET colormap
-                        save_path = os.path.join(args.out_dir, cfg.name, "png", f'normal_loss_contribution_{view_data["name"]}_iter_{i}.png')
-                        cv2.imwrite(save_path, normal_diff_colored)
-                    """
-
 
                 # Combine all losses with appropriate weights
                 view_total_loss = sil_loss + 0.2 * normal_loss + 0.1 * landmark_loss + 0.3 * head_roll_loss
@@ -1152,98 +1068,6 @@ if __name__ == "__main__":
                 torchvision.utils.save_image(combined_panel, save_path_panel)
 
         # === After optimization ===
-        # === Plot and save loss curve ===
-        plt.figure(figsize=(6, 4))
-        plt.plot(loss_values, color='blue', linewidth=2)
-        plt.xlabel("Iteration", fontsize=12)
-        plt.ylabel("Loss", fontsize=12)
-        plt.title("SMPL Optimization Loss", fontsize=14)
-        plt.grid(True)
-        plt.tight_layout()
-
-        # Save to file
-        loss_curve_path = os.path.join(args.out_dir, cfg.name, "loss_curve.png")
-        plt.savefig(loss_curve_path)
-        plt.close()
-
-        print(colored(f"📉 Saved loss curve to {loss_curve_path}", "cyan"))
-        
-        """
-
-        # ==============================================================================
-        # FINAL STEP: PROCESS COLLECTED LOSSES AND GENERATE THE COMPARISON TABLE
-        # ==============================================================================
-        print(colored("\n[3/3] Generating final quantitative comparison table...", "cyan"))
-
-        # This list will hold the structured data for our DataFrame
-        data_for_df = []
-
-        # Helper function to parse the dictionaries and populate our list
-        def process_metrics_dict(stage_name, metrics_dict, multi_view_data):
-            
-            #Parses a loss dictionary and adds structured rows to the data_for_df list.
-            
-            for view_data in multi_view_data:
-                view_name = view_data["name"]
-                frame_id = int(view_name.split("_")[1])
-
-                # Safely get values from the dictionary, defaulting to 0 if a key is missing
-                # The [0] is because your values are stored in a list
-                iou = metrics_dict.get(f'{view_name}_silhouette_iou', [0])[0]
-                lmk_px = metrics_dict.get(f'{view_name}_landmark_error_px', [0])[0]
-                normal_loss = metrics_dict.get(f'{view_name}_normal_loss', [0])[0]
-                head_roll_loss = metrics_dict.get(f'{view_name}_head_roll_loss', [0])[0]
-                total_loss = metrics_dict.get(f'{view_name}_total_loss', [0])[0]
-
-                data_for_df.append({
-                    'Stage': stage_name,
-                    'View': frame_id,
-                    'Silhouette IoU ↑': iou,
-                    'Landmark Error (px) ↓': lmk_px,
-                    'Normal Loss ↓': normal_loss,
-                    'Head Roll Loss ↓': head_roll_loss,
-                    'Total Loss ↓': total_loss,
-                })
-
-        # Process each of the three stages
-        process_metrics_dict('1. Initial Per-View', before_mean_losses, multi_view_data)
-        process_metrics_dict('2. After Mean (Iter 0)', first_iter_losses, multi_view_data)
-        process_metrics_dict('3. Final Optimized', last_iter_losses, multi_view_data)
-
-        # Create a pandas DataFrame from our list of structured data
-        df = pd.DataFrame(data_for_df)
-
-        # Create a pivot table for a clean, multi-level indexed presentation
-        # This is the format you wanted
-        df_pivot = df.pivot_table(
-            index=['Stage', 'View'],
-            values=['Silhouette IoU ↑', 'Landmark Error (px) ↓', 'Normal Loss ↓', 'Head Roll Loss ↓', 'Total Loss ↓']
-        )
-
-        # Ensure the columns are in a logical order
-        df_pivot = df_pivot[['Silhouette IoU ↑', 'Landmark Error (px) ↓', 'Normal Loss ↓', 'Head Roll Loss ↓', 'Total Loss ↓']]
-
-        # Sort the table by Stage (as a categorical type to maintain order) and then by View
-        df_pivot.index = df_pivot.index.set_levels(
-            pd.Categorical(df_pivot.index.levels[0], categories=['1. Initial Per-View', '2. After Mean (Iter 0)', '3. Final Optimized'], ordered=True),
-            level=0
-        )
-        df_pivot.sort_index(inplace=True)
-
-
-        # Print the final, formatted table to the console
-        print("\n" + "="*80)
-        print(f" SMPL Optimization Quantitative Analysis: {multi_view_data[0]['name'].split('_')[0]}")
-        print("="*80)
-        print(df_pivot.to_string(float_format="%.5f"))
-        print("="*80)
-
-        # Save the table to a CSV file for easy use in your thesis
-        csv_path = os.path.join(args.out_dir, cfg.name, "obj", f"{multi_view_data[0]['name'].split('_')[0]}_smpl_optimization_metrics.csv")
-        df_pivot.to_csv(csv_path)
-        print(colored(f"✅ Saved detailed metrics table to {csv_path}", "green"))
-        """
-
         save_obj_path = os.path.join(args.out_dir, cfg.name, "obj", "final_smpl.obj")
         final_smpl_obj = trimesh.Trimesh(
             smpl_verts[0].detach().cpu() * torch.tensor([1.0, -1.0, 1.0]),
@@ -1305,33 +1129,6 @@ if __name__ == "__main__":
             img_norm_path_f = osp.join(args.out_dir, cfg.name, "png", f"{view_data['name']}_normal_{frame_id}.png")
             torchvision.utils.save_image((view_data["normal_F"].detach().cpu()), img_norm_path_f) 
             normal_map = view_data["normal_F"].squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
-            """
-            # Save front-view-space normal map
-            # Get transformation for this view
-            frame_id = int(view_data["name"].split("_")[1])
-            
-            # Get transformation from current view to front view
-            T_current_to_first = transform_manager.get_transform_to_target(frame_id)  # current to first view
-            T_front_to_first = transform_manager.get_transform_to_target(front_view)  # front to first view
-            
-            # Calculate transformation from current view to front view: T_current_to_front = T_front_to_first^-1 * T_current_to_first
-            T_front_to_first_inv = torch.linalg.inv(T_front_to_first)
-            T_current_to_front = T_front_to_first_inv @ T_current_to_first
-            R_current_to_front = T_current_to_front[:3, :3]  # 3x3 rotation matrix
-
-            # Transform normals to front view space
-            front_normal_map = transform_normals(normal_map, R_current_to_front)
-
-            # Save front-view-space normal map
-            front_norm_path = osp.join(args.out_dir, cfg.name, "png", f"{view_data['name']}_normal_front_{frame_id}.png")
-            
-            # Convert from [-1, 1] to [0, 1] range for proper visualization
-            front_normal_vis = (front_normal_map + 1.0) / 2.0
-            front_normal_vis = np.clip(front_normal_vis, 0.0, 1.0)
-            
-            front_normal_tensor = torch.from_numpy(front_normal_vis).permute(2, 0, 1).unsqueeze(0)
-            torchvision.utils.save_image(front_normal_tensor, front_norm_path)
-            """
 
             # Get SMPL depth as proxy
             view_data["depth_F"], view_data["depth_B"] = dataset.render_depth(

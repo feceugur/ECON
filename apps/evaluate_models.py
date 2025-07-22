@@ -83,15 +83,17 @@ if __name__ == "__main__":
 
     updated_econ_filename = 'ext_econ.obj'
     econ_full_filename = 'econ_full.obj'
+    ext_econ_double_filename = 'frame_0007_iter_100.obj'
     # --- Construct full paths ---
     gt_path = os.path.join(args.input_dir, gt_filename)
     updated_econ_path = os.path.join(args.input_dir, updated_econ_filename)
     econ_full_path = os.path.join(args.input_dir, econ_full_filename)
-
+    ext_econ_double_path = os.path.join(args.input_dir, ext_econ_double_filename)
     # Check if all files exist
-    if not all(os.path.exists(p) for p in [gt_path, updated_econ_path, econ_full_path]):
+    if not all(os.path.exists(p) for p in [gt_path, updated_econ_path, econ_full_path, ext_econ_double_path]):
         print("Error: One or more required files are missing from the directory.")
         print(f"Looking for: {gt_filename}, {updated_econ_filename}, {econ_full_filename}")
+        print(f"Looking for: {gt_filename}, {updated_econ_filename}, {econ_full_filename}, {ext_econ_double_filename}")
         exit()
 
     all_results = []
@@ -101,19 +103,26 @@ if __name__ == "__main__":
         gt_mesh = trimesh.load(gt_path, process=False)
         updated_econ_mesh = trimesh.load(updated_econ_path, process=False)
         econ_full_mesh = trimesh.load(econ_full_path, process=False)
-        
+        ext_econ_double_mesh = trimesh.load(ext_econ_double_path, process=False)
         print("Calculating metrics for after Side Surface Refinement (ext_econ.obj)...")
         updated_econ_metrics = calculate_metrics(updated_econ_mesh, gt_mesh)
-        updated_econ_metrics['model'] = 'Ours (Ext. ECON)'
+        updated_econ_metrics['model'] = 'Ours (exECON)'
         updated_econ_metrics['subject'] = os.path.basename(args.input_dir)
 
         print("Calculating metrics for Original ECON (econ_full.obj)...")
         econ_full_metrics = calculate_metrics(econ_full_mesh, gt_mesh)
         econ_full_metrics['model'] = 'Original ECON'
         econ_full_metrics['subject'] = os.path.basename(args.input_dir)
+
+
+        print("Calculating metrics for Double Ext. ECON (exEcon_double.obj)...")
+        ext_econ_double_metrics = calculate_metrics(ext_econ_double_mesh, gt_mesh)
+        ext_econ_double_metrics['model'] = 'Double View exECON'
+        ext_econ_double_metrics['subject'] = os.path.basename(args.input_dir)
         
         all_results.append(updated_econ_metrics)
-        all_results.append(econ_full_metrics)
+        all_results.append(econ_full_metrics)        
+        all_results.append(ext_econ_double_metrics)
 
     except Exception as e:
         print(f"An error occurred during evaluation: {e}")

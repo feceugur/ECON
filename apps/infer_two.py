@@ -80,7 +80,7 @@ if __name__ == "__main__":
 
     cfg.merge_from_list(cfg_show_list)
     cfg.freeze()
-    normal_path = "/home/ubuntu/Data/Fulden/ckpt/normal.ckpt"
+    normal_path = "/var/locally-mounted/myshareddir/Fulden/ckpt/normal.ckpt"
     # load normal model
     normal_net = Normal.load_from_checkpoint(
         cfg=cfg, checkpoint_path=normal_path, map_location=device, strict=False
