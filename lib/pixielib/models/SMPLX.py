@@ -137,7 +137,7 @@ class SMPLX(nn.Module):
     def __init__(self, config):
         super(SMPLX, self).__init__()
         # print("creating the SMPLX Decoder")
-        datafile_path = "/home/ubuntu/Data/Fulden/"
+        datafile_path = "/var/locally-mounted/myshareddir/Fulden//"
         ss = np.load(datafile_path + "HPS/pixie_data/SMPLX_NEUTRAL_2020.npz", allow_pickle=True)
         smplx_model = Struct(**ss)
 

@@ -5,17 +5,17 @@ from PIL import Image
 from torchvision import transforms
 from huggingface_hub import snapshot_download
 
-os.environ["HF_HOME"] = "/home/ubuntu/Data/Fulden/sapiens"
+os.environ["HF_HOME"] = "/var/locally-mounted/myshareddir/Fulden//sapiens"
 class Config:
     ASSETS_DIR = os.path.join(
         snapshot_download(
             repo_id="facebook/sapiens-normal",
             repo_type="space",
-            cache_dir="/home/ubuntu/Data/Fulden/sapiens"
+            cache_dir="/var/locally-mounted/myshareddir/Fulden//sapiens"
         ),
         'assets'
     )
-    CHECKPOINTS_DIR = "/home/ubuntu/Data/Fulden/sapiens/spaces--facebook--sapiens-normal/snapshots/69445cc36a49af657aaa25c86f747c5fc01d3e69/assets/checkpoints/"  # Custom directory for checkpoints
+    CHECKPOINTS_DIR = "/var/locally-mounted/myshareddir/Fulden//sapiens/spaces--facebook--sapiens-normal/snapshots/69445cc36a49af657aaa25c86f747c5fc01d3e69/assets/checkpoints/"  # Custom directory for checkpoints
     
     # Define checkpoint paths within the custom directory
     CHECKPOINTS = {
@@ -26,7 +26,7 @@ class Config:
     }
     
     # Custom directory for segmentation checkpoints
-    SEG_CHECKPOINTS_DIR = "/home/ubuntu/Data/Fulden/sapiens/spaces--facebook--sapiens-normal/snapshots/69445cc36a49af657aaa25c86f747c5fc01d3e69/assets/checkpoints/"  # Custom directory for segmentation models
+    SEG_CHECKPOINTS_DIR = "/var/locally-mounted/myshareddir/Fulden//sapiens/spaces--facebook--sapiens-normal/snapshots/69445cc36a49af657aaa25c86f747c5fc01d3e69/assets/checkpoints/"  # Custom directory for segmentation models
     
     # Define segmentation checkpoint paths within the custom directory
     SEG_CHECKPOINTS = {

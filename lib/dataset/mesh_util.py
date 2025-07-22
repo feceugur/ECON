@@ -44,7 +44,7 @@ class SMPLX:
     def __init__(self):
 
         self.current_dir = osp.join(osp.dirname(__file__), "../../data/smpl_related")
-        self.data_dir = osp.join("/home/ubuntu/Data/Fulden")
+        self.data_dir = osp.join("/var/locally-mounted/myshareddir/Fulden/")
         #self.smpl_verts_path = osp.join(self.current_dir, "smpl_data/smpl_verts.npy")
         self.smpl_verts_path = osp.join(self.data_dir, "smpl_related/smpl_verts.npy")
         self.smpl_faces_path = osp.join(self.data_dir, "smpl_related/smpl_faces.npy")
