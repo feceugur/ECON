@@ -13,7 +13,7 @@ abs_pixie_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".
 cfg.pixie_dir = abs_pixie_dir
 cfg.device = "cuda"
 cfg.device_id = "0"
-cfg.datafile_dir = "/home/ubuntu/Data/Fulden"
+cfg.datafile_dir = "/var/locally-mounted/myshareddir/Fulden/"
 cfg.pretrained_modelpath = os.path.join(cfg.datafile_dir, "HPS/pixie_data", "pixie_model.tar")
 # smplx parameter settings
 cfg.params = CN()

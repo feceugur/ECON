@@ -308,7 +308,7 @@ class Render:
                 images = (images[:, :, :, :3].permute(0, 3, 1, 2) - 0.5) * 2.0
 
             elif type == "mask":
-                images = self.renderer(current_mesh.extend(len(self.cam_pos[cam_type])))[:, :, :, 3]
+                    images = self.renderer(current_mesh.extend(len(self.cam_pos[cam_type])))[:, :, :, 3]
             else:
                 print(f"unknown {type}")
 
