@@ -26,7 +26,6 @@ class FaceGraftingConfig:
     projection_footprint_threshold: float = 0.01
     footprint_dilation_rings: int = 0
     squashed_triangle_drop_fraction: float = 0.7
-    vertex_coordinate_precision_digits: Optional[int] = 5
 
     # === Body mesh simplification ===
     body_simplification_target_faces: int = 12000
@@ -49,7 +48,7 @@ class FaceGraftingConfig:
 
     # === Cleaning & debug options ===
     use_open3d_cleaning: bool = False
-    save_debug_body_with_hole: bool = True
+    save_debug_body_with_hole: bool = False
     debug_smply_integrity_trace: bool = True
 
 
@@ -653,75 +652,69 @@ class FaceGraftingPipeline:
         if self.config.footprint_dilation_rings > 0 and np.any(self.faces_to_remove_mask_on_body):
             logger.info(f"Dilating footprint by {self.config.footprint_dilation_rings} ring(s)...")
             adj = self.simplified_body_trimesh.face_adjacency
-            current_wavefront = self.faces_to_remove_mask_on_body.copy()
             for _ in range(self.config.footprint_dilation_rings):
-                wave_indices = np.where(current_wavefront)[0]
-                if not wave_indices.size: break
-                all_neighbors_this_ring = adj[np.isin(adj, wave_indices).any(axis=1)].flatten()
-                unique_neigh = np.unique(all_neighbors_this_ring)
-                new_to_add = unique_neigh[~self.faces_to_remove_mask_on_body[unique_neigh]]
-                if not new_to_add.size: break
-                self.faces_to_remove_mask_on_body[new_to_add] = True
-                current_wavefront.fill(False); current_wavefront[new_to_add] = True
+                wavefront_indices = np.where(self.faces_to_remove_mask_on_body)[0]
+                if not wavefront_indices.size: break
+                neighbor_faces = adj[np.isin(adj, wavefront_indices).any(axis=1)]
+                self.faces_to_remove_mask_on_body[np.unique(neighbor_faces)] = True
 
-        # --- MODIFIED LOGIC: REMOVE FACES AND IMMEDIATELY ISOLATE LARGEST COMPONENT ---
+        # --- NEW, ROBUST PROCESSING SEQUENCE ---
+        
+        # 1. Cut the hole
         current_mesh = self.simplified_body_trimesh.copy()
         if np.any(self.faces_to_remove_mask_on_body):
-            # 1. Apply the (potentially messy) removal mask
             current_mesh.update_faces(~self.faces_to_remove_mask_on_body)
             current_mesh.remove_unreferenced_vertices()
-            
-            # 2. Split the result into all its parts (main body + floating islands)
-            logger.info("Isolating main body component to remove floating face islands...")
-            components = current_mesh.split(only_watertight=False)
-            
-            # 3. Robustly find the largest component and discard the rest
-            actual_components_list = [c for c in np.atleast_1d(components) if c is not None and not c.is_empty]
-            if len(actual_components_list) > 1:
-                logger.info(f"Found {len(actual_components_list)} components after removal. Keeping largest.")
-                current_mesh = max(actual_components_list, key=lambda c: len(c.faces))
-            elif actual_components_list:
-                current_mesh = actual_components_list[0]
-            else:
-                logger.warning("Splitting after face removal resulted in no valid components.")
-                current_mesh = trimesh.Trimesh() # Create empty mesh if all else fails
         else:
             logger.warning("No faces were marked for removal.")
-        # --- END OF MODIFIED LOGIC ---
 
-        self._debug_log_and_save(current_mesh, "01", "AfterFaceRemovalAndSplit")
-
-        logger.info("Forcing mesh re-processing to update internal state...")
+        # 2. Force re-processing to ensure a valid internal state
+        logger.info("Re-processing mesh after hole cutting...")
         current_mesh = trimesh.Trimesh(vertices=current_mesh.vertices, faces=current_mesh.faces, process=True)
-        self._debug_log_and_save(current_mesh, "02", "AfterReprocessing")
 
+        # 3. Aggressively clean to detach any non-manifold "floating" faces
+        logger.info("Cleaning mesh to detach floating islands...")
+        cleaned_mesh = self._thoroughly_clean_trimesh_object(current_mesh.copy(), "BodyWithHolePreSplit", self.INTERNAL_VERSION_TRACKER)
+        if cleaned_mesh:
+            current_mesh = cleaned_mesh
+
+        # 4. Split to remove the now-detached floating islands
+        components_result = current_mesh.split(only_watertight=False)
+        actual_components_list = [c for c in np.atleast_1d(components_result) if c is not None and not c.is_empty]
+        if len(actual_components_list) > 1:
+            logger.info(f"Found {len(actual_components_list)} components; removing floating islands.")
+            current_mesh = max(actual_components_list, key=lambda c: len(c.faces))
+
+        # 5. Fill any remaining secondary holes
         loops = MeshCleanProcess.get_all_boundary_loops(current_mesh, min_loop_len=3)
         if len(loops) > 1:
-            logger.warning(f"Detected {len(loops)} holes, attempting to fill all but the largest.")
+            logger.warning(f"Detected {len(loops)} holes; filling all but the largest.")
             filled_mesh = self._close_smplx_holes_by_fan_fill(current_mesh)
             if filled_mesh:
                 current_mesh = filled_mesh
-        self._debug_log_and_save(current_mesh, "04", "AfterHoleFill")
 
+        # 6. Smooth the final, single hole boundary
         self.body_with_hole_trimesh = current_mesh
-        if self._smooth_main_hole_boundary():
-             current_mesh = self.body_with_hole_trimesh
-        self._debug_log_and_save(current_mesh, "05", "AfterSmoothing")
-
-        cleaned_mesh = self._thoroughly_clean_trimesh_object(current_mesh.copy(), "BodyWithHoleClean", self.INTERNAL_VERSION_TRACKER)
-        if cleaned_mesh:
-            current_mesh = cleaned_mesh
-        self._debug_log_and_save(current_mesh, "06", "AfterFinalClean")
-
-        self.body_with_hole_trimesh = current_mesh
+        if not self._smooth_main_hole_boundary():
+            logger.warning("Hole boundary smoothing failed or was skipped.")
+        
+        # Final assignment
+        self.body_with_hole_trimesh = self.body_with_hole_trimesh
         
         if not MeshCleanProcess._is_mesh_valid_for_concat(self.body_with_hole_trimesh, "FinalBodyWHole"):
             logger.critical("Final Body-with-hole mesh is invalid. Aborting.")
             return False
 
         logger.info(f"Finished body_with_hole creation. V={len(self.body_with_hole_trimesh.vertices)}, F={len(self.body_with_hole_trimesh.faces)}")
+        
+        if self.config.save_debug_body_with_hole:
+            base_name, _ = os.path.splitext(self.output_path)
+            debug_path = f"{base_name}_debug_body_with_hole.obj"
+            self.body_with_hole_trimesh.export(debug_path)
+            logger.info(f"Saved debug body with hole to: {debug_path}")
+
         return True
-    
+
     def _extract_smplx_face_loop(self) -> bool:
         if not self.original_smplx_face_geom_tri: return False
         # logger.info("Extracting SMPLX face loop.") 
@@ -1090,7 +1083,7 @@ class FaceGraftingPipeline:
         strip = self._create_loft_stitch_mesh_zipper()
         if self._is_stitch_strip_valid(strip):
             stitched = _assemble(strip)
-            _save_debug_stitch(stitched, "zipper")
+            # _save_debug_stitch(stitched, "zipper")
             if stitched and self._verify_seam_closure_on_mesh(stitched, "ZipperResult"):
                 self.stitched_mesh_intermediate = stitched
                 return True
@@ -1103,7 +1096,7 @@ class FaceGraftingPipeline:
         strip = self._create_loft_stitch_mesh_resample_body()
         if self._is_stitch_strip_valid(strip):
             stitched = _assemble(strip)
-            _save_debug_stitch(stitched, "body_resample")
+            # _save_debug_stitch(stitched, "body_resample")
             if stitched and self._verify_seam_closure_on_mesh(stitched, "BodyResampleResult"):
                 self.stitched_mesh_intermediate = stitched
                 return True
@@ -1116,7 +1109,7 @@ class FaceGraftingPipeline:
         strip = self._create_loft_stitch_mesh_projection()
         if strip:
             stitched = _assemble(strip)
-            _save_debug_stitch(stitched, "projection")
+            # _save_debug_stitch(stitched, "projection")
             if stitched:
                 logger.info("SUCCESS: Fallback Projection method assembled a mesh.")
                 self.stitched_mesh_intermediate = stitched
@@ -1786,28 +1779,25 @@ class FaceGraftingPipeline:
             logger.critical("Cannot save final mesh: Mesh is invalid or missing.")
             return False
 
-        # --- STEP 1: Unconditionally save the file ---
         logger.info(f"--- Saving final processed mesh to: {self.output_path} ---")
         try:
             self.final_processed_mesh.export(self.output_path)
             logger.info("File saved successfully.")
         except Exception as e:
             logger.critical(f"Failed to export the final mesh: {e}", exc_info=True)
-            return False # The save operation itself failed.
+            return False
 
-        # --- STEP 2: Perform the quality check and report on it ---
         logger.info("--- Performing Final Watertightness Check on Saved Mesh ---")
         
         if self.final_processed_mesh.is_watertight:
             logger.info("SUCCESS: The saved mesh is watertight.")
-            return True # The pipeline's goal was met.
+            return True
         else:
             logger.warning("--- WATERTIGHTNESS CHECK FAILED ---")
             logger.warning("The saved mesh is NOT watertight, but the file was saved as requested.")
             
-            # Use a robust try-except block for diagnostics
+            # --- IMPROVED DIAGNOSTICS ---
             try:
-                # This block will ONLY run if the necessary attributes exist.
                 is_manifold = self.final_processed_mesh.is_manifold
                 boundary_edge_count = len(self.final_processed_mesh.boundary_edges)
                 
@@ -1817,16 +1807,16 @@ class FaceGraftingPipeline:
                     logger.warning("  - Diagnostics: Mesh is not manifold (e.g., contains edges shared by more than two faces).")
             
             except AttributeError:
-                # If ANY attribute is missing, fall back to a generic message.
-                logger.warning("  - Detailed diagnostics unavailable for this Trimesh version.")
+                logger.warning("  - Detailed diagnostics unavailable because the mesh object is in an unprocessed state.")
+            # --- END IMPROVED DIAGNOSTICS ---
 
-            # Return False to indicate the watertightness GOAL was not met.
             return False
-                        
+
     def _retain_largest_component_only(self) -> bool:
         """
         Ensures the mesh consists of only one single connected component by
         discarding any smaller, disconnected "islands" of geometry.
+        This version ensures the resulting mesh is fully processed.
         """
         logger.info("--- Verifying mesh consists of a single connected component ---")
         if not self.final_processed_mesh or self.final_processed_mesh.is_empty:
@@ -1835,18 +1825,26 @@ class FaceGraftingPipeline:
         mesh_before_split = self.final_processed_mesh.copy()
         
         try:
-            # The split operation returns a list of Trimesh objects
             components = self.final_processed_mesh.split(only_watertight=False)
             
             if len(components) > 1:
                 logger.warning(f"Found {len(components)} disconnected components. Retaining only the largest.")
                 
-                # Find the largest component by number of faces
                 largest_component = max(components, key=lambda c: len(c.faces))
                 
                 if MeshCleanProcess._is_mesh_valid_for_concat(largest_component, "LargestComponent"):
-                    self.final_processed_mesh = largest_component
-                    logger.info("Successfully isolated the largest mesh component.")
+                    # --- THE DEFINITIVE FIX ---
+                    # Re-create the Trimesh object from its core data with process=True.
+                    # This forces a full build of all internal graph data, making
+                    # properties like .is_watertight and .boundary_edges reliable.
+                    logger.info("Re-processing the largest component to ensure graph integrity...")
+                    self.final_processed_mesh = trimesh.Trimesh(
+                        vertices=largest_component.vertices,
+                        faces=largest_component.faces,
+                        process=True
+                    )
+                    logger.info("Successfully isolated and processed the main mesh component.")
+                    # --- END OF FIX ---
                 else:
                     logger.error("The largest component was invalid after splitting. Reverting.")
                     self.final_processed_mesh = mesh_before_split
@@ -1860,7 +1858,7 @@ class FaceGraftingPipeline:
             logger.error(f"An error occurred during component splitting: {e}", exc_info=True)
             self.final_processed_mesh = mesh_before_split
             return False
-
+            
     def process(self) -> Optional[trimesh.Trimesh]:
         """
         Executes the full face grafting pipeline.
@@ -1881,15 +1879,18 @@ class FaceGraftingPipeline:
             self._fill_seam_holes_by_fan() 
             self._apply_final_polish()
 
-            # --- REORDERED VERIFICATION STEPS (AS REQUESTED) ---
-            # 1. Verify SMPLX integrity on the fully assembled mesh BEFORE component splitting.
-            self._verify_smplx_face_integrity()
+            # --- SMPLX INTEGRITY CHECK (MOVED) ---
+            # Verify the graft BEFORE removing disconnected components like eyes.
+            # This checks the fully assembled mesh.
+            if not self._verify_smplx_face_integrity():
+                logger.critical("SMPLX face integrity check failed after stitching and polishing. Aborting before component splitting.")
+                return None
+            # --- END OF MOVED BLOCK ---
 
-            # 2. Retain only the largest component.
+            # Now that the graft is verified, it's safe to remove the eyes/other components.
             self._retain_largest_component_only()
-            # --- END OF REORDERED STEPS ---
-
-            self._save_and_check_debug_vertices(self.final_processed_mesh, "04_after_component_filter")
+            
+            self._save_and_check_debug_vertices(self.final_processed_mesh, "07_after_component_filter")
             
             if self._final_watertightness_check_and_save():
                 pipeline_ok = True
@@ -1897,7 +1898,7 @@ class FaceGraftingPipeline:
             else:
                 return None
             
-            # The seam closure check is still performed on the final, saved mesh.
+            # Seam closure is still a relevant final check on the main body.
             self._verify_seam_closure()
             
             return final_mesh_for_return
@@ -1908,7 +1909,7 @@ class FaceGraftingPipeline:
             self._cleanup_temp_files()
             if not pipeline_ok: 
                 logger.error(f"Pipeline V{self.INTERNAL_VERSION_TRACKER} did not complete successfully.")
-                                
+                
     @staticmethod
     def _iterative_non_manifold_repair_pml_aggressive(
         input_mesh: trimesh.Trimesh,
