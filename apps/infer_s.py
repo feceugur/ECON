@@ -1,46 +1,39 @@
-# region IMPORTS
+# TIDIED
 import argparse
 import logging
 import os
 import os.path as osp
+import shutil
 import warnings
-import shutil # Import shutil for robust directory deletion
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
+from torchvision.transforms import ToPILImage
 import trimesh
 from pytorch3d.ops import SubdivideMeshes
 from pytorch3d.structures import Meshes
-from scipy.spatial import cKDTree
 from termcolor import colored
 from tqdm.auto import tqdm
 
-# Local Application Imports
+# Local modules
 from apps.IFGeo import IFGeo
 from apps.Normal_f import Normal
 from apps.clean_mesh import MeshCleanProcess
-from apps.face_rig_exporter import FaceRigExporter
 from apps.sapiens import ImageProcessor
 from lib.common.BNI import BNI
 from lib.common.BNI_utils import save_normal_tensor
 from lib.common.config import cfg
-from lib.common.imutils import blend_rgb_norm, load_img, transform_to_tensor, wrap
+from lib.common.imutils import blend_rgb_norm
 from lib.common.local_affine import register
-from lib.common.render import query_color
 from lib.common.train_util import Format, init_loss
 from lib.common.voxelize import VoxelGrid
 from lib.dataset.TestDataset_f import TestDataset
 from lib.dataset.mesh_util import *
 from lib.net.geometry import rot6d_to_rotmat, rotation_matrix_to_angle_axis
 import lib.smplx as smplx
-from lib.smplx.lbs import general_lbs
 
-# endregion
-
-# region SETUP
-# Suppress warnings and logs for cleaner output
 warnings.filterwarnings("ignore")
 logging.getLogger("lightning").setLevel(logging.ERROR)
 logging.getLogger("trimesh").setLevel(logging.ERROR)
@@ -49,8 +42,6 @@ logging.getLogger("trimesh").setLevel(logging.ERROR)
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-# endregion
-
 
 def parse_args():
     """Parses command-line arguments."""
@@ -270,62 +261,75 @@ def angle_axis_to_rotation_matrix(angle_axis: torch.Tensor) -> torch.Tensor:
     R = I + sin_angle.unsqueeze(-1) * K + (1 - cos_angle.unsqueeze(-1)) * torch.matmul(K, K)
     return R
 
+# In apps/infer_s.py
 
-def get_facial_landmarks_from_mesh(
-    dense_mesh: trimesh.Trimesh, smplx_model, smpl_params: dict, device: torch.device
-) -> (np.ndarray, np.ndarray):
+def extract_landmarks_from_smplx_params(
+    smpl_params: dict, smplx_model, cfg: object, device: torch.device
+) -> np.ndarray: # <-- Add cfg to the signature
     """
-    Identifies facial landmark vertices on a dense mesh by finding the nearest
-    neighbors to the landmarks of a registered SMPL-X model.
+    Calculates the 68 3D facial landmarks directly from SMPL-X parameters.
+    ... (docstring remains the same) ...
     """
-    # 1. Load parameters and move to the device.
+    # 1. Load parameters and move to the correct device
     betas = torch.tensor(smpl_params["betas"], dtype=torch.float32, device=device)
     expression = torch.tensor(smpl_params["expression"], dtype=torch.float32, device=device)
     transl = torch.tensor(smpl_params["transl"], dtype=torch.float32, device=device)
+    scale = torch.tensor(smpl_params.get("scale", 1.0), dtype=torch.float32, device=device)
 
-    # 2. Convert all axis-angle pose parameters to rotation matrices.
-    B = betas.shape[0]
-    all_poses = {
-        name: torch.tensor(smpl_params[name], dtype=torch.float32, device=device)
-        for name in ["global_orient", "body_pose", "jaw_pose", "left_hand_pose", "right_hand_pose"]
-    }
-
-    global_orient_mat = angle_axis_to_rotation_matrix(all_poses["global_orient"].squeeze(1)).unsqueeze(1)
-    jaw_pose_mat = angle_axis_to_rotation_matrix(all_poses["jaw_pose"].squeeze(1)).unsqueeze(1)
-    body_pose_mat = angle_axis_to_rotation_matrix(all_poses["body_pose"].view(-1, 3)).view(B, -1, 3, 3)
-    left_hand_pose_mat = angle_axis_to_rotation_matrix(all_poses["left_hand_pose"].view(-1, 3)).view(B, -1, 3, 3)
-    right_hand_pose_mat = angle_axis_to_rotation_matrix(all_poses["right_hand_pose"].view(-1, 3)).view(B, -1, 3, 3)
-
-    # 3. Run the model wrapper without translation.
+    # 2. Convert all axis-angle pose parameters to rotation matrices
+    global_orient_mat = angle_axis_to_rotation_matrix(torch.tensor(smpl_params["global_orient"].squeeze(1), device=device)).unsqueeze(1)
+    jaw_pose_mat = angle_axis_to_rotation_matrix(torch.tensor(smpl_params["jaw_pose"].squeeze(1), device=device)).unsqueeze(1)
+    body_pose_mat = angle_axis_to_rotation_matrix(torch.tensor(smpl_params["body_pose"].view(-1, 3), device=device)).view(betas.shape[0], -1, 3, 3)
+    left_hand_pose_mat = angle_axis_to_rotation_matrix(torch.tensor(smpl_params["left_hand_pose"].view(-1, 3), device=device)).view(betas.shape[0], -1, 3, 3)
+    right_hand_pose_mat = angle_axis_to_rotation_matrix(torch.tensor(smpl_params["right_hand_pose"].view(-1, 3), device=device)).view(betas.shape[0], -1, 3, 3)
+    
+    # 3. Run the SMPL-X model forward pass to get landmarks directly
     with torch.no_grad():
-        _, smplx_landmarks_3d_obj_space, _ = smplx_model(
-            shape_params=betas,
-            expression_params=expression,
-            global_pose=global_orient_mat,
-            body_pose=body_pose_mat,
-            jaw_pose=jaw_pose_mat,
-            left_hand_pose=left_hand_pose_mat,
-            right_hand_pose=right_hand_pose_mat,
+        _, smplx_landmarks, _ = smplx_model(
+            shape_params=betas, expression_params=expression, global_pose=global_orient_mat,
+            body_pose=body_pose_mat, jaw_pose=jaw_pose_mat,
+            left_hand_pose=left_hand_pose_mat, right_hand_pose=right_hand_pose_mat,
         )
 
-    # 4. Apply transformations manually.
-    smplx_landmarks_3d = smplx_landmarks_3d_obj_space + transl.unsqueeze(0)
-    scale = torch.tensor(smpl_params.get("scale", 1.0), dtype=torch.float32, device=device)
-    smplx_landmarks_3d = smplx_landmarks_3d * scale
-    smplx_landmarks_3d = smplx_landmarks_3d.squeeze(0).cpu().numpy()
-    transform_mat = np.array([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]])
-    smplx_landmarks_3d = smplx_landmarks_3d @ transform_mat.T
+    # --- START OF THE FIX ---
+    # 4. Apply the SAME backward Z-shift that was applied to the face mesh
+    thickness_shift = torch.tensor([0, 0, -cfg.bni.thickness], dtype=torch.float32, device=device)
+    shifted_landmarks = smplx_landmarks + thickness_shift.view(1, 1, 3)
+    # --- END OF THE FIX ---
 
-    # 5. Find nearest neighbors on the final dense mesh.
-    dense_vertices = np.asarray(dense_mesh.vertices)
-    kdtree = cKDTree(dense_vertices)
-    _, landmark_indices = kdtree.query(smplx_landmarks_3d)
+    # 5. Apply translation and scale to move landmarks to world space
+    posed_landmarks = (shifted_landmarks + transl.unsqueeze(1)) * scale.view(-1, 1, 1)
 
-    # 6. Retrieve coordinates.
-    landmark_coords = dense_vertices[landmark_indices]
+    # 6. Apply the final coordinate system transformation to match the saved mesh
+    transform_mat = torch.tensor([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]], device=device)
+    posed_landmarks = torch.matmul(posed_landmarks, transform_mat.T)
+    
+    # Squeeze batch dimension and return as numpy array
+    final_landmarks = posed_landmarks.squeeze(0).cpu().numpy()
+    
+    print(f"Directly extracted {final_landmarks.shape[0]} facial landmark coordinates from SMPL-X params (with thickness correction).")
+    return final_landmarks
 
-    print(f"Extracted {len(landmark_indices)} facial landmark vertices from the dense mesh.")
-    return landmark_indices, landmark_coords
+def get_optim_grid_image(image_list, text_list, nrow, type):
+    """
+    Creates a grid of images from a list of tensors.
+    """
+    processed_images = []
+    for img_tensor in image_list:
+        if img_tensor.dim() == 3:
+            img_tensor = img_tensor.unsqueeze(0)
+        
+        if img_tensor.max() > 1.0:
+            img_tensor = img_tensor / 255.0
+        else:
+            img_tensor = (img_tensor + 1.0) / 2.0
+        
+        processed_images.append(img_tensor.cpu())
+
+    grid_tensor = torch.cat(processed_images, dim=0)
+    grid = torchvision.utils.make_grid(grid_tensor, nrow=nrow, padding=2, pad_value=0)
+    pil_image = ToPILImage()(grid)
+    return pil_image
 
 def process_sample_combined(
     data, data_b, args, cfg, device, normal_net, sapiens_normal_net, ifnet, SMPLX_object, dataset, bg_color
@@ -386,7 +390,7 @@ def process_sample_combined(
         batch_smpl_verts = torch.stack(smpl_verts_lst)
         batch_smpl_faces = torch.stack(smpl_faces_lst)
 
-        in_tensor["T_normal_F"], in_tensor["T_normal_B"], T_mask_F, T_mask_B = dataset.render_normal(
+        in_tensor["T_normal_F"], in_tensor["T_normal_B"], _, _ = dataset.render_normal(
             batch_smpl_verts, batch_smpl_faces
         )
 
@@ -403,7 +407,7 @@ def process_sample_combined(
             optimed_orient_mat = rot6d_to_rotmat(optimed_orient.view(-1, 6)).view(N_body, 1, 3, 3)
             optimed_pose_mat = rot6d_to_rotmat(optimed_pose.view(-1, 6)).view(N_body, N_pose, 3, 3)
 
-            smpl_verts, smpl_landmarks, smpl_joints = dataset.smpl_model(
+            smpl_verts, _, smpl_joints = dataset.smpl_model(
                 shape_params=optimed_betas,
                 expression_params=tensor2variable(data["exp"], device),
                 body_pose=optimed_pose_mat,
@@ -476,18 +480,11 @@ def process_sample_combined(
         target_size = (target_h, target_w)
 
         if rgb_norm_B.shape[2:] != target_size:
-            print(
-                colored(
-                    f"Warning: Resizing back overlap image from {rgb_norm_B.shape[2:]} to {target_size} to match front.",
-                    "yellow",
-                )
-            )
+            print(colored(f"Warning: Resizing back overlap image from {rgb_norm_B.shape[2:]} to {target_size} to match front.", "yellow"))
             rgb_norm_B = F.interpolate(rgb_norm_B, size=target_size, mode="bilinear", align_corners=False)
 
         img_overlap_path = osp.join(args.out_dir, cfg.name, f"png/{sample_name}_overlap.png")
-        torchvision.utils.save_image(
-            torch.cat([data["img_raw"], rgb_norm_F, rgb_norm_B], dim=-1) / 255.0, img_overlap_path
-        )
+        torchvision.utils.save_image(torch.cat([data["img_raw"], rgb_norm_F, rgb_norm_B], dim=-1) / 255.0, img_overlap_path)
 
     # Save optimized SMPL-X meshes and parameters
     smpl_obj_lst = []
@@ -532,26 +529,14 @@ def process_sample_combined(
         in_tensor["normal_F"] = erase_bg(in_tensor["normal_F"], in_tensor["mask"])
         in_tensor["normal_B"] = erase_bg(in_tensor["normal_B"], in_tensor["mask_back"])
 
-        BNI_dict = save_normal_tensor(
-            in_tensor, idx, osp.join(args.out_dir, cfg.name, f"BNI/{sample_name}_{idx}"), cfg.bni.thickness
-        )
-        BNI_object = BNI(
-            dir_path=osp.join(args.out_dir, cfg.name, "BNI"),
-            name=sample_name,
-            BNI_dict=BNI_dict,
-            cfg=cfg.bni,
-            device=device,
-        )
+        BNI_dict = save_normal_tensor(in_tensor, idx, osp.join(args.out_dir, cfg.name, f"BNI/{sample_name}_{idx}"), cfg.bni.thickness)
+        BNI_object = BNI(dir_path=osp.join(args.out_dir, cfg.name, "BNI"), name=sample_name, BNI_dict=BNI_dict, cfg=cfg.bni, device=device)
         BNI_object.extract_surface(False)
 
         if cfg.bni.use_ifnet:
             side_mesh_path = f"{args.out_dir}/{cfg.name}/obj/{sample_name}_{idx}_IF.obj"
             side_mesh = apply_face_mask(side_mesh, ~SMPLX_object.smplx_eyeball_fid_mask)
-            in_tensor.update(
-                dataset.depth_to_voxel(
-                    {"depth_F": BNI_object.F_depth.unsqueeze(0), "depth_B": BNI_object.B_depth.unsqueeze(0)}
-                )
-            )
+            in_tensor.update(dataset.depth_to_voxel({"depth_F": BNI_object.F_depth.unsqueeze(0), "depth_B": BNI_object.B_depth.unsqueeze(0)}))
             occupancies = VoxelGrid.from_mesh(side_mesh, cfg.vol_res, loc=[0, 0, 0], scale=2.0).data.transpose(2, 1, 0)
             occupancies = np.flip(occupancies, axis=1)
             in_tensor["body_voxels"] = torch.tensor(occupancies.copy()).float().unsqueeze(0).to(device)
@@ -563,66 +548,35 @@ def process_sample_combined(
             side_mesh = trimesh.Trimesh(verts_IF, faces_IF)
             side_mesh = remesh_laplacian(side_mesh, side_mesh_path)
         else:
-            side_mesh = apply_vertex_mask(
-                side_mesh,
-                (
-                    SMPLX_object.front_flame_vertex_mask
-                    + SMPLX_object.smplx_mano_vertex_mask
-                    + SMPLX_object.eyeball_vertex_mask
-                )
-                .eq(0)
-                .float(),
-            )
-            side_mesh = Meshes(
-                verts=[torch.tensor(side_mesh.vertices).float()], faces=[torch.tensor(side_mesh.faces).long()]
-            ).to(device)
+            side_mesh = apply_vertex_mask(side_mesh, (SMPLX_object.front_flame_vertex_mask + SMPLX_object.smplx_mano_vertex_mask + SMPLX_object.eyeball_vertex_mask).eq(0).float())
+            side_mesh = Meshes(verts=[torch.tensor(side_mesh.vertices).float()], faces=[torch.tensor(side_mesh.faces).long()]).to(device)
             sm = SubdivideMeshes(side_mesh)
             side_mesh = register(BNI_object.F_B_trimesh, sm(side_mesh), device)
 
         full_lst = []
 
         if "face" in cfg.bni.use_smpl:
-            face_plus_eye_mask = (
-                SMPLX_object.front_flame_vertex_mask + SMPLX_object.eyeball_vertex_mask
-            ).clamp_max(1.0)
+            face_plus_eye_mask = (SMPLX_object.front_flame_vertex_mask + SMPLX_object.eyeball_vertex_mask).clamp_max(1.0)
             face_mesh = apply_vertex_mask(face_mesh, face_plus_eye_mask)
-
             if not face_mesh.is_empty:
                 face_mesh.vertices = face_mesh.vertices - np.array([0, 0, cfg.bni.thickness])
-                BNI_object.F_B_trimesh = part_removal(
-                    BNI_object.F_B_trimesh, face_mesh, cfg.bni.face_thres, device, smplx_mesh, region="face"
-                )
-                side_mesh = part_removal(
-                    side_mesh, face_mesh, cfg.bni.face_thres, device, smplx_mesh, region="face"
-                )
+                BNI_object.F_B_trimesh = part_removal(BNI_object.F_B_trimesh, face_mesh, cfg.bni.face_thres, device, smplx_mesh, region="face")
+                side_mesh = part_removal(side_mesh, face_mesh, cfg.bni.face_thres, device, smplx_mesh, region="face")
                 face_mesh.export(f"{args.out_dir}/{cfg.name}/obj/{sample_name}_{idx}_face.obj")
                 full_lst += [face_mesh]
 
         if "hand" in cfg.bni.use_smpl:
             hand_mask = torch.zeros(SMPLX_object.smplx_verts.shape[0])
             if data["hands_visibility"][idx][0]:
-                mano_left_vid = np.unique(
-                    np.concatenate(
-                        [SMPLX_object.smplx_vert_seg["leftHand"], SMPLX_object.smplx_vert_seg["leftHandIndex1"]]
-                    )
-                )
+                mano_left_vid = np.unique(np.concatenate([SMPLX_object.smplx_vert_seg["leftHand"], SMPLX_object.smplx_vert_seg["leftHandIndex1"]]))
                 hand_mask.index_fill_(0, torch.tensor(mano_left_vid), 1.0)
             if data["hands_visibility"][idx][1]:
-                mano_right_vid = np.unique(
-                    np.concatenate(
-                        [SMPLX_object.smplx_vert_seg["rightHand"], SMPLX_object.smplx_vert_seg["rightHandIndex1"]]
-                    )
-                )
+                mano_right_vid = np.unique(np.concatenate([SMPLX_object.smplx_vert_seg["rightHand"], SMPLX_object.smplx_vert_seg["rightHandIndex1"]]))
                 hand_mask.index_fill_(0, torch.tensor(mano_right_vid), 1.0)
             hand_mesh = apply_vertex_mask(hand_mesh, hand_mask)
-
             if not hand_mesh.is_empty:
-                BNI_object.F_B_trimesh = part_removal(
-                    BNI_object.F_B_trimesh, hand_mesh, cfg.bni.hand_thres, device, smplx_mesh, region="hand"
-                )
-                side_mesh = part_removal(
-                    side_mesh, hand_mesh, cfg.bni.hand_thres, device, smplx_mesh, region="hand"
-                )
+                BNI_object.F_B_trimesh = part_removal(BNI_object.F_B_trimesh, hand_mesh, cfg.bni.hand_thres, device, smplx_mesh, region="hand")
+                side_mesh = part_removal(side_mesh, hand_mesh, cfg.bni.hand_thres, device, smplx_mesh, region="hand")
                 hand_mesh.export(f"{args.out_dir}/{cfg.name}/obj/{sample_name}_{idx}_hand.obj")
                 full_lst += [hand_mesh]
 
@@ -646,8 +600,6 @@ def process_sample_combined(
             rotate_recon_lst = dataset.render.get_image(cam_type="four", bg=bg_color)
             per_loop_lst_front = [in_tensor["image"][idx : idx + 1]] + rotate_recon_lst
             per_loop_lst_back = [in_tensor["image_back"][idx : idx + 1]] + rotate_recon_lst
-
-            # This block is now active and will save the visualization grids
             if len(per_loop_lst_front) > 0 and len(per_loop_lst_back) > 0:
                 clean_bg_color = bg_color.strip('"').strip("'") if isinstance(bg_color, str) else str(bg_color)
                 cloth_front = get_optim_grid_image(per_loop_lst_front, None, nrow=5, type="cloth_front")
@@ -657,7 +609,6 @@ def process_sample_combined(
                 cloth_back_path = osp.join(args.out_dir, cfg.name, f"png/{sample_name}_cloth_back_{clean_bg_color}.png")
                 cloth_back.save(cloth_back_path)
 
-        # Watertightening and Face Grafting
         final_watertight_path = f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_full_wt.obj"
         watertightifier = MeshCleanProcess(final_path, final_watertight_path)
         poisson_depth_wt = getattr(cfg.bni, "poisson_depth", 9)
@@ -665,27 +616,24 @@ def process_sample_combined(
 
         if not result:
             print(f"Failed to create watertight base mesh from {final_path}. Skipping grafting process.")
-            continue 
+            continue
 
         print(f"Watertight base mesh saved to {final_watertight_path}")
         original_smplx_face_path = f"{args.out_dir}/{cfg.name}/obj/{sample_name}_{idx}_face.obj"
 
         if not osp.exists(original_smplx_face_path):
             print(f"ERROR: SMPLX face mesh {original_smplx_face_path} not found. Cannot perform grafting.")
-            continue 
+            continue
 
-        # --- START: Grafting Retry Loop ---
         grafting_successful = False
         final_grafted_mesh_obj = None
-        max_attempts = 3
+        max_attempts = 5
 
         for attempt in range(max_attempts):
             dilation_rings = attempt
             print(colored(f"\n--- Grafting Attempt {attempt + 1}/{max_attempts} with footprint_dilation_rings = {dilation_rings} ---", "yellow"))
-
             grafted_output_path_v6 = f"{args.out_dir}/{cfg.name}/obj/{data['name']}_{idx}_final_grafted_v6_att{attempt}.obj"
             debug_graft_dir = osp.join(args.out_dir, cfg.name, "debug_grafting", f"{data['name']}_{idx}_att{attempt}")
-
             if osp.exists(debug_graft_dir):
                 shutil.rmtree(debug_graft_dir)
 
@@ -712,37 +660,52 @@ def process_sample_combined(
                 print(colored(f"Grafting failed on attempt {attempt + 1}. Trying again with increased dilation...", "red"))
                 if osp.exists(grafted_output_path_v6):
                     os.remove(grafted_output_path_v6)
-        # --- END: Grafting Retry Loop ---
 
         if not grafting_successful:
             print(colored(f"All {max_attempts} grafting attempts failed for {sample_name}_{idx}. Skipping post-processing.", "red"))
             continue
 
+        smpl_obj_path = f"{args.out_dir}/{cfg.name}/obj/{sample_name}_smpl_{idx:02d}.obj"
         smpl_params_path = smpl_obj_path.replace(".obj", ".npy")
         if osp.exists(smpl_params_path):
-            print("Extracting landmarks from the final grafted mesh...")
+            print("Extracting landmarks directly from SMPL-X parameters...")
             smpl_params = np.load(smpl_params_path, allow_pickle=True).item()
-
-            landmark_indices, landmark_coords = get_facial_landmarks_from_mesh(
-                dense_mesh=final_grafted_mesh_obj,
-                smplx_model=dataset.smpl_model,
-                smpl_params=smpl_params,
-                device=device,
+            
+            landmark_coords = extract_landmarks_from_smplx_params(
+                smpl_params=smpl_params, 
+                smplx_model=dataset.smpl_model, 
+                cfg=cfg,
+                device=device
             )
 
-            landmark_output_path = osp.join(
-                args.out_dir, cfg.name, "obj", f"{data['name']}_{idx}_landmarks.npz"
-            )
-            np.savez(landmark_output_path, indices=landmark_indices, coords_3d=landmark_coords)
+            landmark_output_path = osp.join(args.out_dir, cfg.name, "obj", f"{data['name']}_{idx}_landmarks.npz")
+            np.savez(landmark_output_path, coords_3d=landmark_coords)
             print(f"Saved landmark data to {landmark_output_path}")
+
+            # Save the landmarks as a .ply point cloud, applying the requested rotation
+            try:
+                ply_landmark_path = osp.join(args.out_dir, cfg.name, "obj", f"{data['name']}_{idx}_landmarks.ply")
+                landmark_point_cloud = trimesh.points.PointCloud(vertices=landmark_coords)
+
+                # Create a 90-degree rotation matrix around the positive X-axis
+                angle = np.pi / 2.0
+                axis = [1, 0, 0]
+                rotation_matrix = trimesh.transformations.rotation_matrix(angle, axis)
+                
+                # Apply the transformation
+                landmark_point_cloud.apply_transform(rotation_matrix)
+                
+                landmark_point_cloud.export(ply_landmark_path)
+                print(f"Saved rotated landmark point cloud to {ply_landmark_path}")
+            except Exception as e:
+                print(f"Error exporting landmark point cloud to .ply ({ply_landmark_path}): {e}")
+
         else:
             print(f"Could not find SMPL params at {smpl_params_path}, skipping landmark extraction.")
 
-        # Save a .ply version with the original "_full_soups" naming
         try:
             ply_output_filename = f"{data['name']}_{idx}_full_soups.ply"
             ply_output_path = osp.join(args.out_dir, cfg.name, "obj", ply_output_filename)
-            
             final_grafted_mesh_obj.export(ply_output_path)
             print(f"Additionally saved final grafted mesh as .ply to {ply_output_path}")
         except Exception as e:

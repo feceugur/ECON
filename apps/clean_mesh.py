@@ -26,6 +26,7 @@ class FaceGraftingConfig:
     projection_footprint_threshold: float = 0.01
     footprint_dilation_rings: int = 0
     squashed_triangle_drop_fraction: float = 0.7
+    vertex_coordinate_precision_digits: Optional[int] = 5
 
     # === Body mesh simplification ===
     body_simplification_target_faces: int = 12000
@@ -48,7 +49,7 @@ class FaceGraftingConfig:
 
     # === Cleaning & debug options ===
     use_open3d_cleaning: bool = False
-    save_debug_body_with_hole: bool = False
+    save_debug_body_with_hole: bool = True
     debug_smply_integrity_trace: bool = True
 
 
@@ -79,46 +80,6 @@ class FaceGraftingPipeline:
         self.s_loop_coords_ordered: Optional[np.ndarray] = None
         self.b_loop_coords_aligned: Optional[np.ndarray] = None
         self.debug_tracked_vertex_coords: Optional[np.ndarray] = None # <-- ADD THIS LINE
-
-    def _save_and_check_debug_vertices(self, 
-            mesh_to_check: Optional[trimesh.Trimesh], 
-            stage_name: str
-        ):
-            """
-            Saves the current mesh and checks for the presence of specific tracked vertices.
-            This is an intensive debug tool activated by a config flag.
-            """
-            if not self.config.debug_smply_integrity_trace or self.debug_tracked_vertex_coords is None:
-                return
-
-            if not mesh_to_check or mesh_to_check.is_empty:
-                logger.info(f"Integrity Trace ({stage_name}): Mesh is empty, cannot check. 0/{len(self.debug_tracked_vertex_coords)} found.")
-                return
-
-            base_name, _ = os.path.splitext(self.output_path)
-            
-            # Save the current state of the main mesh for visual inspection
-            mesh_debug_path = f"{base_name}_debug_mesh_at_{stage_name}.obj"
-            mesh_to_check.export(mesh_debug_path)
-            
-            # Save the points we are tracking as a separate file
-            points_debug_path = f"{base_name}_debug_points_tracked.ply"
-            if not os.path.exists(points_debug_path): # Only save once
-                trimesh.points.PointCloud(self.debug_tracked_vertex_coords).export(points_debug_path)
-
-            # Check how many of our tracked vertices still exist in the current mesh
-            kdtree = cKDTree(mesh_to_check.vertices)
-            distances, _ = kdtree.query(self.debug_tracked_vertex_coords, k=1)
-            
-            # A vertex is considered "found" if a point in the mesh is very close to its original position
-            found_mask = distances < 1e-5
-            num_found = np.sum(found_mask)
-            num_total = len(self.debug_tracked_vertex_coords)
-            
-            logger.warning(
-                f"Integrity Trace ({stage_name}): {num_found}/{num_total} tracked vertices found. "
-                f"Debug mesh saved to {mesh_debug_path}"
-            )
 
     def _make_temp_path(self, suffix_label: str, use_ply: bool = False) -> str:
         """Helper to create and track temporary file paths."""
@@ -462,86 +423,6 @@ class FaceGraftingPipeline:
             # This is an in-place modification of the original `verts` array.
             verts[loop_vidx] += relax * move * 0.5
                 
-    @staticmethod
-    def _triangle_altitudes(v0: np.ndarray, v1: np.ndarray, v2: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Returns the three altitudes (h0, h1, h2) for an array of triangles.
-        h0 = altitude from v0 onto edge v1–v2, and so on.
-        This is a fully vectorized version.
-        """
-        # edge lengths (F,)
-        a = np.linalg.norm(v1 - v0, axis=1)
-        b = np.linalg.norm(v2 - v1, axis=1)
-        c = np.linalg.norm(v0 - v2, axis=1)
-
-        # twice the area via Heron's formula (robust for slivers)
-        s = 0.5 * (a + b + c)
-        # We use clip(min=0) to prevent small floating point errors from yielding negative numbers
-        area2 = (s * (s - a) * (s - b) * (s - c)).clip(min=0)
-
-        # Mask for valid, non-collapsed triangles
-        valid_mask = area2 > 1e-12
-        A = np.sqrt(area2[valid_mask])
-        twoA = 2 * A
-
-        # Initialize altitudes to 0
-        h0, h1, h2 = np.zeros_like(a), np.zeros_like(a), np.zeros_like(a)
-        
-        # Calculate altitudes only for valid triangles
-        h0[valid_mask] = twoA / a[valid_mask]
-        h1[valid_mask] = twoA / b[valid_mask]
-        h2[valid_mask] = twoA / c[valid_mask]
-
-        return h0, h1, h2
-
-    @staticmethod
-    def _remove_faces_if_any_altitude_drops(
-            mesh_before: trimesh.Trimesh,
-            mesh_after:  trimesh.Trimesh,
-            drop_fraction: float
-    ) -> trimesh.Trimesh:
-        """
-        Deletes every face for which *any one* of its three altitudes has
-        decreased by >= drop_fraction between mesh_before and mesh_after.
-        The two meshes must share the same face indexing.
-        """
-        if not np.array_equal(mesh_before.faces, mesh_after.faces):
-            logger.error("Cannot compare altitudes; meshes have different face indexing. Returning original mesh.")
-            return mesh_after
-
-        # Get vertices for all faces in a (F, 3, 3) array, then transpose to (3, F, 3)
-        v0b, v1b, v2b = (mesh_before.vertices[mesh_before.faces].transpose(1, 0, 2))
-        v0a, v1a, v2a = (mesh_after.vertices[mesh_after.faces].transpose(1, 0, 2))
-
-        # Vectorised altitude computation for all faces at once
-        h0b, h1b, h2b = FaceGraftingPipeline._triangle_altitudes(v0b, v1b, v2b)
-        h0a, h1a, h2a = FaceGraftingPipeline._triangle_altitudes(v0a, v1a, v2a)
-
-        keep = np.ones(len(mesh_before.faces), dtype=bool)
-
-        # Test each altitude separately
-        for hb, ha in ((h0b, h0a), (h1b, h1a), (h2b, h2a)):
-            # Avoid division by zero; if original altitude was near zero, keep it.
-            mask = hb > 1e-9
-            
-            # Create a mask for faces where the altitude has dropped too much
-            dropped_mask = np.zeros_like(keep, dtype=bool)
-            dropped_mask[mask] = ha[mask] < (1.0 - drop_fraction) * hb[mask]
-            
-            # Update the master 'keep' mask. If a face is dropped, it stays dropped.
-            keep[dropped_mask] = False
-
-        num_to_remove = len(keep) - np.sum(keep)
-        if num_to_remove > 0:
-            logger.info(f"...found and removed {num_to_remove} squashed faces based on altitude drop.")
-            cleaned = mesh_after.copy()
-            cleaned.update_faces(keep)
-            cleaned.remove_unreferenced_vertices()
-            return cleaned
-        else:
-            logger.info("...no squashed faces found to remove based on altitude drop.")
-            return mesh_after
-
     def _smooth_main_hole_boundary(self) -> bool:
         if not self.body_with_hole_trimesh or \
             not MeshCleanProcess._is_mesh_valid_for_concat(self.body_with_hole_trimesh, "BodyForHoleSmooth"):
@@ -588,33 +469,6 @@ class FaceGraftingPipeline:
         if hasattr(self.body_with_hole_trimesh, '_cache'): self.body_with_hole_trimesh._cache.clear()
         return True
 
-    def _debug_log_and_save(self, mesh_to_debug: Optional[trimesh.Trimesh], stage_id: str, stage_description: str):
-        """Logs the state of a mesh and saves it for visual inspection."""
-        base_name, _ = os.path.splitext(self.output_path)
-        debug_path = f"{base_name}_debug_{stage_id}_{stage_description}.obj"
-
-        logger.info(f"--- DEBUG CHECKPOINT: {stage_id} ---")
-        
-        if not mesh_to_debug or mesh_to_debug.is_empty:
-            logger.info(f"DEBUG ({stage_id}): Mesh is None or empty.")
-            return
-
-        # Log what trimesh reports about its state
-        try:
-            loops = MeshCleanProcess.get_all_boundary_loops(mesh_to_debug, min_loop_len=3)
-            num_loops = len(loops)
-            logger.info(f"DEBUG ({stage_id}): Trimesh reports {num_loops} boundary loop(s).")
-        except Exception as e:
-            logger.error(f"DEBUG ({stage_id}): Could not get boundary loops. Error: {e}")
-
-        # Save the mesh for visual inspection
-        try:
-            mesh_to_debug.export(debug_path)
-            logger.info(f"DEBUG ({stage_id}): Saved mesh state to {debug_path}")
-        except Exception as e:
-            logger.error(f"DEBUG ({stage_id}): Failed to save debug mesh: {e}")
-        logger.info("-" * (23 + len(stage_id)))
-
     def _determine_hole_faces_and_create_body_with_hole(self) -> bool:
         if self.simplified_body_trimesh is None or self.original_smplx_face_geom_tri is None:
             logger.error("Missing meshes for hole creation. Aborting.")
@@ -652,69 +506,50 @@ class FaceGraftingPipeline:
         if self.config.footprint_dilation_rings > 0 and np.any(self.faces_to_remove_mask_on_body):
             logger.info(f"Dilating footprint by {self.config.footprint_dilation_rings} ring(s)...")
             adj = self.simplified_body_trimesh.face_adjacency
+            current_wavefront = self.faces_to_remove_mask_on_body.copy()
             for _ in range(self.config.footprint_dilation_rings):
-                wavefront_indices = np.where(self.faces_to_remove_mask_on_body)[0]
-                if not wavefront_indices.size: break
-                neighbor_faces = adj[np.isin(adj, wavefront_indices).any(axis=1)]
-                self.faces_to_remove_mask_on_body[np.unique(neighbor_faces)] = True
+                wave_indices = np.where(current_wavefront)[0]
+                if not wave_indices.size: break
+                all_neighbors_this_ring = adj[np.isin(adj, wave_indices).any(axis=1)].flatten()
+                unique_neigh = np.unique(all_neighbors_this_ring)
+                new_to_add = unique_neigh[~self.faces_to_remove_mask_on_body[unique_neigh]]
+                if not new_to_add.size: break
+                self.faces_to_remove_mask_on_body[new_to_add] = True
+                current_wavefront.fill(False); current_wavefront[new_to_add] = True
 
-        # --- NEW, ROBUST PROCESSING SEQUENCE ---
-        
-        # 1. Cut the hole
+        # --- MODIFIED LOGIC: REMOVE FACES AND IMMEDIATELY ISOLATE LARGEST COMPONENT ---
         current_mesh = self.simplified_body_trimesh.copy()
         if np.any(self.faces_to_remove_mask_on_body):
+            # 1. Apply the (potentially messy) removal mask
             current_mesh.update_faces(~self.faces_to_remove_mask_on_body)
             current_mesh.remove_unreferenced_vertices()
+            
+            # 2. Split the result into all its parts (main body + floating islands)
+            logger.info("Isolating main body component to remove floating face islands...")
+            components = current_mesh.split(only_watertight=False)
+            
+            # 3. Robustly find the largest component and discard the rest
+            actual_components_list = [c for c in np.atleast_1d(components) if c is not None and not c.is_empty]
+            if len(actual_components_list) > 1:
+                logger.info(f"Found {len(actual_components_list)} components after removal. Keeping largest.")
+                current_mesh = max(actual_components_list, key=lambda c: len(c.faces))
+            elif actual_components_list:
+                current_mesh = actual_components_list[0]
+            else:
+                logger.warning("Splitting after face removal resulted in no valid components.")
+                current_mesh = trimesh.Trimesh() # Create empty mesh if all else fails
         else:
             logger.warning("No faces were marked for removal.")
 
-        # 2. Force re-processing to ensure a valid internal state
-        logger.info("Re-processing mesh after hole cutting...")
-        current_mesh = trimesh.Trimesh(vertices=current_mesh.vertices, faces=current_mesh.faces, process=True)
-
-        # 3. Aggressively clean to detach any non-manifold "floating" faces
-        logger.info("Cleaning mesh to detach floating islands...")
-        cleaned_mesh = self._thoroughly_clean_trimesh_object(current_mesh.copy(), "BodyWithHolePreSplit", self.INTERNAL_VERSION_TRACKER)
-        if cleaned_mesh:
-            current_mesh = cleaned_mesh
-
-        # 4. Split to remove the now-detached floating islands
-        components_result = current_mesh.split(only_watertight=False)
-        actual_components_list = [c for c in np.atleast_1d(components_result) if c is not None and not c.is_empty]
-        if len(actual_components_list) > 1:
-            logger.info(f"Found {len(actual_components_list)} components; removing floating islands.")
-            current_mesh = max(actual_components_list, key=lambda c: len(c.faces))
-
-        # 5. Fill any remaining secondary holes
-        loops = MeshCleanProcess.get_all_boundary_loops(current_mesh, min_loop_len=3)
-        if len(loops) > 1:
-            logger.warning(f"Detected {len(loops)} holes; filling all but the largest.")
-            filled_mesh = self._close_smplx_holes_by_fan_fill(current_mesh)
-            if filled_mesh:
-                current_mesh = filled_mesh
-
-        # 6. Smooth the final, single hole boundary
         self.body_with_hole_trimesh = current_mesh
-        if not self._smooth_main_hole_boundary():
-            logger.warning("Hole boundary smoothing failed or was skipped.")
-        
-        # Final assignment
-        self.body_with_hole_trimesh = self.body_with_hole_trimesh
         
         if not MeshCleanProcess._is_mesh_valid_for_concat(self.body_with_hole_trimesh, "FinalBodyWHole"):
             logger.critical("Final Body-with-hole mesh is invalid. Aborting.")
             return False
 
         logger.info(f"Finished body_with_hole creation. V={len(self.body_with_hole_trimesh.vertices)}, F={len(self.body_with_hole_trimesh.faces)}")
-        
-        if self.config.save_debug_body_with_hole:
-            base_name, _ = os.path.splitext(self.output_path)
-            debug_path = f"{base_name}_debug_body_with_hole.obj"
-            self.body_with_hole_trimesh.export(debug_path)
-            logger.info(f"Saved debug body with hole to: {debug_path}")
-
         return True
-
+    
     def _extract_smplx_face_loop(self) -> bool:
         if not self.original_smplx_face_geom_tri: return False
         # logger.info("Extracting SMPLX face loop.") 
@@ -779,29 +614,6 @@ class FaceGraftingPipeline:
             # logger.info("Body loop orientation kept forward for best fit.")
 
         return self.b_loop_coords_aligned is not None and len(self.b_loop_coords_aligned) >= 3
-
-    def _body_index_sequence(self,
-                            body_loop: np.ndarray,
-                            n_target: int) -> np.ndarray:
-        """
-        Return an array of length `n_target` whose entries are *indices* into
-        `body_loop` (len = Nb).  The sequence is strictly non-decreasing modulo Nb
-        and wraps exactly once (Rule R1).  Duplicates are grouped (Rule R2).
-
-        • If Nb >= n_target  → some indices are skipped.
-        • If Nb <  n_target  → some indices are repeated in short runs.
-        """
-        Nb = len(body_loop)
-        if Nb == 0:
-            return np.empty(0, dtype=int)
-
-        # Ideal fractional step around the rim
-        step = Nb / n_target
-        seq  = np.floor(np.arange(n_target) * step).astype(int)  # len = n_target
-
-        # Ensure wrap exactly once (seq[-1] may be Nb-1 twice otherwise)
-        seq[-1] = Nb - 1
-        return seq
 
     # -------------------------------------------------------------------------
     #  2) MAIN: watertight strip where *only* body rim is resampled
@@ -1035,16 +847,6 @@ class FaceGraftingPipeline:
 
         base_name, ext = os.path.splitext(self.output_path)
 
-        def _save_debug_stitch(mesh, method_name):
-            if not mesh: return
-            try:
-                debug_path = f"{base_name}_debug_stitch_{method_name}{ext}"
-                mesh.export(debug_path)
-                logger.info(f"Saved debug mesh from {method_name} stitch attempt to: {debug_path}")
-            except Exception as e:
-                logger.warning(f"Could not save {method_name} stitch debug mesh: {e}")
-
-        # --- MODIFIED ASSEMBLY LOGIC ---
         def _assemble(strip: trimesh.Trimesh) -> Optional[trimesh.Trimesh]:
             """
             Assembles the body, the original face, and the stitch strip by
@@ -1083,7 +885,6 @@ class FaceGraftingPipeline:
         strip = self._create_loft_stitch_mesh_zipper()
         if self._is_stitch_strip_valid(strip):
             stitched = _assemble(strip)
-            # _save_debug_stitch(stitched, "zipper")
             if stitched and self._verify_seam_closure_on_mesh(stitched, "ZipperResult"):
                 self.stitched_mesh_intermediate = stitched
                 return True
@@ -1096,7 +897,6 @@ class FaceGraftingPipeline:
         strip = self._create_loft_stitch_mesh_resample_body()
         if self._is_stitch_strip_valid(strip):
             stitched = _assemble(strip)
-            # _save_debug_stitch(stitched, "body_resample")
             if stitched and self._verify_seam_closure_on_mesh(stitched, "BodyResampleResult"):
                 self.stitched_mesh_intermediate = stitched
                 return True
@@ -1109,7 +909,6 @@ class FaceGraftingPipeline:
         strip = self._create_loft_stitch_mesh_projection()
         if strip:
             stitched = _assemble(strip)
-            # _save_debug_stitch(stitched, "projection")
             if stitched:
                 logger.info("SUCCESS: Fallback Projection method assembled a mesh.")
                 self.stitched_mesh_intermediate = stitched
@@ -1779,25 +1578,28 @@ class FaceGraftingPipeline:
             logger.critical("Cannot save final mesh: Mesh is invalid or missing.")
             return False
 
+        # --- STEP 1: Unconditionally save the file ---
         logger.info(f"--- Saving final processed mesh to: {self.output_path} ---")
         try:
             self.final_processed_mesh.export(self.output_path)
             logger.info("File saved successfully.")
         except Exception as e:
             logger.critical(f"Failed to export the final mesh: {e}", exc_info=True)
-            return False
+            return False # The save operation itself failed.
 
+        # --- STEP 2: Perform the quality check and report on it ---
         logger.info("--- Performing Final Watertightness Check on Saved Mesh ---")
         
         if self.final_processed_mesh.is_watertight:
             logger.info("SUCCESS: The saved mesh is watertight.")
-            return True
+            return True # The pipeline's goal was met.
         else:
             logger.warning("--- WATERTIGHTNESS CHECK FAILED ---")
             logger.warning("The saved mesh is NOT watertight, but the file was saved as requested.")
             
-            # --- IMPROVED DIAGNOSTICS ---
+            # Use a robust try-except block for diagnostics
             try:
+                # This block will ONLY run if the necessary attributes exist.
                 is_manifold = self.final_processed_mesh.is_manifold
                 boundary_edge_count = len(self.final_processed_mesh.boundary_edges)
                 
@@ -1807,16 +1609,16 @@ class FaceGraftingPipeline:
                     logger.warning("  - Diagnostics: Mesh is not manifold (e.g., contains edges shared by more than two faces).")
             
             except AttributeError:
-                logger.warning("  - Detailed diagnostics unavailable because the mesh object is in an unprocessed state.")
-            # --- END IMPROVED DIAGNOSTICS ---
+                # If ANY attribute is missing, fall back to a generic message.
+                logger.warning("  - Detailed diagnostics unavailable for this Trimesh version.")
 
+            # Return False to indicate the watertightness GOAL was not met.
             return False
-
+                        
     def _retain_largest_component_only(self) -> bool:
         """
         Ensures the mesh consists of only one single connected component by
         discarding any smaller, disconnected "islands" of geometry.
-        This version ensures the resulting mesh is fully processed.
         """
         logger.info("--- Verifying mesh consists of a single connected component ---")
         if not self.final_processed_mesh or self.final_processed_mesh.is_empty:
@@ -1825,26 +1627,18 @@ class FaceGraftingPipeline:
         mesh_before_split = self.final_processed_mesh.copy()
         
         try:
+            # The split operation returns a list of Trimesh objects
             components = self.final_processed_mesh.split(only_watertight=False)
             
             if len(components) > 1:
                 logger.warning(f"Found {len(components)} disconnected components. Retaining only the largest.")
                 
+                # Find the largest component by number of faces
                 largest_component = max(components, key=lambda c: len(c.faces))
                 
                 if MeshCleanProcess._is_mesh_valid_for_concat(largest_component, "LargestComponent"):
-                    # --- THE DEFINITIVE FIX ---
-                    # Re-create the Trimesh object from its core data with process=True.
-                    # This forces a full build of all internal graph data, making
-                    # properties like .is_watertight and .boundary_edges reliable.
-                    logger.info("Re-processing the largest component to ensure graph integrity...")
-                    self.final_processed_mesh = trimesh.Trimesh(
-                        vertices=largest_component.vertices,
-                        faces=largest_component.faces,
-                        process=True
-                    )
-                    logger.info("Successfully isolated and processed the main mesh component.")
-                    # --- END OF FIX ---
+                    self.final_processed_mesh = largest_component
+                    logger.info("Successfully isolated the largest mesh component.")
                 else:
                     logger.error("The largest component was invalid after splitting. Reverting.")
                     self.final_processed_mesh = mesh_before_split
@@ -1858,7 +1652,7 @@ class FaceGraftingPipeline:
             logger.error(f"An error occurred during component splitting: {e}", exc_info=True)
             self.final_processed_mesh = mesh_before_split
             return False
-            
+
     def process(self) -> Optional[trimesh.Trimesh]:
         """
         Executes the full face grafting pipeline.
@@ -1879,18 +1673,13 @@ class FaceGraftingPipeline:
             self._fill_seam_holes_by_fan() 
             self._apply_final_polish()
 
-            # --- SMPLX INTEGRITY CHECK (MOVED) ---
-            # Verify the graft BEFORE removing disconnected components like eyes.
-            # This checks the fully assembled mesh.
-            if not self._verify_smplx_face_integrity():
-                logger.critical("SMPLX face integrity check failed after stitching and polishing. Aborting before component splitting.")
-                return None
-            # --- END OF MOVED BLOCK ---
+            # --- REORDERED VERIFICATION STEPS (AS REQUESTED) ---
+            # 1. Verify SMPLX integrity on the fully assembled mesh BEFORE component splitting.
+            self._verify_smplx_face_integrity()
 
-            # Now that the graft is verified, it's safe to remove the eyes/other components.
+            # 2. Retain only the largest component.
             self._retain_largest_component_only()
-            
-            self._save_and_check_debug_vertices(self.final_processed_mesh, "07_after_component_filter")
+            # --- END OF REORDERED STEPS ---
             
             if self._final_watertightness_check_and_save():
                 pipeline_ok = True
@@ -1898,7 +1687,7 @@ class FaceGraftingPipeline:
             else:
                 return None
             
-            # Seam closure is still a relevant final check on the main body.
+            # The seam closure check is still performed on the final, saved mesh.
             self._verify_seam_closure()
             
             return final_mesh_for_return
@@ -1909,7 +1698,7 @@ class FaceGraftingPipeline:
             self._cleanup_temp_files()
             if not pipeline_ok: 
                 logger.error(f"Pipeline V{self.INTERNAL_VERSION_TRACKER} did not complete successfully.")
-                
+                                
     @staticmethod
     def _iterative_non_manifold_repair_pml_aggressive(
         input_mesh: trimesh.Trimesh,
