@@ -69,7 +69,7 @@ class CameraTransformManager:
 
         if self.debug:
             print(f"[DEBUG] Transform from frame {frame} → {self.target_frame} (Blender-to-CV: {use_blender_to_cv}):")
-            print(T_cv)
+            #print(T_cv)
 
         return T_cv
 
