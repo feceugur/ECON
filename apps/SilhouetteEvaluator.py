@@ -7,7 +7,6 @@ from tqdm.auto import tqdm
 import os.path as osp
 from termcolor import colored
 
-# Add the root directory to the Python path to allow imports to work properly
 current_dir = os.path.dirname(os.path.abspath(__file__))
 root_dir = os.path.dirname(current_dir)
 if root_dir not in sys.path:

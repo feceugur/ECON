@@ -84,6 +84,16 @@ def convert_rot_matrix_to_angle_axis(rot_matrix):
         raise ValueError(f"Unsupported rotation matrix shape: {input_shape}")
 
 
+def copy_view_data_to_device(view_data, device):
+    for k in view_data:
+        if torch.is_tensor(view_data[k]):
+            view_data[k] = view_data[k].detach().cpu() if device == "cpu" else view_data[k].to(device)
+    return view_data
+
+def print_gpu_memory_usage():
+    free, total = torch.cuda.mem_get_info()   # bytes
+    print(f"  GPU memory usage      : {(total - free)/1e9:.2f} GB")
+
 if __name__ == "__main__":
 
     # loading cfg file
@@ -129,8 +139,8 @@ if __name__ == "__main__":
         )
     )
 
-    if cfg.sapiens.use:
-        sapiens_normal_net = ImageProcessor(device=device)
+    #if cfg.sapiens.use:
+    #    sapiens_normal_net = ImageProcessor(device=device)
 
     # SMPLX object
     SMPLX_object = SMPLX()
@@ -166,6 +176,10 @@ if __name__ == "__main__":
 
     print(colored(f"Dataset Size: {len(dataset)}", "green"))
 
+    import time
+    start = time.perf_counter()
+    DEBUG = False
+
     pbar = tqdm(dataset)
 
     for data in pbar:
@@ -198,18 +212,18 @@ if __name__ == "__main__":
 
         # sapiens inference for current batch data
 
-        if cfg.sapiens.use:
-            sapiens_normal = sapiens_normal_net.process_image(
-                Image.fromarray(
-                    data["img_raw"].squeeze(0).permute(1, 2, 0).numpy().astype(np.uint8)
-                ), "1b", cfg.sapiens.seg_model
-            )
-            print(colored("Estimating normal maps from input image, using Sapiens-normal", "green"))
+        #if cfg.sapiens.use:
+        #    sapiens_normal = sapiens_normal_net.process_image(
+        #        Image.fromarray(
+        #            data["img_raw"].squeeze(0).permute(1, 2, 0).numpy().astype(np.uint8)
+        #        ), "1b", cfg.sapiens.seg_model
+        #    )
+        #    print(colored("Estimating normal maps from input image, using Sapiens-normal", "green"))
 
-            sapiens_normal_square_lst = []
-            for idx in range(len(data["img_icon"])):
-                sapiens_normal_square_lst.append(wrap(sapiens_normal, data["uncrop_param"], idx))
-            sapiens_normal_square = torch.cat(sapiens_normal_square_lst)
+        #    sapiens_normal_square_lst = []
+        #    for idx in range(len(data["img_icon"])):
+        #        sapiens_normal_square_lst.append(wrap(sapiens_normal, data["uncrop_param"], idx))
+        #    sapiens_normal_square = torch.cat(sapiens_normal_square_lst)
         
         # smpl optimization
         loop_smpl = tqdm(range(args.loop_smpl))
@@ -222,10 +236,10 @@ if __name__ == "__main__":
             frame_id = int(data["name"].split("_")[1])
             in_tensor[f"view_{frame_id}"] = {
                 "smpl_faces": data["smpl_faces"], 
-                "image": data["img_icon"].to(device), 
-                "mask": data["img_mask"].to(device)
+                "image": data["img_icon"], #.to(device), 
+                "mask": data["img_mask"] #.to(device)
             }
-            data["image"] = data["img_icon"].to(device)
+            data["image"] = data["img_icon"] #.to(device)
             multi_view_data.append(data)
 
             if len(multi_view_data) < len(dataset):  
@@ -234,8 +248,8 @@ if __name__ == "__main__":
             print(colored(f"Optimizing Canonical SMPL Body using {len(multi_view_data)} views...", "blue"))
 
         losses = init_loss()
-        front_data = multi_view_data[front_view]
-        back_data = multi_view_data[back_view]
+        #front_data = multi_view_data[front_view]
+        #back_data = multi_view_data[back_view]
         first_data = multi_view_data[0]
         in_tensor = {
             "smpl_faces": first_data["smpl_faces"],
@@ -284,62 +298,84 @@ if __name__ == "__main__":
             rotated_global_orients.append(corrected_orient_6d)
 
             # Collect other parameters
-            pose_list.append(data["body_pose"])
-            trans_list.append(data["trans"])
-            betas_list.append(data["betas"])
-            exp_list.append(data["exp"])
-            jaw_list.append(data["jaw_pose"])
+            #pose_list.append(data["body_pose"])
+            #trans_list.append(data["trans"])
+            #betas_list.append(data["betas"])
+            #exp_list.append(data["exp"])
+            #jaw_list.append(data["jaw_pose"])
+            torch.cuda.empty_cache() # clean gpu memory
 
         # compute losses for each view before mean computation
-        before_mean_losses = defaultdict(list)
-        for view_data in multi_view_data:
-            frame_id = int(view_data["name"].split("_")[1])
+        if DEBUG:
+            before_mean_losses = defaultdict(list)
+            for view_data in multi_view_data:
 
-            view_data["T_normal_F"], view_data["T_normal_B"] = dataset.render_normal(
-                view_data["smpl_verts"] * torch.tensor([-1.0, -1.0, 1.0]).to(device),
-                view_data["smpl_faces"],
-            )
-            view_data["T_mask_F"], view_data["T_mask_B"] = dataset.render.get_image(type="mask")
-            view_data["normal_F"], view_data["normal_B"] = normal_net.netG(view_data)
-            smpl_arr = torch.cat([view_data["T_mask_F"], view_data["T_mask_B"]], dim=-1)
-            gt_arr = view_data["img_mask"].to(device).repeat(1, 1, 2)
-            diff_S = torch.abs(smpl_arr - gt_arr)
-            sil_loss = diff_S.mean()
-            normal_loss = (torch.abs(view_data["normal_F"]) - torch.abs(view_data["T_normal_F"])).mean()
-            
-            
-            # Extract head rotation matrix from pose parameters
-            view_pose_mat = rot6d_to_rotmat(view_data["body_pose"].view(-1, 6)).view(1, 21, 3, 3)
-            head_rotmat = view_pose_mat[:, 14]  # Head joint is at index 14
-            head_roll_loss = compute_head_roll_loss(head_rotmat, up_direction="view_y")
-            
-            # Ensure all tensors are on the same device
-            ghum_smpl_pairs = SMPLX_object.ghum_smpl_pairs.to(device)
-            landmark_data = view_data["landmark"].to(device)
-            
-            ghum_lmks = landmark_data[:, ghum_smpl_pairs[:, 0], :2]
-            smpl_lmks = view_data["smpl_verts"][:, ghum_smpl_pairs[:, 1], :2]
-            ghum_conf = landmark_data[:, ghum_smpl_pairs[:, 0], -1]
-            
-            valid_landmarks = ghum_conf > 0.5
-            if valid_landmarks.any():
-                landmark_loss = (torch.norm(ghum_lmks - smpl_lmks, dim=2) * ghum_conf * valid_landmarks.float()).sum() / valid_landmarks.float().sum()
-            else:
-                landmark_loss = torch.tensor(0.0, device=device)
+                # move to gpu
+                view_data = copy_view_data_to_device(view_data, device)
 
-            view_total_loss = sil_loss + 0.2 * normal_loss + 0.1 * landmark_loss 
-            view_data["total_loss"] = view_total_loss
-            before_mean_losses[f'{view_data["name"]}_silhouette_iou'].append(sil_loss.item())
-            before_mean_losses[f'{view_data["name"]}_landmark_error_px'].append(landmark_loss.item())
-            before_mean_losses[f'{view_data["name"]}_sil_l1_loss'].append(sil_loss.item())
-            before_mean_losses[f'{view_data["name"]}_normal_loss'].append(normal_loss.item())
-            before_mean_losses[f'{view_data["name"]}_head_roll_loss'].append(head_roll_loss.item())
-            before_mean_losses[f'{view_data["name"]}_total_loss'].append(view_total_loss.item())
+                frame_id = int(view_data["name"].split("_")[1])
+                
+                # Get transformation matrix for 180 degree rotation around z-axis
+                rot_180_z = torch.tensor([
+                    [-1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0], 
+                    [0.0, 0.0, -1.0]
+                ], device=device)
 
+                # Apply rotation to vertices
+                view_data["smpl_verts"] = torch.matmul(view_data["smpl_verts"], rot_180_z.T)
+                view_data["smpl_verts"] = view_data["smpl_verts"] * torch.tensor([1.0, 1.0, -1.0]).to(device)
+
+
+                view_data["T_normal_F"], view_data["T_normal_B"] = dataset.render_normal(
+                    view_data["smpl_verts"] * torch.tensor([-1.0, -1.0, 1.0]).to(device),
+                    view_data["smpl_faces"],
+                )
+                view_data["T_mask_F"], view_data["T_mask_B"] = dataset.render.get_image(type="mask")
+                view_data["normal_F"], view_data["normal_B"] = normal_net.netG(view_data)
+                smpl_arr = torch.cat([view_data["T_mask_F"], view_data["T_mask_B"]], dim=-1)
+                gt_arr = view_data["img_mask"].to(device).repeat(1, 1, 2)
+                diff_S = torch.abs(smpl_arr - gt_arr)
+                sil_loss = diff_S.mean()
+                normal_loss = (torch.abs(view_data["normal_F"]) - torch.abs(view_data["T_normal_F"])).mean()
+                
+                
+                # Extract head rotation matrix from pose parameters
+                view_pose_mat = rot6d_to_rotmat(view_data["body_pose"].view(-1, 6)).view(1, 21, 3, 3)
+                head_rotmat = view_pose_mat[:, 14]  # Head joint is at index 14
+                head_roll_loss = compute_head_roll_loss(head_rotmat, up_direction="view_y")
+                
+                # Ensure all tensors are on the same device
+                ghum_smpl_pairs = SMPLX_object.ghum_smpl_pairs.to(device)
+                landmark_data = view_data["landmark"].to(device)
+                
+                ghum_lmks = landmark_data[:, ghum_smpl_pairs[:, 0], :2]
+                smpl_lmks = view_data["smpl_verts"][:, ghum_smpl_pairs[:, 1], :2]
+                ghum_conf = landmark_data[:, ghum_smpl_pairs[:, 0], -1]
+                
+                valid_landmarks = ghum_conf > 0.5
+                if valid_landmarks.any():
+                    landmark_loss = (torch.norm(ghum_lmks - smpl_lmks, dim=2) * ghum_conf * valid_landmarks.float()).sum() / valid_landmarks.float().sum()
+                else:
+                    landmark_loss = torch.tensor(0.0, device=device)
+
+                view_total_loss = sil_loss + 0.2 * normal_loss + 0.1 * landmark_loss 
+                view_data["total_loss"] = view_total_loss
+                before_mean_losses[f'{view_data["name"]}_silhouette_iou'].append(sil_loss.item())
+                before_mean_losses[f'{view_data["name"]}_landmark_error_px'].append(landmark_loss.item())
+                before_mean_losses[f'{view_data["name"]}_sil_l1_loss'].append(sil_loss.item())
+                before_mean_losses[f'{view_data["name"]}_normal_loss'].append(normal_loss.item())
+                before_mean_losses[f'{view_data["name"]}_head_roll_loss'].append(head_roll_loss.item())
+                before_mean_losses[f'{view_data["name"]}_total_loss'].append(view_total_loss.item())
+
+                view_data = copy_view_data_to_device(view_data, "cpu")
 
         # === Compute mean of all corrected values ===
-        mean_pose = torch.stack(pose_list, dim=0).mean(dim=0)
+        mean_pose = torch.stack([data["body_pose"] for data in multi_view_data], dim=0).mean(dim=0)
+        mean_pose = mean_pose.to(device)
+        #mean_pose = torch.stack(pose_list, dim=0).mean(dim=0)
         #mean_pose = pose_list[front_view]
+
 
         head_indices = [14]
         body_indices = [i for i in range(21) if i not in head_indices]
@@ -356,17 +392,24 @@ if __name__ == "__main__":
             full_pose[:, head_indices, :] = head
             return full_pose
         
-        # mean_jaw_pose = torch.stack(jaw_list, dim=0).mean(dim=0)
-
-        closest_exp = exp_list[front_view].detach()
-        closest_jaw = jaw_list[front_view].detach()
+        closest_exp = multi_view_data[front_view]["exp"].detach().to(device)
+        closest_jaw = multi_view_data[front_view]["jaw_pose"].detach().to(device)
+        #closest_exp = exp_list[front_view].detach()
+        #closest_jaw = jaw_list[front_view].detach()
         #mean_jaw_pose = torch.stack(jaw_list, dim=0).mean(dim=0)
 
-        mean_trans = torch.stack(trans_list, dim=0).mean(dim=0)
-        mean_betas = torch.stack(betas_list, dim=0).mean(dim=0)
-        mean_global_orient = torch.stack(rotated_global_orients, dim=0).mean(dim=0)
+        mean_trans = torch.stack([data["trans"] for data in multi_view_data], dim=0).mean(dim=0).to(device)
+        mean_betas = torch.stack([data["betas"] for data in multi_view_data], dim=0).mean(dim=0).to(device)
+        #mean_trans = torch.stack(trans_list, dim=0).mean(dim=0)
+        #mean_betas = torch.stack(betas_list, dim=0).mean(dim=0)
+        mean_global_orient = torch.stack(rotated_global_orients, dim=0).mean(dim=0).to(device)
+
+        # clean up
+        del pose_list, trans_list, betas_list, exp_list, jaw_list
+        torch.cuda.empty_cache()
 
         # === Initialize optimization parameters ===
+
         optimed_pose = mean_pose
         optimed_trans = mean_trans.requires_grad_(True)
         optimed_betas = mean_betas.requires_grad_(True)
@@ -386,17 +429,24 @@ if __name__ == "__main__":
 
         print(colored("✅ Canonical SMPL Initialization done (multi-view aware)", "cyan"))
 
+       
 
-        loop_smpl = tqdm(range(args.loop_smpl))
+        
         save_vis_dir = os.path.join(args.out_dir, cfg.name, "png", "canonical_smpl_iters")
         os.makedirs(save_vis_dir, exist_ok=True)
         loss_values = []
         first_iter_losses = defaultdict(list)
         last_iter_losses = defaultdict(list)
+        
+        if DEBUG:
+            print_gpu_memory_usage()
+            args.loop_smpl = 35
 
+        loop_smpl = tqdm(range(args.loop_smpl))
         # Optimization loop
         for i in loop_smpl:
-            optimizer_smpl.zero_grad()
+            #optimizer_smpl.zero_grad()
+            optimizer_smpl.zero_grad(set_to_none=True) 
 
             N_body, N_pose = optimed_pose.shape[:2]
             optimed_orient_mat = rot6d_to_rotmat(optimed_orient.view(-1, 6)).view(N_body, 1, 3, 3)
@@ -415,8 +465,8 @@ if __name__ == "__main__":
             right_hand_pose=tensor2variable(first_data["right_hand_pose"], device),
             )
 
-            smpl_verts = (smpl_verts + optimed_trans) * first_data["scale"]
-            smpl_joints = (smpl_joints + optimed_trans) * first_data["scale"] * torch.tensor([
+            smpl_verts = (smpl_verts + optimed_trans) * first_data["scale"].to(device)
+            smpl_joints = (smpl_joints + optimed_trans) * first_data["scale"].to(device) * torch.tensor([
                 1.0, 1.0, -1.0
             ]).to(device)
             #smpl_verts = smpl_verts * torch.tensor([1.0, 1.0, -1.0]).to(device)
@@ -424,13 +474,24 @@ if __name__ == "__main__":
             frame_to_camera_dir = {}
             total_loss = 0.0
 
-            for view_data in multi_view_data:
+            for j, view_data in enumerate(multi_view_data):
+                view_data = copy_view_data_to_device(view_data, device)
                 frame_id = int(view_data["name"].split("_")[1])
                 T_frame_to_target = transform_manager.get_transform_to_target(frame_id)
                 T_frame_to_target[:3, 3] = 0.0
 
                 view_data["smpl_verts"] = apply_homogeneous_transform(smpl_verts, (T_frame_to_target))
                 view_data["smpl_joints"] = apply_homogeneous_transform(smpl_joints, (T_frame_to_target))
+
+                if len(multi_view_data) == 2:
+                    rot_180_z = torch.tensor([
+                        [-1.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0], 
+                        [0.0, 0.0, -1.0]
+                    ], device=device)
+
+                    # Apply rotation to vertices
+                    view_data["smpl_verts"] = torch.matmul(view_data["smpl_verts"], rot_180_z.T)
 
                 head_rotmat = optimed_pose_mat[:, 14] 
 
@@ -467,39 +528,61 @@ if __name__ == "__main__":
                 normal_loss = (torch.abs(view_data["T_normal_F"]) - torch.abs(view_data["normal_F"])).mean()
                     
                 # Combine all losses with appropriate weights
-                view_total_loss = sil_loss + 0.2 * normal_loss + 0.1 * landmark_loss + 0.3 * head_roll_loss
+                if len(multi_view_data) == 2:
+                    view_total_loss = sil_loss + 0.2 * normal_loss + 0.1 * landmark_loss + 0.01 * head_roll_loss
+                else:
+                    view_total_loss = sil_loss + 0.2 * normal_loss + 0.1 * landmark_loss + 0.1 * head_roll_loss
                 total_loss += view_total_loss
 
-            total_loss /= len(multi_view_data)
-            loss_values.append(total_loss.item())
+                del ghum_lmks, ghum_conf, gt_arr
+                del view_total_loss, sil_loss, normal_loss, landmark_loss, head_roll_loss
+                torch.cuda.empty_cache()
+
+                view_data = copy_view_data_to_device(view_data, "cpu")
+                
+                if DEBUG:
+                    print_gpu_memory_usage()
+
+            total_loss = total_loss/len(multi_view_data)
             total_loss.backward()
             optimizer_smpl.step()
-            scheduler_smpl.step(total_loss)
+            scheduler_smpl.step(total_loss.item())
+            loss_values.append(total_loss.detach().cpu())
+
+            del total_loss
+            torch.cuda.empty_cache()
+
+
             
             # === Visualization (optional) ===
-            with torch.no_grad():
-                smpl_silhouette_images, gt_silhouette_images, diff_silhouette_images = [], [], []
+            if DEBUG:
+                with torch.no_grad():
+                    smpl_silhouette_images, gt_silhouette_images, diff_silhouette_images = [], [], []
 
-                for view_data in multi_view_data:
-                    frame_id = int(view_data["name"].split("_")[1])
+                    for view_data in multi_view_data:
+                        view_data = copy_view_data_to_device(view_data, device)
+                        frame_id = int(view_data["name"].split("_")[1])
 
-                    smpl_mask_front = view_data["T_mask_F"]
-                    gt_mask_front = view_data["img_mask"].to(device)
+                        smpl_mask_front = view_data["T_mask_F"]
+                        gt_mask_front = view_data["img_mask"].to(device)
 
-                    diff_S_front = torch.abs(smpl_mask_front - gt_mask_front)
+                        diff_S_front = torch.abs(smpl_mask_front - gt_mask_front)
 
-                    smpl_silhouette_images.append(smpl_mask_front.repeat(1, 3, 1, 1))
-                    gt_silhouette_images.append(gt_mask_front.unsqueeze(1).repeat(1, 3, 1, 1))
-                    diff_silhouette_images.append(diff_S_front.repeat(1, 3, 1, 1))
+                        smpl_silhouette_images.append(smpl_mask_front.repeat(1, 3, 1, 1))
+                        gt_silhouette_images.append(gt_mask_front.unsqueeze(1).repeat(1, 3, 1, 1))
+                        diff_silhouette_images.append(diff_S_front.repeat(1, 3, 1, 1))
 
-                combined_panel = torch.cat([
-                    torch.cat(smpl_silhouette_images, dim=3),
-                    torch.cat(gt_silhouette_images, dim=3),
-                    torch.cat(diff_silhouette_images, dim=3),
-                ], dim=2)
+                    combined_panel = torch.cat([
+                        torch.cat(smpl_silhouette_images, dim=3),
+                        torch.cat(gt_silhouette_images, dim=3),
+                        torch.cat(diff_silhouette_images, dim=3),
+                    ], dim=2)
 
-                save_path_panel = os.path.join(save_vis_dir, f"panel_iter_{i:03d}.png")
-                torchvision.utils.save_image(combined_panel, save_path_panel)
+                    save_path_panel = os.path.join(save_vis_dir, f"panel_iter_{i:03d}.png")
+                    torchvision.utils.save_image(combined_panel, save_path_panel)
+                    view_data = copy_view_data_to_device(view_data, "cpu")
+
+        del scheduler_smpl
 
         # === After optimization ===
         save_obj_path = os.path.join(args.out_dir, cfg.name, "obj", "final_smpl.obj")
@@ -526,8 +609,8 @@ if __name__ == "__main__":
             "smpl_joints": smpl_joints.detach().cpu(),
             "smpl_landmarks": smpl_landmarks.detach().cpu(),
             "smpl_lmks": smpl_lmks.detach().cpu(),
-            "ghum_lmks": ghum_lmks.detach().cpu(),
-            "ghum_conf": ghum_conf.detach().cpu()
+            #"ghum_lmks": ghum_lmks.detach().cpu(),
+            #"ghum_conf": ghum_conf.detach().cpu()
         }
         np.save(save_obj_path.replace(".obj", ".npy"), smpl_info, allow_pickle=True)
         print(colored(f"✅ Saved SMPL parameters to {save_obj_path.replace('.obj', '.npy')}", "green"))
@@ -542,6 +625,8 @@ if __name__ == "__main__":
         H, W = multi_view_data[0]["img_icon"].shape[-2:]
 
         for view_data in multi_view_data:
+            view_data = copy_view_data_to_device(view_data, device)
+
             frame_id = int(view_data["name"].split("_")[1])
 
             # Add view-specific data to in_tensor
@@ -611,6 +696,9 @@ if __name__ == "__main__":
             in_tensor.update({
                 f"view_{frame_id}": view_data
             })
+
+            view_data = copy_view_data_to_device(view_data, "cpu")
+
         sp_out_dir = os.path.join(args.out_dir, cfg.name, "own_objects_normals")
 
         # Save lists as numpy arrays
@@ -633,6 +721,11 @@ if __name__ == "__main__":
         del optimed_trans
         torch.cuda.empty_cache()
 
+        if DEBUG:
+            print_gpu_memory_usage()
+
+
+
         # ------------------------------------------------------------------------------------------------------------------
         # clothing refinement        
         
@@ -646,8 +739,8 @@ if __name__ == "__main__":
         final_path = f"{args.out_dir}/{cfg.name}/obj/{data['name']}_full.obj"
 
         side_mesh = smpl_obj_lst[back_view].copy()
-        face_mesh = smpl_obj_lst[4].copy()
-        hand_mesh = smpl_obj_lst[4].copy()
+        face_mesh = smpl_obj_lst[back_view].copy()
+        hand_mesh = smpl_obj_lst[back_view].copy()
         smplx_mesh = smpl_obj_lst[back_view].copy()
 
         bni_mesh_list = []
@@ -872,4 +965,11 @@ if __name__ == "__main__":
         final_mesh_path = os.path.join(args.out_dir, cfg.name, "obj", f"{data['name']}_final.obj")
         recon_obj.export(final_mesh_path)
         print(colored(f"✅ Saved final mesh to {final_path}", "green"))
+        
+        
+        end = time.perf_counter()
+        elapsed = end - start
+        minutes = int(elapsed // 60)
+        seconds = int(elapsed % 60)
+        print(f"Running time: {minutes} min {seconds} sec")
         exit()
